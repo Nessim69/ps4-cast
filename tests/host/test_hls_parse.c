@@ -29,6 +29,65 @@ static void test_resolve_url(void) {
     // amazonaws.com https downgraded to http (TLS-fingerprint workaround)
     hlspl_resolve_url("https://bucket.s3.amazonaws.com/pl.m3u8", "a.ts", out, sizeof out);
     CHECK(strncmp(out, "http://bucket.s3.amazonaws.com", 30) == 0);
+
+    // dot segments, query-only and fragments resolve per RFC 3986
+    hlspl_resolve_url("https://cdn.example.com/a/b/index.m3u8", "../c/0.ts", out, sizeof out);
+    CHECK(strcmp(out, "https://cdn.example.com/a/c/0.ts") == 0);
+    hlspl_resolve_url("https://cdn.example.com/a/index.m3u8?t=1", "0.ts#x", out, sizeof out);
+    CHECK(strcmp(out, "https://cdn.example.com/a/0.ts") == 0);
+    // a base with no path must not glue the reference onto the host name
+    hlspl_resolve_url("https://cdn.example.com", "0.ts", out, sizeof out);
+    CHECK(strcmp(out, "https://cdn.example.com/0.ts") == 0);
+}
+
+// HTTP Location resolution (aseg/httpsrc redirects): base = URL that answered.
+static void test_resolve_redirect(void) {
+    char out[2048];
+    const char *base = "https://origin.example:8443/media/v1/play.php?id=7&sig=abc";
+#define REDIR(loc, want) do { hlspl_resolve_ref(base, (loc), out, sizeof out); \
+        if (strcmp(out, (want)) != 0) { printf("  got %s\n", out); } \
+        CHECK(strcmp(out, (want)) == 0); } while (0)
+    REDIR("https://cdn.example/f.mp4?e=1", "https://cdn.example/f.mp4?e=1");   // absolute
+    REDIR("HTTP://cdn.example/f.mp4",      "http://cdn.example/f.mp4");        // scheme case
+    REDIR("//cdn.example/f.mp4",           "https://cdn.example/f.mp4");       // scheme-relative
+    REDIR("/files/f.mp4",                  "https://origin.example:8443/files/f.mp4");   // absolute-path
+    REDIR("f.mp4",                         "https://origin.example:8443/media/v1/f.mp4"); // relative
+    REDIR("?id=8",                         "https://origin.example:8443/media/v1/play.php?id=8"); // query-only
+    REDIR("../f.mp4",                      "https://origin.example:8443/media/f.mp4");    // ../
+    REDIR("../../../../f.mp4",             "https://origin.example:8443/f.mp4");          // clamps at root
+    REDIR("./x/../f.mp4?a=../b#frag",      "https://origin.example:8443/media/v1/f.mp4?a=../b");
+    REDIR("f.mp4#t=10",                    "https://origin.example:8443/media/v1/f.mp4");  // fragment dropped
+    REDIR("",                              "https://origin.example:8443/media/v1/play.php?id=7&sig=abc");
+    REDIR("https://s3.amazonaws.com/b/k",  "https://s3.amazonaws.com/b/k");   // no S3 rewrite on redirects
+#undef REDIR
+
+    // RFC 3986 section 5.4 normal and abnormal examples (fragments dropped)
+    base = "http://a/b/c/d;p?q";
+    static const char *rfc[][2] = {
+        {"g", "http://a/b/c/g"}, {"./g", "http://a/b/c/g"}, {"g/", "http://a/b/c/g/"},
+        {"/g", "http://a/g"}, {"//g", "http://g"}, {"?y", "http://a/b/c/d;p?y"},
+        {"g?y", "http://a/b/c/g?y"}, {"#s", "http://a/b/c/d;p?q"}, {"g#s", "http://a/b/c/g"},
+        {";x", "http://a/b/c/;x"}, {"", "http://a/b/c/d;p?q"}, {".", "http://a/b/c/"},
+        {"./", "http://a/b/c/"}, {"..", "http://a/b/"}, {"../", "http://a/b/"},
+        {"../g", "http://a/b/g"}, {"../..", "http://a/"}, {"../../", "http://a/"},
+        {"../../g", "http://a/g"}, {"../../../g", "http://a/g"}, {"/./g", "http://a/g"},
+        {"/../g", "http://a/g"}, {"g.", "http://a/b/c/g."}, {".g", "http://a/b/c/.g"},
+        {"g..", "http://a/b/c/g.."}, {"..g", "http://a/b/c/..g"}, {"./../g", "http://a/b/g"},
+        {"./g/.", "http://a/b/c/g/"}, {"g/./h", "http://a/b/c/g/h"}, {"g/../h", "http://a/b/c/h"},
+        {"g;x=1/./y", "http://a/b/c/g;x=1/y"}, {"g;x=1/../y", "http://a/b/c/y"},
+        {"g?y/./x", "http://a/b/c/g?y/./x"}, {"g#s/../x", "http://a/b/c/g"},
+    };
+    for (unsigned i = 0; i < sizeof(rfc) / sizeof(rfc[0]); i++) {
+        hlspl_resolve_ref(base, rfc[i][0], out, sizeof out);
+        if (strcmp(out, rfc[i][1]) != 0) printf("  rfc '%s': got %s want %s\n", rfc[i][0], out, rfc[i][1]);
+        CHECK(strcmp(out, rfc[i][1]) == 0);
+    }
+
+    // truncation never overruns the output buffer
+    char small[24];
+    memset(small, 'Z', sizeof small);
+    hlspl_resolve_ref("https://a-rather-long-host.example/x/y", "../z.ts", small, sizeof small);
+    CHECK(strlen(small) == sizeof small - 1);
 }
 
 static void test_parse_media_vod(void) {
@@ -110,6 +169,7 @@ static void test_collect_variants(void) {
 
 int main(void) {
     test_resolve_url();
+    test_resolve_redirect();
     test_parse_media_vod();
     test_parse_media_live_disc_map();
     test_parse_media_rejects_encryption();

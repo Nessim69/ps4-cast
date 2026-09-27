@@ -2,6 +2,7 @@
 #include "tls.h"
 #include "urlopt.h"
 #include "native_http.h"
+#include "hls_parse.h"
 
 // main.c: pet the freeze watchdog during a legitimately-progressing blocking op.
 // Safe here because every fetch is bounded by ASEG_FETCH_BUDGET_US, so this can
@@ -370,6 +371,7 @@ static int do_request(int reuse, int *status, char *loc, int loccap,
             l += 9; while (*l == ' ' || *l == '\t') l++;
             const char *eol = strstr(l, "\r\n");
             int ln = eol ? (int)(eol - l) : (int)strlen(l);
+            while (ln > 0 && (l[ln - 1] == ' ' || l[ln - 1] == '\t')) ln--;
             if (ln >= loccap) ln = loccap - 1;
             memcpy(loc, l, ln); loc[ln] = '\0';
         }
@@ -541,6 +543,7 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
     }
 
     char cur[1400];
+    static char next[1400];   // redirect scratch, off the small prefetch-thread stacks; under g_fetchMtx
     strncpy(cur, url, sizeof(cur) - 1); cur[sizeof(cur) - 1] = '\0';
 
     uint8_t lead[4096]; int leadLen = 0; long clen = -1; int chunked = 0;
@@ -566,7 +569,10 @@ static int aseg_fetch_inner(const char *url, uint8_t **outBuf, int *outLen) {
             conn_close(); g_kaAlive = 0;
             rc = do_request(0, &status, loc, sizeof(loc), lead, &leadLen, &clen, &chunked);
         }
-        if (rc == 1 && loc[0]) { strncpy(cur, loc, sizeof(cur) - 1); cur[sizeof(cur) - 1] = '\0'; g_kaAlive = 0; continue; }
+        // Location may be relative ("/path", "seg.ts", "?x=1"); parse_url only
+        // takes absolute http(s) URLs, so resolve it against the URL that
+        // answered (RFC 7231 7.1.2) instead of failing the next hop.
+        if (rc == 1 && loc[0]) { hlspl_resolve_ref(cur, loc, next, sizeof(next)); memcpy(cur, next, sizeof(cur)); g_kaAlive = 0; continue; }
         if (rc != 0) {
             conn_close(); g_kaAlive = 0;
             // A hard failure BEFORE any HTTP status — connect refused/timeout,
