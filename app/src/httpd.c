@@ -671,6 +671,38 @@ static const char CONNECTION_XML[] =
 "</serviceStateTable>"
 "</scpd>";
 
+// Served (401) for a controls-page load without a valid token: type the code
+// the TV shows after ?t= (or paste the whole TV address) and reload the SAME
+// page with it -- keeping the path and #fragment, so a /handoff link from the
+// phone browser helper still carries its media URL. The main page then
+// remembers the token as usual.
+static const char PAIR_PAGE_HTML[] =
+"<!doctype html><html><head><meta charset=\"utf-8\">"
+"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+"<title>PS4 Cast - pair</title><style>"
+"body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
+"background:#060913;color:#f3f6ff;font:15px/1.5 -apple-system,system-ui,sans-serif}"
+"main{max-width:360px;padding:24px}h1{font-size:20px;margin:0 0 8px}"
+"p{color:#9aa4c8;margin:0 0 16px}input{width:100%;box-sizing:border-box;padding:12px;"
+"border-radius:10px;border:1px solid #2c3658;background:#181f3a;color:#f3f6ff;font-size:18px;"
+"letter-spacing:2px;text-transform:uppercase}button{margin-top:12px;width:100%;padding:12px;"
+"border:0;border-radius:10px;background:#5b8cff;color:#fff;font-size:16px;font-weight:600}"
+"#e{color:#ffc44a;min-height:1.5em;margin-top:10px}</style></head><body><main>"
+"<h1>Pair with PS4 Cast</h1>"
+"<p>This browser isn't paired with the PS4, or its pairing code changed. Scan the QR code on "
+"the TV, or type the 8-character code shown after <b>?t=</b> in the TV's address.</p>"
+"<form id=\"f\"><input id=\"c\" maxlength=\"80\" placeholder=\"ABCD2345\" autocomplete=\"off\" "
+"autocapitalize=\"characters\" spellcheck=\"false\" autofocus><button>Pair</button>"
+"<div id=\"e\"></div></form></main><script>"
+"document.getElementById('f').onsubmit=function(ev){ev.preventDefault();"
+"var c=document.getElementById('c').value.trim().toUpperCase(),m=c.match(/[?&]T=([A-Z2-9]{8})/);"
+"if(m)c=m[1];if(!/^[A-Z2-9]{8}$/.test(c)){document.getElementById('e').textContent="
+"'The code is 8 letters/digits, as shown on the TV';return}"
+"location.replace(location.pathname+'?t='+c+location.hash)};"
+"if(/[?&]t=/.test(location.search))document.getElementById('e').textContent="
+"'That code was not accepted - check the code on the TV';"
+"</script></body></html>";
+
 static char g_dlna_uri[1024];
 static int  g_dlna_started;
 
@@ -1506,6 +1538,17 @@ static void handle_client(OrbisNetId c) {
     // can't require the very token it exists to hand out.
     int tokenWindowOk = strcmp(path, "/token") == 0 && httpd_pairing_window_left() > 0;
     if (!token_exempt(path) && !token_ok(target, req) && !tokenWindowOk) {
+        // A browser opening the controls page with a missing or outdated token
+        // (an old bookmark after the token was regenerated) used to get a bare
+        // text line and no way forward. Give page loads a small pairing form
+        // instead; API calls keep the plain 401 the web UI/extension detect.
+        if (strcmp(method, "GET") == 0 &&
+            (strcmp(path, "/") == 0 || strncmp(path, "/index", 6) == 0 ||
+             strcmp(path, "/handoff") == 0 || strcmp(path, "/setup") == 0)) {
+            send_response(c, "401 Unauthorized", "text/html; charset=utf-8",
+                          PAIR_PAGE_HTML, (int)sizeof(PAIR_PAGE_HTML) - 1);
+            return;
+        }
         send_response(c, "401 Unauthorized", "text/plain",
                       "missing pairing token (see the TV screen)", 41);
         return;

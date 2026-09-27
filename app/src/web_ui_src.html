@@ -265,6 +265,16 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
   <div class="failure-actions"><button class="primary" onclick="retryFailure()">Retry</button><button id="failureSw" onclick="trySoftware()">Try software</button><button onclick="copyDiagnostics()">Copy diagnostics</button></div>
  </section>
 
+ <section class="card" id="repair" hidden>
+  <div class="lbl">Pair this browser again</div>
+  <div class="sub" style="margin-bottom:10px">The PS4's pairing code changed, so it no longer accepts commands from this browser. Scan the QR code on the TV again, or type the 8-character code shown after <b>?t=</b> in the TV's address.</div>
+  <div class="inrow">
+   <input id="pairCode" type="text" maxlength="80" placeholder="ABCD2345" autocomplete="off" autocapitalize="characters" spellcheck="false">
+  </div>
+  <div class="actions"><button class="btn primary" onclick="repairWithCode()">Pair</button></div>
+  <div class="sub" id="pairErr" style="margin:8px 0 0;color:#ffc44a"></div>
+ </section>
+
  <nav class="mode-tabs" aria-label="Receiver mode">
   <button class="on" id="modeCast" onclick="setMode('cast')">Cast</button>
   <button id="modeIptv" onclick="setMode('iptv')">Live TV<span class="cnt" id="modeChanCount"></span></button>
@@ -349,7 +359,7 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
   <div class="sw" id="swPair" onclick="togglePair()"></div>
  </div>
  <div class="set">
-  <div class="txt"><div class="a">Pairing token <span class="tokval" id="tokVal">—</span></div><div class="b">Regenerate if you have shared the link. Paired devices re-pair themselves; the Chrome extension does it on its next cast.</div></div>
+  <div class="txt"><div class="a">Pairing token <span class="tokval" id="tokVal">—</span></div><div class="b">Regenerate if you have shared the link. Other browsers then scan the TV's QR code again; the Chrome extension re-pairs after you press Square on the TV.</div></div>
   <button class="mini" id="btnRegen" onclick="regenToken()">Regenerate</button>
  </div>
  <div class="set">
@@ -408,8 +418,25 @@ function fmt(s){s=Math.max(0,s|0);var h=(s/3600)|0,m=((s/60)|0)%60,x=s%60,p=func
 function esc(s){return(''+s).replace(/[&<>"']/g,function(c){return c=='<'?'&lt;':c=='>'?'&gt;':c=='&'?'&amp;':c=='"'?'&quot;':'&#39;'})}
 function shorten(u){try{u=decodeURIComponent(u)}catch(e){}return u.length>60?u.slice(0,34)+'…'+u.slice(-22):u}
 function nameFromUrl(u){try{u=decodeURIComponent(u)}catch(e){}u=u.split(/[?#]/)[0];var p=u.split('/').filter(Boolean);return p.length?p[p.length-1]:u}
-async function post(p,b){try{return await fetch(withT(p),{method:'POST',headers:{'Content-Type':'text/plain','X-PS4Cast-Token':TOKEN||''},body:b||''})}catch(e){}}
-async function getj(p){try{return await(await fetch(withT(p),{headers:{'X-PS4Cast-Token':TOKEN||''}})).json()}catch(e){return null}}
+async function post(p,b){try{return noteAuth(await fetch(withT(p),{method:'POST',headers:{'Content-Type':'text/plain','X-PS4Cast-Token':TOKEN||''},body:b||''}))}catch(e){}}
+async function getj(p){try{var r=noteAuth(await fetch(withT(p),{headers:{'X-PS4Cast-Token':TOKEN||''}}));if(r.status===401)return null;return await r.json()}catch(e){return null}}
+/* A 401 means the receiver's token changed after this page loaded (regenerated
+   from another device). /status stays open, so without this the page looked
+   fine while every command failed -- and asked for /token once a second. */
+var authLost=false;
+function noteAuth(r){if(r&&r.status===401&&!authLost){authLost=true;$('repair').hidden=false;msg('This browser needs to pair again')}return r}
+async function repairWithCode(){
+ var c=($('pairCode').value||'').trim().toUpperCase();
+ var m=c.match(/[?&]T=([A-Z2-9]{8})/);if(m)c=m[1];   // a pasted TV address works too
+ var err=$('pairErr');err.textContent='';
+ if(!/^[A-Z2-9]{8}$/.test(c)){err.textContent='The code is 8 letters/digits, as shown on the TV';return}
+ var r=null;try{r=await fetch('/token?t='+c,{headers:{'X-PS4Cast-Token':c}})}catch(e){}
+ if(!r||!r.ok){err.textContent=r&&r.status===401?'That code was not accepted — check the TV':'Could not reach the PS4';return}
+ TOKEN=c;try{localStorage.setItem('ps4cast-token',c)}catch(e){}
+ authLost=false;$('repair').hidden=true;$('pairCode').value='';
+ var el=document.getElementById('tokVal');if(el)el.textContent=c;
+ msg('Paired');poll();refreshLists();reloadChans()
+}
 /* pairing token: taken from ?t= (the TV QR encodes it), then remembered */
 var TOKEN='';
 try{var _t=new URLSearchParams(location.search).get('t');if(_t)localStorage.setItem('ps4cast-token',_t)}catch(e){}
@@ -419,9 +446,9 @@ var pair=1;
 async function togglePair(){pair=pair?0:1;setSw('swPair',pair);await post('/pairing',''+pair);msg(pair?'Pairing required':'Pairing off — open receiver')}
 /* Show the receiver's CURRENT token, not just whatever this browser remembers:
    they diverge as soon as another device regenerates it. */
-async function showToken(){try{var r=await fetch(withT('/token'),{headers:{'X-PS4Cast-Token':TOKEN||''}});if(!r.ok)return;var t=(await r.text()).trim();var el=document.getElementById('tokVal');if(el&&/^[A-Z2-9]{8}$/.test(t))el.textContent=t}catch(e){}}
+async function showToken(){try{var r=noteAuth(await fetch(withT('/token'),{headers:{'X-PS4Cast-Token':TOKEN||''}}));if(!r.ok)return;var t=(await r.text()).trim();var el=document.getElementById('tokVal');if(el&&/^[A-Z2-9]{8}$/.test(t))el.textContent=t}catch(e){}}
 async function regenToken(){
- if(!confirm('Regenerate the pairing token?\n\nThis browser stays paired. Other devices re-pair automatically on their next command.'))return;
+ if(!confirm('Regenerate the pairing token?\n\nThis browser stays paired. Other browsers must scan the TV\'s QR code again, and the Chrome extension re-pairs after you press Square on the TV.'))return;
  var r=await post('/token/regen','');
  if(!r||!r.ok){msg(r&&r.status===401?'Pair this browser first':'Could not regenerate');return}
  var t=(await r.text()).trim();
@@ -556,7 +583,7 @@ function uploadLocal(file){
  try{x.setRequestHeader('X-PS4Cast-Token',TOKEN||'')}catch(e){}
  try{x.setRequestHeader('X-PS4Cast-Filename',encodeURIComponent(file.name))}catch(e){x.setRequestHeader('X-PS4Cast-Filename','Local%20file')}
  x.upload.onprogress=function(e){if(!e.lengthComputable)return;var p=Math.min(100,Math.round(e.loaded/e.total*100));$('uploadBar').style.transform='scaleX('+(p/100)+')';$('localLabel').textContent='Uploading '+p+'%'};
- x.onload=function(){var ok=x.status>=200&&x.status<300;finishUpload(ok,ok?'Opening '+file.name:(x.responseText||'Upload failed'))};
+ x.onload=function(){var ok=x.status>=200&&x.status<300;noteAuth(x);finishUpload(ok,ok?'Opening '+file.name:(x.responseText||'Upload failed'))};
  x.onerror=function(){finishUpload(false,'PS4 connection lost during upload')};
  x.onabort=function(){finishUpload(false,'Upload cancelled')};
  x.send(file);
@@ -763,7 +790,7 @@ async function poll(){if(document.hidden||uploading)return;var j=await getj('/st
  if(j.hw_enabled!=null){hw=j.hw_enabled;setSw('swHw',hw)}
  if(j.debug!=null){dbg=j.debug;setSw('swDbg',dbg)}
  if(j.pair!=null){pair=j.pair;setSw('swPair',pair)}
- if(document.getElementById('tokVal')&&document.getElementById('tokVal').textContent==='—')showToken()
+ if(!authLost&&document.getElementById('tokVal')&&document.getElementById('tokVal').textContent==='—')showToken()
  if(j.chan_cur!=null&&j.chan_cur!=chanCur){chanCur=j.chan_cur;if(plData.length)renderPane('pl')}
  if(j.error_code)showFailure(j);else if(on)$('failure').hidden=true;
  // lists_ver/chan_ver let us refetch only what actually changed; an older
