@@ -125,6 +125,7 @@ static AVFrame *g_lastShown = NULL;
 static AVFrame *g_nvFrame;          // picture paint_nv12 converts (see build_scaled_nv12_direct)
 static int      g_nvVisW, g_nvVisH; // visible size g_nvTag was issued for
 static uint64_t g_nvTag;
+static AVBufferPool *g_nv12Pool;    // decoded HW frame buffers (see nv12_frame_buffer)
 // Bumped whenever a newly decoded frame becomes the frame on screen.
 static unsigned g_shownGen = 0;
 unsigned player_present_generation(void) { return g_shownGen; }
@@ -397,6 +398,7 @@ void player_stop(void) {
     present_pool_stop();                 // join present workers before freeing buffers
     if (g_lastShown) av_frame_free(&g_lastShown);
     g_nvFrame = NULL;                    // it was g_lastShown
+    av_buffer_pool_uninit(&g_nv12Pool);  // decode thread joined; buffers still referenced outlive it
     if (g_scaled){ free(g_scaled); g_scaled = NULL; }
     g_scaledTag = 0;
     if (g_isLocal) {
@@ -1431,6 +1433,42 @@ static int hw_reopen_for_params(const AVCodecParameters *par) {
     return hw_failover_to_software(-9001);
 }
 
+// Every decoded HW picture is copied out of vdec_hw into an AVFrame. With
+// av_frame_get_buffer that was a fresh ~3 MB allocation per frame at 1080p
+// (~180 MB/s of large malloc/free churn at 60 fps, on the decode thread). The
+// buffers now come from a pool laid out exactly like av_frame_get_buffer(cl, 32)
+// would: same buffer size, plane offset and linesizes, captured from one
+// template frame whenever the dimensions change (convert_band reads data[0],
+// data[1] and linesize[] only). Frames queued, reordered or held keep their
+// pool references: replacing or uninitialising the pool frees each buffer only
+// when its last reference goes (av_buffer_pool_uninit defers the free).
+// Decode thread only; player_stop frees the pool after joining it.
+static int    g_nv12W, g_nv12H, g_nv12Ls[2];
+static size_t g_nv12Off1;
+
+static int nv12_frame_buffer(AVFrame *cl) {
+    if (!g_nv12Pool || cl->width != g_nv12W || cl->height != g_nv12H) {
+        AVFrame *t = av_frame_alloc();
+        if (!t) return -1;
+        t->format = AV_PIX_FMT_NV12; t->width = cl->width; t->height = cl->height;
+        if (av_frame_get_buffer(t, 32) < 0) { av_frame_free(&t); return -1; }
+        av_buffer_pool_uninit(&g_nv12Pool);
+        g_nv12Pool = av_buffer_pool_init(t->buf[0]->size, NULL);   // NULL: av_buffer_alloc, as the template
+        g_nv12W = cl->width; g_nv12H = cl->height;
+        g_nv12Ls[0] = t->linesize[0]; g_nv12Ls[1] = t->linesize[1];
+        g_nv12Off1 = (size_t)(t->data[1] - t->data[0]);
+        av_frame_free(&t);
+        if (!g_nv12Pool) return -1;
+    }
+    cl->buf[0] = av_buffer_pool_get(g_nv12Pool);
+    if (!cl->buf[0]) return -1;
+    cl->data[0] = cl->buf[0]->data;
+    cl->data[1] = cl->buf[0]->data + g_nv12Off1;
+    cl->linesize[0] = g_nv12Ls[0]; cl->linesize[1] = g_nv12Ls[1];
+    cl->extended_data = cl->data;
+    return 0;
+}
+
 // Hardware H.264 path: convert the packet to Annex B, decode each access unit on
 // the GPU silicon into NV12, copy it into an AVFrame, and feed it through the
 // reorder buffer -> queue -> sync/scale/blit path (sws converts NV12->BGRA).
@@ -1451,7 +1489,7 @@ static void decode_video_hw(AVPacket *pkt) {
         AVFrame *cl = av_frame_alloc();
         if (!cl) continue;
         cl->format = AV_PIX_FMT_NV12; cl->width = hf.width; cl->height = hf.height;
-        if (av_frame_get_buffer(cl, 32) < 0) { av_frame_free(&cl); continue; }
+        if (nv12_frame_buffer(cl) < 0) { av_frame_free(&cl); continue; }
         for (int y = 0; y < hf.height; y++)
             memcpy(cl->data[0] + (size_t)y * cl->linesize[0], hf.y + (size_t)y * hf.pitch, hf.width);
         for (int y = 0; y < hf.height / 2; y++)
@@ -1556,7 +1594,7 @@ static void decode_video_hw_seg(AVPacket *pkt, AVRational vtb) {
     AVFrame *cl = av_frame_alloc();
     if (!cl) return;
     cl->format = AV_PIX_FMT_NV12; cl->width = hf.width; cl->height = hf.height;
-    if (av_frame_get_buffer(cl, 32) < 0) { av_frame_free(&cl); return; }
+    if (nv12_frame_buffer(cl) < 0) { av_frame_free(&cl); return; }
     for (int y = 0; y < hf.height; y++)
         memcpy(cl->data[0] + (size_t)y * cl->linesize[0], hf.y + (size_t)y * hf.pitch, hf.width);
     for (int y = 0; y < hf.height / 2; y++)
