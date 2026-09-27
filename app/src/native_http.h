@@ -14,12 +14,14 @@
 #define NHTTP_SLOTS 4
 void native_http_init(void);
 // headers: CRLF block whose Referer/Origin/User-Agent/Cookie lines are sent
-// ("" = none). abort_flag: the caller's sticky abort, re-checked under the
-// slot lock before the request exists, so a racing native_http_abort() can
-// never be missed. May be NULL.
+// ("" = none). max_bytes > 0: a probe -- keep at most that many body bytes and
+// stop once timeout_us has passed in total (0 = whole body, 16 MB cap).
+// abort_flag: the caller's sticky abort, re-checked under the slot lock before
+// the request exists, so a racing native_http_abort() can never be missed.
+// May be NULL.
 int native_http_fetch(int slot, const char *url, const char *headers,
                       uint8_t **body, int *len, int *status, uint64_t timeout_us,
-                      const volatile int *abort_flag);
+                      int max_bytes, const volatile int *abort_flag);
 // Abort `slot`'s in-flight request; its connection is never reused.
 void native_http_abort(int slot);
 const char *native_http_debug(void);

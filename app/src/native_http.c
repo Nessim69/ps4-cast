@@ -221,7 +221,8 @@ static void add_option_header(int req, const char *headers, const char *name) {
 
 int native_http_fetch(int slot, const char *url, const char *headers,
                       uint8_t **body, int *len, int *status, uint64_t timeout_us,
-                      const volatile int *abort_flag) {
+                      int max_bytes, const volatile int *abort_flag) {
+    uint64_t t0 = sceKernelGetProcessTime();
     if (!body || !len || !status || !url) return -1;
     *body = NULL; *len = 0; *status = 0;
     if (!g_locksUp || slot < 0 || slot >= NHTTP_SLOTS) return -1;
@@ -288,7 +289,13 @@ int native_http_fetch(int slot, const char *url, const char *headers,
     int length_type = 0;
     size_t declared = 0;
     pGetLength(req, &length_type, &declared);
-    if (declared > NHTTP_CAP) {
+    // Probe (max_bytes > 0, resolve.c): keep only the head, and stop once
+    // timeout_us has passed in total. SceHttp's timeouts are per operation,
+    // so an endless stream that keeps delivering would otherwise hold the
+    // caller -- the main thread, which nothing here pets the watchdog for.
+    size_t limit = (max_bytes > 0 && max_bytes < NHTTP_CAP) ? (size_t)max_bytes : 0;
+    int cut = 0;
+    if (declared > NHTTP_CAP && !limit) {
         snprintf(g_debug, sizeof(g_debug), "native too large status=%d bytes=%lu",
                  *status, (unsigned long)declared);
         end_request(s, req);
@@ -296,6 +303,7 @@ int native_http_fetch(int slot, const char *url, const char *headers,
     }
 
     size_t cap = declared > 0 ? declared : 256 * 1024;
+    if (limit && cap > limit) cap = limit;
     if (cap < 4096) cap = 4096;
     uint8_t *buf = malloc(cap);
     if (!buf) {
@@ -304,6 +312,9 @@ int native_http_fetch(int slot, const char *url, const char *headers,
     }
     size_t used = 0;
     for (;;) {
+        if (limit && (used >= limit || sceKernelGetProcessTime() - t0 > timeout_us)) {
+            rc = 0; cut = 1; break;
+        }
         if (used == cap) {
             size_t next = cap < NHTTP_CAP / 2 ? cap * 2 : NHTTP_CAP;
             if (next <= cap) { rc = -9; break; }
@@ -313,6 +324,7 @@ int native_http_fetch(int slot, const char *url, const char *headers,
         }
         uint32_t want = (uint32_t)(cap - used);
         if (want > 64 * 1024) want = 64 * 1024;
+        if (limit && want > limit - used) want = (uint32_t)(limit - used);
         int got = pReadData(req, buf + used, want);
         if (got == 0) { rc = 0; break; }
         if (got < 0) { rc = got; break; }
@@ -321,6 +333,7 @@ int native_http_fetch(int slot, const char *url, const char *headers,
     }
 
     end_request(s, req);
+    if (cut) reset_connection(s);    // rest of the body unread: never reuse
     if (rc != 0 || used == 0) {
         snprintf(g_debug, sizeof(g_debug), "native read rc=%#x status=%d bytes=%lu",
                  rc, *status, (unsigned long)used);

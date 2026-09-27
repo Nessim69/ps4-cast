@@ -69,6 +69,10 @@ typedef struct {
     // t0 = start of the current fetch, so do_request's header loop is bounded
     // by the SAME budget as the body loops.
     uint64_t     t0, budgetUs;
+    int          maxBytes;          // body cap: fail above it, or with `truncate` keep that much
+    int          truncate;          // AsegOpts.maxBytes: keep the head, drop the connection
+    int        (*stopAfterHeaders)(const char *ctype);
+    char         ctype[96];         // Content-Type of the last response
     char         host[256];
     char         path[1024];
     uint16_t     port;
@@ -348,6 +352,10 @@ void aseg_resume(void) {
     for (int i = 0; i < ASEG_CH_COUNT; i++) if (g_ch[i].stream) g_ch[i].abort = 0;
 }
 
+void aseg_resume_ch(int ch) {
+    if (ch >= 0 && ch < ASEG_CH_COUNT && g_ch[ch].stream) g_ch[ch].abort = 0;
+}
+
 void aseg_clear_error(void) {
     for (int i = 0; i < ASEG_CH_COUNT; i++) if (g_ch[i].stream) diag_clear(&g_ch[i]);
     g_diagCh = &g_ch[ASEG_CH_PLAYLIST];
@@ -376,7 +384,7 @@ static void native_pin(const char *host) {   // NULL = unpin
 // and the channel's header policy applies (UI: none).
 static int native_fetch(AsegCh *c, const char *url, uint8_t **outBuf, int *outLen, int *status) {
     return native_http_fetch((int)(c - g_ch), url, opt_headers(c), outBuf, outLen, status,
-                             c->budgetUs, &c->abort);
+                             c->budgetUs, c->truncate ? c->maxBytes : 0, &c->abort);
 }
 
 // One request: connect, GET (Connection: close), parse headers. On 3xx returns
@@ -459,6 +467,18 @@ static int do_request(AsegCh *c, int reuse, int *status, char *loc, int loccap,
         *chunked = coding && (!eol || coding < eol);
         if (*chunked && clen) *clen = -1;  // Transfer-Encoding wins over Content-Length.
     }
+    // Per response: a 3xx carries its own (usually text/html), so a probe's
+    // stopAfterHeaders only ever sees the final 2xx response's type.
+    c->ctype[0] = '\0';
+    {
+        const char *ct = ci_strstr(hdr, "\r\nContent-Type:");
+        if (ct && ct < hdr + end) {
+            ct += 15; while (*ct == ' ' || *ct == '\t') ct++;
+            int ln = (int)strcspn(ct, "\r\n");
+            if (ln >= (int)sizeof(c->ctype)) ln = (int)sizeof(c->ctype) - 1;
+            memcpy(c->ctype, ct, ln); c->ctype[ln] = '\0';
+        }
+    }
 
     if (st >= 300 && st < 400 && loc && loccap) {
         loc[0] = '\0';
@@ -529,8 +549,10 @@ static int chunk_read_line(ChunkReader *r, char *line, int cap) {
 // Decode RFC 7230 chunk framing while reading, so a chunk-size line can never
 // leak into the HLS parser as a fake segment URI. The terminating chunk and all
 // trailers are consumed, leaving same-host connections safe for keep-alive.
-static int read_chunked_body(AsegCh *c, const uint8_t *lead, int leadLen, uint8_t **outBuf, int *outLen) {
+static int read_chunked_body(AsegCh *c, const uint8_t *lead, int leadLen, uint8_t **outBuf, int *outLen,
+                             int *cut) {
     ChunkReader reader = { c, lead, leadLen, 0 };
+    const size_t lim = (size_t)c->maxBytes;
     size_t cap = 256 * 1024, used = 0;
     uint8_t *buf = malloc(cap);
     if (!buf) return -6;
@@ -556,26 +578,29 @@ static int read_chunked_body(AsegCh *c, const uint8_t *lead, int leadLen, uint8_
             } while (lineLen != 0);
             break;
         }
-        if (chunk > ASEG_FETCH_CAP || used > ASEG_FETCH_CAP - (size_t)chunk) {
-            free(buf); return -10;
+        size_t take = (size_t)chunk;
+        if (chunk > lim || used > lim - (size_t)chunk) {
+            if (!c->truncate) { free(buf); return -10; }
+            take = lim - used; *cut = 1;              // probe: the head is enough
         }
 
-        size_t need = used + (size_t)chunk;
+        size_t need = used + take;
         if (need > cap) {
             size_t next = cap;
-            while (next < need && next < ASEG_FETCH_CAP) {
+            while (next < need && next < lim) {
                 size_t grown = next * 2;
-                next = grown > ASEG_FETCH_CAP ? ASEG_FETCH_CAP : grown;
+                next = grown > lim ? lim : grown;
             }
             if (next < need) { free(buf); return -10; }
             uint8_t *larger = realloc(buf, next);
             if (!larger) { free(buf); return -7; }
             buf = larger; cap = next;
         }
-        if (chunk_read_exact(&reader, buf + used, (size_t)chunk) != 0) {
+        if (chunk_read_exact(&reader, buf + used, take) != 0) {
             free(buf); return -11;
         }
-        used += (size_t)chunk;
+        used += take;
+        if (*cut) break;
 
         uint8_t crlf[2];
         if (chunk_read_exact(&reader, crlf, sizeof(crlf)) != 0 || crlf[0] != '\r' || crlf[1] != '\n') {
@@ -761,11 +786,21 @@ static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *o
     }
     if (!opened) { conn_close(c); c->kaAlive = 0; return -5; }
 
+    // Probe (AsegOpts): the server says media, so this is not a page. Stop
+    // before reading a byte of what may be an endless stream; the body is
+    // unread, so the socket is never reused.
+    if (c->stopAfterHeaders && c->stopAfterHeaders(c->ctype)) {
+        conn_close(c); c->kaAlive = 0;
+        return ASEG_STOPPED;
+    }
+
     if (chunked) {
         watchdog_note("aseg/body-chunked");
-        int rc = read_chunked_body(c, lead, leadLen, outBuf, outLen);
+        int cut = 0;
+        int rc = read_chunked_body(c, lead, leadLen, outBuf, outLen, &cut);
         if (rc != 0) { conn_close(c); c->kaAlive = 0; return rc; }
-        keep_alive(c, gen0);
+        if (cut) { conn_close(c); c->kaAlive = 0; }   // rest of the body unread
+        else keep_alive(c, gen0);
         return 0;
     }
 
@@ -780,7 +815,11 @@ static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *o
         // for the next same-host segment (skips the TLS handshake — the big win).
         watchdog_note("aseg/body-known");
         size_t need = (size_t)clen;
-        if (need > ASEG_FETCH_CAP) { free(buf); conn_close(c); c->kaAlive = 0; return -10; }
+        int cut = 0;
+        if (need > (size_t)c->maxBytes) {
+            if (!c->truncate) { free(buf); conn_close(c); c->kaAlive = 0; return -10; }
+            need = (size_t)c->maxBytes; cut = 1;       // probe: keep the head only
+        }
         while (used < need) {
             if (c->abort) { free(buf); conn_close(c); c->kaAlive = 0; return -9; }
             // Budget + watchdog, exactly as the unknown-length loop below has.
@@ -809,7 +848,8 @@ static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *o
             if (r <= 0) { free(buf); conn_close(c); c->kaAlive = 0; return -11; }  // short read -> fail+reconnect
             used += r;
         }
-        keep_alive(c, gen0);                                   // reusable next time
+        if (cut) { conn_close(c); c->kaAlive = 0; if (used > need) used = need; }   // rest unread
+        else keep_alive(c, gen0);                              // reusable next time
     } else {
         watchdog_note("aseg/body-eof");
         // Unknown length (no Content-Length): read to EOF, then close (no reuse).
@@ -819,17 +859,22 @@ static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *o
                 free(buf); conn_close(c); c->kaAlive = 0; return -12;
             }
             watchdog_kick();
+            if (c->truncate && used >= (size_t)c->maxBytes) { used = (size_t)c->maxBytes; break; }   // probe: head only
             if (used + 64 * 1024 > cap) {
                 watchdog_note("eof/grow");
                 size_t ncap = cap * 2;
-                if (ncap > ASEG_FETCH_CAP) ncap = ASEG_FETCH_CAP;
-                if (ncap <= cap) { free(buf); conn_close(c); c->kaAlive = 0; return -10; }
-                uint8_t *nb = realloc(buf, ncap);
-                if (!nb) { free(buf); conn_close(c); c->kaAlive = 0; return -7; }
-                buf = nb; cap = ncap;
+                if (ncap > (size_t)c->maxBytes) ncap = (size_t)c->maxBytes;
+                if (ncap <= cap && !c->truncate) { free(buf); conn_close(c); c->kaAlive = 0; return -10; }
+                if (ncap > cap) {
+                    uint8_t *nb = realloc(buf, ncap);
+                    if (!nb) { free(buf); conn_close(c); c->kaAlive = 0; return -7; }
+                    buf = nb; cap = ncap;
+                }
             }
             watchdog_note("eof/read");
-            int r = conn_read(c, buf + used, (int)(cap - used));
+            int want = (int)(cap - used);
+            if (c->truncate && (size_t)want > (size_t)c->maxBytes - used) want = (int)((size_t)c->maxBytes - used);
+            int r = conn_read(c, buf + used, want);
             if (r > 0) { used += r; continue; }
             break;
         }
@@ -879,7 +924,7 @@ void aseg_init(void) {
     g_chInit = 1;
 }
 
-int aseg_fetch_ch(int ch, const char *url, uint8_t **outBuf, int *outLen) {
+int aseg_fetch_opts(int ch, const char *url, uint8_t **outBuf, int *outLen, AsegOpts *o) {
     if (!g_chInit || ch < 0 || ch >= ASEG_CH_COUNT) return -1;   // aseg_init() not run: fail, never race an init
     AsegCh *c = &g_ch[ch];
     const char *pv = watchdog_note("aseg/lock");
@@ -888,9 +933,21 @@ int aseg_fetch_ch(int ch, const char *url, uint8_t **outBuf, int *outLen) {
     c->budgetUs = ch == ASEG_CH_UI ? ASEG_BUDGET_UI_US
                 : (ch == ASEG_CH_PLAYLIST && g_playlistBudget) ? ASEG_BUDGET_PLAYLIST_US
                 : ASEG_BUDGET_SEGMENT_US;
+    c->maxBytes = ASEG_FETCH_CAP; c->truncate = 0; c->stopAfterHeaders = NULL; c->ctype[0] = '\0';
+    if (o) {
+        if (o->budgetUs) c->budgetUs = o->budgetUs;
+        if (o->maxBytes > 0 && o->maxBytes < ASEG_FETCH_CAP) { c->maxBytes = o->maxBytes; c->truncate = 1; }
+        c->stopAfterHeaders = o->stopAfterHeaders;
+    }
     int rc = aseg_fetch_inner(c, url, outBuf, outLen);
+    if (o) snprintf(o->contentType, sizeof(o->contentType), "%s", c->ctype);
+    c->stopAfterHeaders = NULL;
     scePthreadMutexUnlock(&c->mtx);
     return rc;
+}
+
+int aseg_fetch_ch(int ch, const char *url, uint8_t **outBuf, int *outLen) {
+    return aseg_fetch_opts(ch, url, outBuf, outLen, NULL);
 }
 
 int aseg_fetch_ui(const char *url, uint8_t **outBuf, int *outLen) {

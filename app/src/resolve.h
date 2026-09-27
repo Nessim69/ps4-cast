@@ -12,10 +12,13 @@
 #define PS4CAST_RESOLVE_H
 
 // 1 if `url` looks like a web PAGE rather than a media file we can open directly.
+// 0 when the current request (urlopt_kind) declares Type=file or Type=hls.
 int resolve_is_page(const char *url);
 
 // Fetch `pageUrl` and extract the best manifest URL into out (with |Referer=...
-// options appended, since CDNs almost always gate on it). Returns 1 on success.
+// options appended, since CDNs almost always gate on it). Returns 1 on success;
+// 0 otherwise, including when the URL answers with a media Content-Type (it is
+// not a page: play it as-is). Reads at most 2 MB of a page, within ~8 s.
 int resolve_page(const char *pageUrl, char *out, int cap);
 
 // Short human-readable note about the last attempt, for /status.

@@ -35,11 +35,28 @@ int aseg_fetch_ui(const char *url, uint8_t **buf, int *len);
 // Legacy entry point: ASEG_CH_PLAYLIST.
 int aseg_fetch(const char *url, uint8_t **buf, int *len);
 
+// Per-call options, for probing a URL that may or may not be a web page
+// (resolve.c). A zeroed AsegOpts behaves exactly like aseg_fetch_ch().
+typedef struct {
+    int       maxBytes;     // >0: keep at most this many body bytes (then drop the connection)
+    uint64_t  budgetUs;     // >0: whole-fetch budget instead of the channel's
+    // Called with the final 2xx response's Content-Type ("" if absent) before
+    // any body is read; nonzero stops there and the fetch returns ASEG_STOPPED
+    // with no body. (Not consulted on the SceHttp fallback, which cannot see
+    // headers; maxBytes and budgetUs still bound it.)
+    int     (*stopAfterHeaders)(const char *contentType);
+    char      contentType[96];   // out: Content-Type of the final response
+} AsegOpts;
+#define ASEG_STOPPED 1
+int aseg_fetch_opts(int ch, const char *url, uint8_t **buf, int *len, AsegOpts *o);
+
 // Abort fetches in progress (Stop / new cast / teardown) on the three stream
 // channels (VIDEO, AUDIO, PLAYLIST). Sticky until aseg_resume().
 void aseg_abort(void);
 // Clear a stale abort on the stream channels before starting a new stream (see aseg.c).
 void aseg_resume(void);
+// Clear ONE stream channel's stale abort (resolve_page: see resolve.c).
+void aseg_resume_ch(int ch);
 // Tighten ASEG_CH_PLAYLIST's per-fetch time budget around small PLAYLIST
 // fetches (1) and restore the generous SEGMENT budget (0). A single budget for
 // both either starves slow segments (continuous rebuffering) or lets a dead
