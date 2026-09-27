@@ -21,6 +21,7 @@
 #include "vdec_hw.h"
 #include "notify.h"
 #include "audio.h"
+#include "watchdog.h"
 #endif
 
 #ifndef BOOT_MINIMAL
@@ -76,7 +77,6 @@
 #define SA_ONSTACK 0x0001
 #endif
 extern int sigaltstack(const stack_t *, stack_t *);
-extern void player_stage(const char **out);   // current player_play stage, for the hang log
 
 // Persist a one-line crash/hang note to /data (read back via GET /crashlog).
 // Uses raw syscalls so it's safe from a signal handler.
@@ -745,7 +745,7 @@ static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
             char nm[96]; httpd_chan_get(abs, nm, sizeof(nm), NULL, 0);
             int maxch = (lw - 240) / 24; if (maxch < 6) maxch = 6;
             if ((int)strlen(nm) > maxch) nm[maxch] = 0;
-            char num[8]; snprintf(num, sizeof(num), "%d", abs + 1);
+            char num[12]; snprintf(num, sizeof(num), "%d", abs + 1);
             gfx_text(g, lx + 24, y + (rowH - 6) / 2 - 8, num, 2, on ? INK : FAINT);
             gfx_text(g, lx + 118, y + (rowH - 6) / 2 - 12, nm, 3, on ? INK : TXT);
             if (httpd_chan_is_fav(abs)) gfx_text(g, lx + lw - 142, y + 17, "FAV", 2, on ? INK : WARN);
@@ -808,7 +808,7 @@ static void draw_channel_guide(Gfx *g, int sel, int railSel) {
         int maxch = (rw - 230) / 24; if (maxch < 4) maxch = 4;
         if ((int)strlen(name) > maxch) name[maxch] = '\0';
 
-        char num[8]; snprintf(num, sizeof(num), "%d", idx + 1);
+        char num[12]; snprintf(num, sizeof(num), "%d", idx + 1);
         GfxColor numc = seld ? INK : FAINT, nc = seld ? INK : TXT;
         gfx_text(g, rx + 26, rowY + rowH / 2 - 4, num, 2, numc);
         gfx_text(g, rx + 104, rowY + rowH / 2 - 12, name, 3, nc);

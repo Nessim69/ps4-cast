@@ -139,10 +139,12 @@ static int extract_best(const char *body, const char *pageUrl, char *out, int ca
             unescape(cand);
 
             char abs[1400];
-            if (strncmp(cand, "http", 4) == 0)      snprintf(abs, sizeof(abs), "%s", cand);
-            else if (cand[0] == '/' && cand[1] == '/') snprintf(abs, sizeof(abs), "https:%s", cand);
-            else if (cand[0] == '/')                snprintf(abs, sizeof(abs), "%s%s", origin, cand);
+            int an;
+            if (strncmp(cand, "http", 4) == 0)      an = snprintf(abs, sizeof(abs), "%s", cand);
+            else if (cand[0] == '/' && cand[1] == '/') an = snprintf(abs, sizeof(abs), "https:%s", cand);
+            else if (cand[0] == '/')                an = snprintf(abs, sizeof(abs), "%s%s", origin, cand);
             else continue;    // relative-to-directory: too ambiguous to guess safely
+            if (an < 0 || an >= (int)sizeof(abs)) continue;   // a clipped URL would request the wrong thing
 
             if (is_junk(abs)) continue;
             int sc = score_of(abs);

@@ -3,8 +3,7 @@
 #include "tls.h"
 #include "hls_parse.h"
 
-extern void watchdog_kick(void);
-extern const char *watchdog_note(const char *w);   // see aseg.c: bounded slow I/O must not look like a freeze
+#include "watchdog.h"   // see aseg.c: bounded slow I/O must not look like a freeze
 
 #include <stdio.h>
 #include <string.h>
@@ -608,7 +607,9 @@ int httpsrc_open(const char *url) {
             if (g_keepTlsMode == g_tlsmode && g_keepPort == g_port && strcmp(g_keepHost, g_host) == 0) {
                 g_sock = g_keepSock; g_tls = g_keepTls; g_keepSock = -1; g_keepTls = NULL; reuse = 1; g_kalive++;
             } else {
-                if (g_keepTls) tls_close(g_keepTls); sceNetSocketClose(g_keepSock); g_keepSock = -1; g_keepTls = NULL;
+                if (g_keepTls) tls_close(g_keepTls);
+                sceNetSocketClose(g_keepSock);
+                g_keepSock = -1; g_keepTls = NULL;
             }
         }
 

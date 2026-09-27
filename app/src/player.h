@@ -27,6 +27,7 @@ int  player_render(Gfx *g);          // blit newest video frame to g; 1 if drawn
 unsigned player_present_generation(void); // changes once per newly shown video frame
 void player_request_bar_clear(void); // call when an overlay draws over the letterbox bars (prevents ghosting)
 const char *player_status(void);     // short human-readable status line
+void player_stage(const char **out); // current player_play stage, for the hang log
 const char *player_error_code(void); // stable web-UI error category, empty when clear
 const char *player_error_message(void); // actionable user-facing detail
 void player_clear_error(void);       // dismiss the current playback error

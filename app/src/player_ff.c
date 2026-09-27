@@ -16,6 +16,7 @@
 #include "trace.h"
 #include "openq.h"
 #include "tls.h"
+#include "watchdog.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -145,7 +146,7 @@ void player_request_bar_clear(void) { g_barClearLeft = GFX_BUFFER_COUNT + 1; }
 static int   g_started = 0;        // intent: from play() until stop/EOF
 static int   g_active  = 0;        // currently decoding
 static int   g_gotFrame = 0;
-static char  g_status[160] = "idle";
+static char  g_status[256] = "idle";   // holds g_errorMessage whole
 // The spec the current pipeline was opened from: the requested string WITH its
 // |Referer=..&User-Agent=..&Cookie=..&Type=hls options (or the page-resolved
 // spec). Every reopen replays THIS -- replaying the option-stripped URL lost the
@@ -340,10 +341,6 @@ static void pipe_lock(void)  { if (g_pipeUp) scePthreadMutexLock(&g_pipeMtx); }
 static void op_abort_window(int mask);
 
 // ---- custom AVIO: uploaded file, plain HTTP(S), or HLS ---------------------
-extern void watchdog_kick(void);       // main.c: pet the main heartbeat / the opener's progress beat
-extern void watchdog_set_busy(int on);
-extern const char *watchdog_note(const char *w); // main.c: name the blocking call for a HANG line
-extern void watchdog_open_job(int on); // main.c: opener worker entering/leaving a request (OPENHANG beat)
 
 static int avio_read_cb(void *o, uint8_t *buf, int size) {
     (void)o;
@@ -2817,7 +2814,7 @@ static int render_threaded(Gfx *g) {
         // still waits for its full audio cushion.
         int fmp4Backpressure = g_isHls && hls_is_fmp4() &&
                                g_fqCount >= FQ_SLOTS - 2;
-        int audioReady = !g_haveAudio || audio_fill_ms() >= startupAudioMs ||
+        int audioReady = !g_haveAudio || audio_fill_ms() >= (unsigned)startupAudioMs ||
                          fmp4Backpressure || elapsed >= 2500000ULL || g_decEof;
         if ((!videoReady || !audioReady) && elapsed < 5000000ULL && !g_decEof)
             return 0;

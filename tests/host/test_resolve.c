@@ -124,6 +124,18 @@ int main(void) {
     CHECK(strstr(resolve_debug(), "fetch failed") != NULL);
     g_stubRc = 0;
 
+    // a root-relative candidate that only overflows once the origin is
+    // prepended is skipped, never requested as a clipped URL
+    {
+        static char body[1500];
+        char *b = body;
+        b += sprintf(b, "<html><video src=\"/");
+        memset(b, 'a', 1380); b += 1380;
+        sprintf(b, "/v.m3u8\"></video>");
+        g_stubBody = body;
+        CHECK(resolve_page("https://site.example/watch/6", out, sizeof out) == 0);
+    }
+
     test_media_types();
     test_is_page_kind();
 

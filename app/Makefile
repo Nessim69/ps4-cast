@@ -53,13 +53,20 @@ CPPFILES    := $(wildcard src/*.cpp)
 OBJS        := $(patsubst src/%.c, $(INTDIR)/%.o, $(CFILES)) \
                $(patsubst src/%.cpp, $(INTDIR)/%.o, $(CPPFILES))
 
+# Warnings: -Wall -Wextra on everything we write (the tree builds clean).
+# FFmpeg and BearSSL are system includes so a newer compiler's findings in
+# their headers don't bury ours. `make WERROR=1` turns warnings into errors
+# (CI / pre-release); it stays off by default so a newer Homebrew LLVM with
+# new diagnostics can't break a local build.
+WARNFLAGS   := -Wall -Wextra $(if $(filter 1,$(WERROR)),-Werror,)
+
 # Flags
 CFLAGS      := --target=x86_64-pc-freebsd12-elf -O2 -fno-strict-aliasing \
-               -fPIC -funwind-tables -c $(EXTRAFLAGS) \
+               -fPIC -funwind-tables -c $(WARNFLAGS) $(EXTRAFLAGS) \
                -DAPP_VER='"$(VERSION)"' \
                $(if $(filter 1,$(BOOT_MINIMAL)),-DBOOT_MINIMAL,) \
-               -I$(FFMPEG)/include \
-               -I$(BEARSSL)/include \
+               -isystem $(FFMPEG)/include \
+               -isystem $(BEARSSL)/include \
                -isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include
 CXXFLAGS    := $(CFLAGS) -isystem $(TOOLCHAIN)/include/c++/v1
 LDFLAGS     := -m elf_x86_64 -pie --script $(TOOLCHAIN)/link.x --eh-frame-hdr \

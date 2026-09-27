@@ -6,10 +6,12 @@
 #include <orbis/Sysmodule.h>
 
 int net_init(void) {
-    if (sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NET) < 0)
-        return -1;
-    if (sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NETCTL) < 0)
-        return -2;
+    // The Net/NetCtl PRXs are also linked (-lSceNet/-lSceNetCtl), so these
+    // loads are belt and braces. The call returns uint32_t: the old "< 0"
+    // tests could never fire, and a real failure surfaces from
+    // sceNetInit/sceNetCtlInit below either way.
+    (void)sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NET);
+    (void)sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NETCTL);
 
     if (sceNetInit() < 0)
         return -3;

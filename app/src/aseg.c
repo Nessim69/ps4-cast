@@ -9,8 +9,7 @@
 // never mask a true freeze — it only stops a SLOW-but-bounded playlist/segment
 // fetch from being mistaken for one (the "HANG watchdog stale=35s" fail-close
 // seen while zapping past several unreachable channels in a row).
-extern void watchdog_kick(void);
-extern const char *watchdog_note(const char *w);
+#include "watchdog.h"
 
 #include <stdio.h>
 #include <string.h>

@@ -76,6 +76,10 @@ by `scripts/fetch-toolchain.sh` (cached in `../ps4-cast-artifacts/`). Then:
 ./build.sh clean
 ```
 
+The app compiles with `-Wall -Wextra` and builds warning-free; keep it that
+way. `./build.sh WERROR=1` fails the build on any warning (CI, or before a
+release).
+
 Pure-logic regression tests run on the Mac alone (HLS parsing, URL options,
 page scraping): `make -C tests/host test`. Cut a release with
 `scripts/release.sh <version>` — bumps `app/Makefile`, builds, and appends the

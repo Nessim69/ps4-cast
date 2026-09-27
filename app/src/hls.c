@@ -1,6 +1,5 @@
 #include "hls.h"
-extern void watchdog_kick(void);
-extern const char *watchdog_note(const char *w);
+#include "watchdog.h"
 #include "httpsrc.h"
 #include "aseg.h"
 #include "hls_parse.h"
@@ -280,12 +279,6 @@ int hls_buffer_pct(void) {
     int depth = g_prefDepth > 0 ? g_prefDepth : 1;
     int pct = cached * 100 / depth;
     return pct > 100 ? 100 : pct;
-}
-
-static void rstrip(char *s) {
-    int n = (int)strlen(s);
-    while (n > 0 && (s[n-1] == '\r' || s[n-1] == '\n' || s[n-1] == ' ' || s[n-1] == '\t'))
-        s[--n] = '\0';
 }
 
 static void free_segs(void) {

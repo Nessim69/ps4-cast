@@ -1,6 +1,6 @@
 #include "tls.h"
 
-extern void watchdog_kick(void);
+#include "watchdog.h"
 
 // NOTE: deliberately NO unconditional watchdog_kick() in ll_read/ll_write. g_heartbeat means
 // "the main render loop is alive"; kicking it from the read-ahead / audio threads

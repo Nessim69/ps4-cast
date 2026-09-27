@@ -423,17 +423,6 @@ static void json_str(char *out, int cap, int *po, const char *s, int maxchars) {
     *po = o;
 }
 
-// Derive a readable name from a URL: last path segment without the query/hash.
-static void name_from_url(const char *url, char *out, int cap) {
-    const char *q = strpbrk(url, "?#");
-    const char *end = q ? q : url + strlen(url);
-    const char *slash = end;
-    while (slash > url && slash[-1] != '/') slash--;
-    int n = (int)(end - slash);
-    if (n <= 0 || n >= cap) { strncpy(out, "stream", cap - 1); out[cap - 1] = '\0'; return; }
-    memcpy(out, slash, n); out[n] = '\0';
-}
-
 int httpd_take_next(char *out, int len) {
     int got = 0;
     scePthreadMutexLock(&g_mtx);
@@ -462,7 +451,6 @@ static void chan_tuned_push_cb(const char *url) {
     strncpy(g_last_push, url, sizeof(g_last_push) - 1);
     g_last_push[sizeof(g_last_push) - 1] = '\0';
 }
-static void chan_save_file(void) { httpd_channels_save(); }
 
 // %s = ssdp_uuid(): the per-install UUID, shared with SSDP's USN so a control
 // point's description.xml fetch and its SSDP discovery agree on one identity
@@ -1684,7 +1672,7 @@ static void handle_client(OrbisNetId c) {
         } while (0)
         JAPP("{\"ver\":"); json_str(json, cap, &o, APP_VER, 16);
         JAPP(",\"goldhen\":"); json_str(json, cap, &o, goldhen_status(), 96);
-        JAPP(",\"status\":"); json_str(json, cap, &o, player_status(), 159);
+        JAPP(",\"status\":"); json_str(json, cap, &o, player_status(), 255);
         JAPP(",\"ssdp\":"); json_str(json, cap, &o, ssdp_status(), 159);
         JAPP(",\"active\":%d,\"paused\":%d,\"cur\":%d,\"dur\":%d,\"last_push\":",
              active, player_is_paused(), (int)(cur + 0.5), (int)(dur + 0.5));
