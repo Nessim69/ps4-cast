@@ -697,11 +697,13 @@ function applyStored(j){storedInfo=j&&j.exists?j:null;$('stored').hidden=!stored
  if(storedInfo){$('storedName').textContent=storedInfo.name||'Uploaded video';$('storedSize').textContent=fmtBytes(storedInfo.size)+' on PS4 storage'}}
 async function refreshLists(){
  var res=await Promise.all([getj('/favs'),getj('/recent'),getj('/resume'),getj('/upload/status')]);
- var f=res[0]||[],r=res[1]||[],c=res[2]||[],up=res[3]||null;
- if(listChanged('fav',f)){favData=f;listPane('paneFav','cFav','fav',favData,IC_STAR,'No favorites yet. Tap the ★ on a link to save it.',false)}
- if(listChanged('rec',r)){recData=r;listPane('paneRec','cRec','rec',recData,IC_CLOCK,'Nothing played yet.',true)}
- if(listChanged('cont',c)){contData=c;renderCont(contData)}
- if(listChanged('upload',up))applyStored(up)}
+ // A failed fetch (null) keeps what is shown: nothing asks again until the
+ // next lists_ver change, so rendering it as an empty list would stick.
+ var f=res[0],r=res[1],c=res[2],up=res[3];
+ if(f&&listChanged('fav',f)){favData=f;listPane('paneFav','cFav','fav',favData,IC_STAR,'No favorites yet. Tap the ★ on a link to save it.',false)}
+ if(r&&listChanged('rec',r)){recData=r;listPane('paneRec','cRec','rec',recData,IC_CLOCK,'Nothing played yet.',true)}
+ if(c&&listChanged('cont',c)){contData=c;renderCont(contData)}
+ if(up&&listChanged('upload',up))applyStored(up)}
 
 // Single delegated handler for every row/chip/button built above: it looks the
 // real value up by index in the JS-held array it names instead of the value
