@@ -352,6 +352,9 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
   <div class="txt"><div class="a">Pairing token <span class="tokval" id="tokVal">—</span></div><div class="b">Regenerate if you have shared the link. Paired devices re-pair themselves; the Chrome extension does it on its next cast.</div></div>
   <button class="mini" id="btnRegen" onclick="regenToken()">Regenerate</button>
  </div>
+ <div class="set">
+  <div class="txt"><div class="a">Chrome extension pairing</div><div class="b" id="pairWinText">Press Square on the TV's Cast home screen to open a 2-minute window for the Chrome extension to pair.</div></div>
+ </div>
  <button class="setup-link" onclick="openHelper()">
   <svg viewBox="0 0 24 24" fill="none"><rect x="6.5" y="2.5" width="11" height="19" rx="2.2" stroke="currentColor" stroke-width="1.8"/><path d="M10 18h4M3 8.5a4 4 0 0 1 4-4M3 13a8.5 8.5 0 0 1 8.5-8.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
   <span class="st"><span class="a">Phone browser helper</span><span class="b">Send a playing Safari or Chrome video.</span></span><span class="chev">›</span>
@@ -393,12 +396,16 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
 <script>
 var $=function(i){return document.getElementById(i)};
 var drag=false,dur=0,hw=1,dbg=0,curTab='fav',webMode='cast',plData=[],chanCur=-1,curGroup='',curSearch='',manage=false,uploading=false;
+var favData=[],recData=[],contData=[];
+// lists_ver/chan_ver/pair_window are new /status fields; an older receiver
+// omits them, in which case we fall back to unconditional periodic polling.
+var listsVer=null,chanVer=null,listsVerSupported=false,chanVerSupported=false,pairWindow=0;
 var storedInfo=null,lastFailureUrl='',lastFailureLocal=false,lastFailureChan=-1;
 var handoffMediaUrl='',helperKind='android';
 function busy(b){$('spin').style.display=b?'inline-block':'none'}
 function msg(t){$('msg').textContent=t}
 function fmt(s){s=Math.max(0,s|0);var h=(s/3600)|0,m=((s/60)|0)%60,x=s%60,p=function(n){return(n<10?'0':'')+n};return h>0?h+':'+p(m)+':'+p(x):m+':'+p(x)}
-function esc(s){return(''+s).replace(/[<>&]/g,function(c){return c=='<'?'&lt;':c=='>'?'&gt;':'&amp;'})}
+function esc(s){return(''+s).replace(/[&<>"']/g,function(c){return c=='<'?'&lt;':c=='>'?'&gt;':c=='&'?'&amp;':c=='"'?'&quot;':'&#39;'})}
 function shorten(u){try{u=decodeURIComponent(u)}catch(e){}return u.length>60?u.slice(0,34)+'…'+u.slice(-22):u}
 function nameFromUrl(u){try{u=decodeURIComponent(u)}catch(e){}u=u.split(/[?#]/)[0];var p=u.split('/').filter(Boolean);return p.length?p[p.length-1]:u}
 async function post(p,b){try{return await fetch(withT(p),{method:'POST',headers:{'Content-Type':'text/plain','X-PS4Cast-Token':TOKEN||''},body:b||''})}catch(e){}}
@@ -422,6 +429,13 @@ async function regenToken(){
  TOKEN=t;try{localStorage.setItem('ps4cast-token',t)}catch(e){}
  var el=document.getElementById('tokVal');if(el)el.textContent=t;
  msg('New token '+t)
+}
+// pair_window is seconds left in a pairing window opened by pressing Square on
+// the TV's Cast home screen; the Chrome extension can pair itself while it runs.
+function setPairWindow(sec){
+ pairWindow=sec|0;var el=$('pairWinText');if(!el)return;
+ el.textContent=pairWindow>0?'Pairing window open — '+pairWindow+'s':
+  "Press Square on the TV's Cast home screen to open a 2-minute window for the Chrome extension to pair.";
 }
 function setMode(mode){webMode=mode==='iptv'?'iptv':'cast';$('viewCast').hidden=webMode!=='cast';$('viewIptv').hidden=webMode!=='iptv';
  $('modeCast').classList.toggle('on',webMode==='cast');$('modeIptv').classList.toggle('on',webMode==='iptv');
@@ -521,11 +535,11 @@ async function confirmHandoff(){
 }
 
 async function cast(){var u=$('u').value.trim();if(!u){msg('Enter a link first');$('u').focus();return}setMode('cast');$('failure').hidden=true;busy(true);msg('Casting…');await post('/avplay',u)}
-function pick(u){try{u=decodeURIComponent(u)}catch(e){}setMode('cast');$('u').value=u;cast()}
+function pick(u){setMode('cast');$('u').value=u;cast()}
 async function stop(){busy(false);await post('/stop');msg('Stopped')}
 async function toggle(){await post('/pause')}
 async function skip(d){var v=Math.max(0,(+$('sk').value)+d);$('sk').value=v;setSeek(v);await post('/seek',''+v)}
-async function fav(){var u=$('u').value.trim();if(u){await post('/fav',u);msg('Saved to favorites');loadLists()}else msg('Enter a link first')}
+async function fav(){var u=$('u').value.trim();if(u){await post('/fav',u);msg('Saved to favorites');refreshLists()}else msg('Enter a link first')}
 async function queue(){var u=$('u').value.trim();if(u){await post('/queue',u);msg('Added to queue')}else msg('Enter a link first')}
 
 function chooseLocal(){if(!uploading)$('localFile').click()}
@@ -537,7 +551,8 @@ function uploadLocal(file){
  if(!file||uploading)return;
  uploading=true;busy(true);$('localBtn').disabled=true;$('uploadTrack').hidden=false;$('uploadBar').style.transform='scaleX(0)';
  $('localLabel').textContent='Uploading 0%';msg('Uploading '+file.name);
- var x=new XMLHttpRequest();x.open('POST','/upload',true);x.setRequestHeader('Content-Type','application/octet-stream');
+ var x=new XMLHttpRequest();x.open('POST',withT('/upload'),true);x.setRequestHeader('Content-Type','application/octet-stream');
+ try{x.setRequestHeader('X-PS4Cast-Token',TOKEN||'')}catch(e){}
  try{x.setRequestHeader('X-PS4Cast-Filename',encodeURIComponent(file.name))}catch(e){x.setRequestHeader('X-PS4Cast-Filename','Local%20file')}
  x.upload.onprogress=function(e){if(!e.lengthComputable)return;var p=Math.min(100,Math.round(e.loaded/e.total*100));$('uploadBar').style.transform='scaleX('+(p/100)+')';$('localLabel').textContent='Uploading '+p+'%'};
  x.onload=function(){var ok=x.status>=200&&x.status<300;finishUpload(ok,ok?'Opening '+file.name:(x.responseText||'Upload failed'))};
@@ -548,8 +563,7 @@ function uploadLocal(file){
 $('localFile').addEventListener('change',function(){uploadLocal(this.files&&this.files[0])});
 
 function fmtBytes(n){if(!n)return '0 B';var u=['B','KB','MB','GB','TB'],i=Math.min(u.length-1,Math.floor(Math.log(n)/Math.log(1024)));return(n/Math.pow(1024,i)).toFixed(i>1?1:0)+' '+u[i]}
-async function loadStored(){var j=await getj('/upload/status');storedInfo=j&&j.exists?j:null;$('stored').hidden=!storedInfo;
- if(storedInfo){$('storedName').textContent=storedInfo.name||'Uploaded video';$('storedSize').textContent=fmtBytes(storedInfo.size)+' on PS4 storage'}}
+async function loadStored(){var j=await getj('/upload/status');if(listChanged('upload',j||null))applyStored(j)}
 async function replayStored(){setMode('cast');$('failure').hidden=true;busy(true);msg('Opening uploaded video…');var r=await post('/upload/replay');if(!r||!r.ok){busy(false);msg('Uploaded file is no longer available');loadStored()}}
 async function deleteStored(){if(!confirm('Delete this uploaded video from PS4 storage?'))return;await post('/upload/delete');storedInfo=null;$('stored').hidden=true;busy(false);msg('Uploaded video deleted')}
 
@@ -576,10 +590,12 @@ async function loadPlaylist(){var u=$('purl').value.trim();if(!u){msg('Paste an 
   if(!plData.length){msg('No channels found in that link')}else{msg(plData.length+' channels — tap one to play')}}
  catch(e){busy(false);msg('Could not load that playlist')}}
 
-function rowHtml(name,url,icon,rm){var e=encodeURIComponent(url);return '<div class="row" onclick="pick(\''+e+'\')">'+
- '<div class="ic">'+icon+'</div><div class="tx"><div class="n">'+esc(name)+'</div><div class="u">'+esc(shorten(url))+'</div></div>'+
- (rm?'<button class="x" onclick="event.stopPropagation();'+rm+'(\''+e+'\')" aria-label="Remove">×</button>':
-   '<div class="go"><svg viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>')+'</div>'}
+// Row/chip markup never interpolates data into inline handlers: actionable
+// elements carry data-kind/data-act/data-idx and a single delegated click
+// listener (below) looks the real value up in the JS-held array it names.
+// That keeps a hostile name/url/group (e.g. from an unauthenticated DLNA
+// push or an M3U group-title) inert no matter what characters it contains.
+var IC_GO='<div class="go"><svg viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>';
 var IC_TV='<svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M8 21h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
 var IC_STAR='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 4l2.3 4.7 5.2.8-3.8 3.6.9 5.1L12 16.6 7.2 18.8l.9-5.1L4.3 9.5l5.2-.8z"/></svg>';
 var IC_CLOCK='<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.2" stroke="currentColor" stroke-width="1.8"/><path d="M12 8v4.3l2.6 1.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
@@ -589,17 +605,25 @@ function chanRow(i,name,on){
  if(manage){return '<div class="row'+(on?' on':'')+'">'+
   '<div class="ic">'+IC_TV+'</div>'+
   '<div class="tx"><div class="n">'+esc(name)+'</div><div class="s">'+esc(plData[i].g||'no group')+'</div></div>'+
-  '<button class="chipf" onclick="event.stopPropagation();favChan('+i+')">'+(plData[i].f?'★':'☆')+'</button>'+
-  '<button class="chipf" onclick="event.stopPropagation();editChan('+i+')">Edit</button>'+
-  '<button class="chipf" onclick="event.stopPropagation();delChan('+i+')">Delete</button>'+
+  '<button class="chipf" data-kind="chan" data-act="fav" data-idx="'+i+'">'+(plData[i].f?'★':'☆')+'</button>'+
+  '<button class="chipf" data-kind="chan" data-act="edit" data-idx="'+i+'">Edit</button>'+
+  '<button class="chipf" data-kind="chan" data-act="del" data-idx="'+i+'">Delete</button>'+
   '</div>'}
- return '<div class="row'+(on?' on':'')+'" onclick="chanPick('+i+')">'+
+ return '<div class="row'+(on?' on':'')+'" data-kind="chan" data-act="tune" data-idx="'+i+'">'+
  '<div class="ic">'+(on?'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>':IC_TV)+'</div>'+
  '<div class="tx"><div class="n">'+esc(name)+'</div></div>'+
- (on?'<div class="live">LIVE</div>':'<div class="go"><svg viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>')+'</div>'}
+ (on?'<div class="live">LIVE</div>':IC_GO)+'</div>'}
 
 // ---- channel management (uses /channels, /channel/add|edit|del|fav) ----------
-async function reloadChans(){var a=await getj('/channels');if(a){plData=a;renderPane('pl')}}
+// Every list keeps its last-seen JSON so a periodic refresh (version-driven or
+// the legacy 5s fallback) can skip the rebuild — and the scroll position that
+// comes with it — when nothing actually changed.
+var plGroups=[];
+var listCache={fav:null,rec:null,cont:null,chan:null,upload:null};
+function listChanged(kind,val){var j=JSON.stringify(val);if(listCache[kind]===j)return false;listCache[kind]=j;return true}
+function scrollTopOf(el){var s=el&&el.querySelector('.scrolly');return s?s.scrollTop:0}
+function restoreScroll(el,top){var s=el&&el.querySelector('.scrolly');if(s)s.scrollTop=top}
+async function reloadChans(){var a=await getj('/channels');if(a&&listChanged('chan',a)){plData=a;renderPane('pl')}}
 function toggleManage(){manage=!manage;
  $('mgBtn').classList.toggle('on',manage);
  $('mgAdd').hidden=!manage;$('mgClear').hidden=!manage;
@@ -627,43 +651,78 @@ function setGroup(g){curGroup=g;renderPane('pl')}
 function onSearch(){curSearch=($('chSearch').value||'').trim().toLowerCase();renderPane('pl')}
 function chanName(i){return plData[i].n||nameFromUrl(plData[i].u)}
 function renderPane(which){
- if(which=='pl'){$('chTools').hidden=!plData.length;$('modeChanCount').textContent=plData.length?' '+plData.length:'';if(!plData.length){$('panePl').innerHTML='<div class="empty">Add an M3U playlist to browse channels here.</div>';return}
+ if(which=='pl'){$('chTools').hidden=!plData.length;$('modeChanCount').textContent=plData.length?' '+plData.length:'';
+  var container=$('panePl'),top=scrollTopOf(container);
+  if(!plData.length){container.innerHTML='<div class="empty">Add an M3U playlist to browse channels here.</div>';return}
   var groups=[],seen={};for(var k=0;k<plData.length;k++){var g=plData[k].g||'';if(g&&!seen[g]){seen[g]=1;groups.push(g)}}
   var h='';
-  if(groups.length>1){h+='<div class="chips"><button class="chipf'+(curGroup===''?' on':'')+'" onclick="setGroup(\'\')">All</button>';
-   for(var gi=0;gi<groups.length;gi++){h+='<button class="chipf'+(curGroup===groups[gi]?' on':'')+'" onclick="setGroup(\''+esc(groups[gi]).replace(/\x27/g,"&#39;")+'\')">'+esc(groups[gi])+'</button>'}h+='</div>'}
+  if(groups.length>1){plGroups=groups;
+   h+='<div class="chips"><button class="chipf'+(curGroup===''?' on':'')+'" data-kind="group" data-act="set" data-idx="-1">All</button>';
+   for(var gi=0;gi<groups.length;gi++){h+='<button class="chipf'+(curGroup===groups[gi]?' on':'')+'" data-kind="group" data-act="set" data-idx="'+gi+'">'+esc(groups[gi])+'</button>'}h+='</div>'}
   h+='<div class="scrolly">';var shown=0;
   for(var i=0;i<plData.length;i++){if(curGroup&&(plData[i].g||'')!==curGroup)continue;
    if(curSearch&&chanName(i).toLowerCase().indexOf(curSearch)<0)continue;
    h+=chanRow(i,chanName(i),i==chanCur);shown++}
   h+='</div>';
   if(!shown)h+='<div class="empty">'+(curSearch?'No channels match “'+esc(curSearch)+'”.':'No channels in this group.')+'</div>';
-  $('panePl').innerHTML=h}
+  container.innerHTML=h;restoreScroll(container,top)}
 }
-function listPane(id,cntId,arr,icon,emptyMsg,rm){
+function listPane(id,cntId,kind,arr,icon,emptyMsg,removable){
  var el=$(id);$(cntId).textContent=arr&&arr.length?arr.length:'';
+ var top=scrollTopOf(el);
  if(!arr||!arr.length){el.innerHTML='<div class="empty">'+emptyMsg+'</div>';return}
- var h='<div class="scrolly">';for(var i=0;i<arr.length;i++){h+=rowHtml(nameFromUrl(arr[i]),arr[i],icon,rm)}h+='</div>';el.innerHTML=h}
-async function rmRecent(e){await post('/recent/clear',decodeURIComponent(e));loadLists();msg('Removed')}
-async function rmResume(e){await post('/resume/clear',decodeURIComponent(e));loadResume();msg('Removed')}
-async function restartItem(e){await post('/resume/clear',decodeURIComponent(e));pick(e)}
+ var h='<div class="scrolly">';
+ for(var i=0;i<arr.length;i++){var u=arr[i];
+  h+='<div class="row" data-kind="'+kind+'" data-act="pick" data-idx="'+i+'">'+
+   '<div class="ic">'+icon+'</div><div class="tx"><div class="n">'+esc(nameFromUrl(u))+'</div><div class="u">'+esc(shorten(u))+'</div></div>'+
+   (removable?'<button class="x" data-kind="'+kind+'" data-act="rm" data-idx="'+i+'" aria-label="Remove">×</button>':IC_GO)+'</div>'}
+ h+='</div>';el.innerHTML=h;restoreScroll(el,top)}
+async function rmRecent(u){await post('/recent/clear',u);await refreshLists();msg('Removed')}
+async function rmResume(u){await post('/resume/clear',u);await refreshLists();msg('Removed')}
+async function restartItem(u){await post('/resume/clear',u);pick(u)}
 function fmtLeft(p,d){var left=Math.max(0,d-p);var m=Math.round(left/60);return m<1?'<1 min left':m+' min left'}
-function renderCont(a){if(!a||!a.length){$('cont').innerHTML='';return}
+function renderCont(arr){
+ var el=$('cont'),top=scrollTopOf(el);
+ if(!arr||!arr.length){el.innerHTML='';return}
  var h='<div class="lbl" style="margin-top:2px">Continue watching</div><div class="scrolly" style="max-height:none">';
- for(var i=0;i<a.length;i++){var it=a[i],pct=it.d>0?Math.min(100,Math.round(it.p/it.d*100)):0;
-  var e=encodeURIComponent(it.u);
-  h+='<div class="row" onclick="pick(\''+e+'\')">'+
+ for(var i=0;i<arr.length;i++){var it=arr[i],pct=it.d>0?Math.min(100,Math.round(it.p/it.d*100)):0;
+  h+='<div class="row" data-kind="cont" data-act="pick" data-idx="'+i+'">'+
    '<div class="ic"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>'+
    '<div class="tx"><div class="n">'+esc(nameFromUrl(it.u))+'</div><div class="pbar"><span style="width:'+pct+'%"></span></div></div>'+
    '<div class="left">'+fmtLeft(it.p,it.d)+'</div>'+
-   '<button class="x" onclick="event.stopPropagation();restartItem(\''+e+'\')" aria-label="Restart">↺</button>'+
-   '<button class="x" onclick="event.stopPropagation();rmResume(\''+e+'\')" aria-label="Remove">×</button></div>'}
- h+='</div>';$('cont').innerHTML=h}
-async function loadResume(){renderCont(await getj('/resume'))}
-async function loadLists(){var f=await getj('/favs'),r=await getj('/recent');
- listPane('paneFav','cFav',f,IC_STAR,'No favorites yet. Tap the ★ on a link to save it.');
- listPane('paneRec','cRec',r,IC_CLOCK,'Nothing played yet.','rmRecent');
- loadResume()}
+   '<button class="x" data-kind="cont" data-act="restart" data-idx="'+i+'" aria-label="Restart">↺</button>'+
+   '<button class="x" data-kind="cont" data-act="rm" data-idx="'+i+'" aria-label="Remove">×</button></div>'}
+ h+='</div>';el.innerHTML=h;restoreScroll(el,top)}
+function applyStored(j){storedInfo=j&&j.exists?j:null;$('stored').hidden=!storedInfo;
+ if(storedInfo){$('storedName').textContent=storedInfo.name||'Uploaded video';$('storedSize').textContent=fmtBytes(storedInfo.size)+' on PS4 storage'}}
+async function refreshLists(){
+ var res=await Promise.all([getj('/favs'),getj('/recent'),getj('/resume'),getj('/upload/status')]);
+ var f=res[0]||[],r=res[1]||[],c=res[2]||[],up=res[3]||null;
+ if(listChanged('fav',f)){favData=f;listPane('paneFav','cFav','fav',favData,IC_STAR,'No favorites yet. Tap the ★ on a link to save it.',false)}
+ if(listChanged('rec',r)){recData=r;listPane('paneRec','cRec','rec',recData,IC_CLOCK,'Nothing played yet.',true)}
+ if(listChanged('cont',c)){contData=c;renderCont(contData)}
+ if(listChanged('upload',up))applyStored(up)}
+
+// Single delegated handler for every row/chip/button built above: it looks the
+// real value up by index in the JS-held array it names instead of the value
+// ever being placed in markup, so a hostile name/url/group (e.g. from an
+// unauthenticated DLNA push, or an M3U group-title) can't matter what
+// characters it contains.
+document.addEventListener('click',function(e){
+ var t=e.target.closest('[data-act]');if(!t)return;
+ var kind=t.dataset.kind,act=t.dataset.act,idx=+t.dataset.idx;
+ if(kind==='fav'||kind==='rec'){
+  var u=(kind==='fav'?favData:recData)[idx];if(u==null)return;
+  if(act==='pick')pick(u);else if(act==='rm')rmRecent(u);
+ }else if(kind==='cont'){
+  var it=contData[idx];if(!it)return;
+  if(act==='pick')pick(it.u);else if(act==='restart')restartItem(it.u);else if(act==='rm')rmResume(it.u);
+ }else if(kind==='chan'){
+  if(act==='tune')chanPick(idx);else if(act==='fav')favChan(idx);else if(act==='edit')editChan(idx);else if(act==='del')delChan(idx);
+ }else if(kind==='group'){
+  setGroup(idx<0?'':plGroups[idx]);
+ }
+});
 
 function tab(t){curTab=t;var ids={fav:'paneFav',rec:'paneRec'};
  for(var k in ids){$(ids[k]).hidden=(k!=t)}
@@ -684,7 +743,7 @@ function setSeek(v){var m=+$('sk').max||100;$('sk').style.setProperty('--p',(m?(
 $('sk').addEventListener('input',function(){drag=true;setSeek(+this.value);$('cur').textContent=fmt(+this.value)});
 $('sk').addEventListener('change',async function(){await post('/seek',''+this.value);drag=false});
 
-async function poll(){if(uploading)return;var j=await getj('/status');
+async function poll(){if(document.hidden||uploading)return;var j=await getj('/status');
  if(!j){$('dot').className='dot';$('state').textContent='offline';busy(false);msg('Reconnecting to PS4…');return}
  var on=j.active==1||j.paused==1;
  $('dot').className='dot'+(on?' live':'');$('state').textContent=on?(j.paused==1?'Paused':'Playing'):'Idle';
@@ -704,6 +763,13 @@ async function poll(){if(uploading)return;var j=await getj('/status');
  if(document.getElementById('tokVal')&&document.getElementById('tokVal').textContent==='—')showToken()
  if(j.chan_cur!=null&&j.chan_cur!=chanCur){chanCur=j.chan_cur;if(plData.length)renderPane('pl')}
  if(j.error_code)showFailure(j);else if(on)$('failure').hidden=true;
+ // lists_ver/chan_ver let us refetch only what actually changed; an older
+ // receiver omits them, so the 5s fallback timer below polls unconditionally.
+ if(j.lists_ver!=null){listsVerSupported=true;if(listsVer!==j.lists_ver){listsVer=j.lists_ver;refreshLists()}}
+ else listsVerSupported=false;
+ if(j.chan_ver!=null){chanVerSupported=true;if(chanVer!==j.chan_ver){chanVer=j.chan_ver;reloadChans()}}
+ else chanVerSupported=false;
+ setPairWindow(j.pair_window||0);
 }
 $('u').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();cast()}});
 $('u').addEventListener('focus',function(){this.select()});
@@ -712,7 +778,12 @@ $('purl').addEventListener('focus',function(){this.select()});
 try{setMode(localStorage.getItem('ps4cast-mode')||'cast')}catch(e){setMode('cast')}tab('fav');
 if(location.pathname==='/setup')openHelper();else initHandoff();
 if(location.pathname!=='/handoff'&&location.pathname!=='/setup'&&webMode==='cast')try{$('u').focus()}catch(e){}
-setInterval(poll,1000);loadStored();poll();loadLists();reloadChans();setInterval(function(){if(!uploading){loadLists();loadStored();reloadChans()}},5000);
+setInterval(poll,1000);poll();refreshLists();reloadChans();
+// Fallback cadence for a receiver too old to send lists_ver/chan_ver (poll()
+// then never learns it should skip these). Both timers no-op while the tab
+// is hidden, and a return to the tab polls right away instead of waiting.
+setInterval(function(){if(document.hidden||uploading)return;if(!listsVerSupported)refreshLists();if(!chanVerSupported)reloadChans()},5000);
+document.addEventListener('visibilitychange',function(){if(document.hidden)return;poll();refreshLists();reloadChans()});
 </script>
 </body>
 </html>
