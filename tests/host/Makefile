@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -Wno-unused-parameter -g -O1 -std=gnu11
 
 SRC = ../../app/src
 
-TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_agent_crypto
+TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_netwatch test_agent_crypto
 
 # HLS AES-128 decryption (app/src/hls_crypt.c) against BearSSL's AES, built
 # from the pinned source tree that portlibs/fetch.sh unpacks. Skipped (with a
@@ -41,6 +41,10 @@ test_openq: test_openq.c $(SRC)/openq.c
 # Private-host detection, cookie scope, build-date parsing (app/src/netpolicy.c).
 test_netpolicy: test_netpolicy.c $(SRC)/netpolicy.c
 	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_netpolicy.c $(SRC)/netpolicy.c
+
+# Address appeared/changed/lost detector (app/src/netwatch.c).
+test_netwatch: test_netwatch.c $(SRC)/netwatch.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_netwatch.c $(SRC)/netwatch.c
 
 # Deploy agent's SHA-256/HMAC and wire parser (payloads/ps4cast-dpi).
 AGENT = ../../payloads/ps4cast-dpi

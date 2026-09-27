@@ -558,3 +558,21 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
   the console. Also fixed: an fMP4 init segment served through the aseg
   fallback was replayed forever while media segments were skipped.
 - `tests/hls-e2e/run.sh` exercises all of this against a local server.
+
+## Network changes (netmon)
+
+- The LAN address was read once at launch: a console whose Wi-Fi came up
+  after PS4 Cast never started its web server or SSDP (and skipped loading
+  settings, token and channels), and a new DHCP lease left the TV, QR code and
+  SSDP LOCATION on a dead address until relaunch.
+- Now `httpd_init()` always loads state at boot; `netmon.c` polls the address
+  every 2 s (first poll synchronous, so a normal boot is unchanged), retries
+  `httpd_listen()` until it succeeds, starts SSDP once there is an address,
+  and on a change calls `ssdp_set_ip()` (drop + re-join the multicast group
+  on the new interface, new LOCATION, re-announce; applied by the SSDP thread,
+  whose receive timeout is now 5 s). The TV and QR code follow `netmon_ip()`,
+  and a toast gives the new URL.
+- `netwatch.c` (host-tested) debounces: a first address is adopted at once, a
+  different one after 2 consecutive polls, a loss after 3.
+- Open connections to the old address (phone UI, a playing stream) still drop
+  with it; the phone must reopen the URL shown on the TV.

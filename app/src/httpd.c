@@ -2262,7 +2262,10 @@ static void *server_main(void *arg) {
     return NULL;
 }
 
-int httpd_start(int port) {
+void httpd_init(void) {
+    static int inited = 0;
+    if (inited) return;
+    inited = 1;
     scePthreadMutexInit(&g_mtx, NULL, "ps4cast_mtx");
     sceKernelUnlink(UPLOAD_TMP_PATH); // discard a partial upload left by power loss/crash
     favs_load();    // restore saved favorites from /data
@@ -2273,7 +2276,10 @@ int httpd_start(int port) {
     resume_load();  // restore saved per-URL resume positions
     httpd_channels_init(); // channel store mutex + restore the last-loaded list
     httpd_channels_set_push_cb(chan_tuned_push_cb);
+}
 
+int httpd_listen(int port) {
+    if (g_started) return 0;
     g_listen = sceNetSocket("ps4cast", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_STREAM, 0);
     if (g_listen < 0)
         return -1;
@@ -2319,6 +2325,11 @@ int httpd_start(int port) {
     if (scePthreadCreate(&g_event_thread, NULL, event_main, NULL, "ps4cast_event") == 0)
         g_event_thread_up = 1;
     return 0;
+}
+
+int httpd_start(int port) {
+    httpd_init();
+    return httpd_listen(port);
 }
 
 void httpd_poll(void) {

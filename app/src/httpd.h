@@ -3,7 +3,15 @@
 #ifndef PS4CAST_HTTPD_H
 #define PS4CAST_HTTPD_H
 
-int  httpd_start(int port);                       // 0 on success
+// Load the persisted state (settings, token, favorites, resume positions,
+// channels). Once, from main(), before any thread uses httpd -- whether or
+// not the network is up yet.
+void httpd_init(void);
+// Open :port and start the server threads. 0 on success, also when already
+// listening; safe to retry until it succeeds (netmon.c does, so a console
+// that boots before its network comes up still gets a server).
+int  httpd_listen(int port);
+int  httpd_start(int port);                       // httpd_init + httpd_listen
 void httpd_poll(void);                            // service pending clients
 int  httpd_take_play_request(char *out, int len); // 1 if a new URL was posted
 // Returns 1 for a normal cast/local file and 2 for an IPTV channel selection.

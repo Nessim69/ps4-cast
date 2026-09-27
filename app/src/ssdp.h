@@ -4,6 +4,10 @@
 
 int ssdp_start(const char *ip, int http_port);
 const char *ssdp_status(void);
+// The console's address changed (or came back): re-join the multicast group
+// on it, advertise the new LOCATION and re-announce. Applied by the SSDP
+// thread within a few seconds. No-op before ssdp_start.
+void ssdp_set_ip(const char *ip);
 // Send ssdp:byebye for every NT this device advertises. Call once at app
 // exit so control points that saw our ssdp:alive drop us immediately instead
 // of waiting out CACHE-CONTROL's max-age.

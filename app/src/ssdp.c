@@ -30,6 +30,7 @@ typedef struct {
 #define ORBIS_NET_IP_MULTICAST_IF   9
 #define ORBIS_NET_IP_MULTICAST_TTL  10
 #define ORBIS_NET_IP_ADD_MEMBERSHIP 12
+#define ORBIS_NET_IP_DROP_MEMBERSHIP 13
 
 // Every earlier build advertised this SAME hard-coded UUID from every
 // install, so two consoles on one LAN shared one SSDP USN / description.xml
@@ -276,6 +277,56 @@ void ssdp_shutdown(void) {
     send_ssdp_byebye("urn:schemas-upnp-org:service:RenderingControl:1");
 }
 
+// Address changes (netmon.c) are handed over here and applied by the SSDP
+// thread, the only thread that uses the socket and g_ip after ssdp_start.
+static char         g_pendIp[32];
+static volatile int g_ipDirty;
+static volatile int g_ipLock;
+
+void ssdp_set_ip(const char *ip) {
+    if (g_sock < 0 || !ip) return;
+    while (__atomic_exchange_n(&g_ipLock, 1, __ATOMIC_ACQUIRE)) sceKernelUsleep(50);
+    snprintf(g_pendIp, sizeof(g_pendIp), "%s", ip);
+    g_ipDirty = 1;
+    __atomic_store_n(&g_ipLock, 0, __ATOMIC_RELEASE);
+}
+
+// Join the SSDP group on the interface that owns `ip` and send from it.
+// INADDR_ANY for the membership interface does not reliably bind to wlan0 on
+// this stack, which is why discovery failed before the join named it.
+static void join_on(const char *ip, int *jrc, int *mif) {
+    uint32_t ifaddr = 0;   // INADDR_ANY fallback
+    sceNetInetPton(ORBIS_NET_AF_INET, ip, &ifaddr);
+    ps4_ip_mreq mreq;
+    mreq.imr_multiaddr = mcast_group_addr();
+    mreq.imr_interface = ifaddr;
+    *jrc = sceNetSetsockopt(g_sock, ORBIS_NET_IPPROTO_IP, ORBIS_NET_IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+    *mif = sceNetSetsockopt(g_sock, ORBIS_NET_IPPROTO_IP, ORBIS_NET_IP_MULTICAST_IF, &ifaddr, sizeof(ifaddr));
+}
+
+// SSDP thread: move to a new address handed over by ssdp_set_ip.
+static void apply_new_ip(void) {
+    char ip[32];
+    while (__atomic_exchange_n(&g_ipLock, 1, __ATOMIC_ACQUIRE)) sceKernelUsleep(50);
+    snprintf(ip, sizeof(ip), "%s", g_pendIp);
+    g_ipDirty = 0;
+    __atomic_store_n(&g_ipLock, 0, __ATOMIC_RELEASE);
+    // Leave the group on the old interface (it may already be gone: ignore
+    // the result), then join on the new one. Also done for the same address
+    // coming back, since a link drop can take the membership with it.
+    uint32_t old = 0;
+    sceNetInetPton(ORBIS_NET_AF_INET, g_ip, &old);
+    ps4_ip_mreq mreq;
+    mreq.imr_multiaddr = mcast_group_addr();
+    mreq.imr_interface = old;
+    sceNetSetsockopt(g_sock, ORBIS_NET_IPPROTO_IP, ORBIS_NET_IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
+    snprintf(g_ip, sizeof(g_ip), "%s", ip);
+    int jrc, mif;
+    join_on(g_ip, &jrc, &mif);
+    snprintf(g_diag, sizeof(g_diag), "ssdp moved ip=%s join=%d mif=%d", g_ip, jrc, mif);
+    for (int i = 0; i < 2; i++) announce_all();
+}
+
 // How often ssdp:alive repeats once the socket is up. Well under the
 // CACHE-CONTROL max-age (1800s) above so a passive control point (one that
 // only ever listens for alive/byebye and never sends its own M-SEARCH) never
@@ -298,6 +349,7 @@ static void *ssdp_main(void *arg) {
         // M-SEARCH traffic, so the periodic re-announce below can't be
         // starved by a blocking recvfrom that never returns.
         uint64_t now = sceKernelGetProcessTime();
+        if (g_ipDirty) { apply_new_ip(); lastAnnounce = now; }
         if (now - lastAnnounce >= SSDP_ANNOUNCE_INTERVAL_US) {
             announce_all();
             lastAnnounce = now;
@@ -352,9 +404,9 @@ int ssdp_start(const char *ip, int http_port) {
     sceNetSetsockopt(g_sock, SOL_SOCKET_PS4, SO_REUSEADDR_PS4, &on, sizeof(on));
 
     // Bound the blocking recvfrom in ssdp_main so the periodic re-announce
-    // there runs even when nothing ever arrives on the wire (rather than a
-    // separate timer thread for the same purpose).
-    int rcvtmo = 30 * 1000 * 1000;
+    // (and an address change from ssdp_set_ip) runs even when nothing ever
+    // arrives on the wire, rather than a separate timer thread for it.
+    int rcvtmo = 5 * 1000 * 1000;
     sceNetSetsockopt(g_sock, SOL_SOCKET_PS4, SO_RCVTIMEO_PS4, &rcvtmo, sizeof(rcvtmo));
 
     ps4_sockaddr_in addr;
@@ -371,23 +423,10 @@ int ssdp_start(const char *ip, int http_port) {
         return -2;
     }
 
-    // Resolve our own LAN IP so the multicast join + send egress the active
-    // interface explicitly. INADDR_ANY for the membership interface does not
-    // reliably bind to wlan0 on this stack, which is likely why discovery still
-    // failed even with the join added.
-    uint32_t ifaddr = 0; // INADDR_ANY fallback
-    sceNetInetPton(ORBIS_NET_AF_INET, g_ip, &ifaddr);
-
-    // Join the SSDP multicast group so we actually receive M-SEARCH probes.
-    ps4_ip_mreq mreq;
-    mreq.imr_multiaddr = mcast_group_addr();
-    mreq.imr_interface = ifaddr;
-    int jrc = sceNetSetsockopt(g_sock, ORBIS_NET_IPPROTO_IP, ORBIS_NET_IP_ADD_MEMBERSHIP,
-                               &mreq, sizeof(mreq));
-
-    // Send alive/response advertisements out of the same interface, bounded TTL.
-    int mif = sceNetSetsockopt(g_sock, ORBIS_NET_IPPROTO_IP, ORBIS_NET_IP_MULTICAST_IF,
-                               &ifaddr, sizeof(ifaddr));
+    // Join the SSDP multicast group on our LAN interface so we actually
+    // receive M-SEARCH probes, and send alive/responses out of it.
+    int jrc, mif;
+    join_on(g_ip, &jrc, &mif);
     int ttl = 2;
     sceNetSetsockopt(g_sock, ORBIS_NET_IPPROTO_IP, ORBIS_NET_IP_MULTICAST_TTL,
                      &ttl, sizeof(ttl));

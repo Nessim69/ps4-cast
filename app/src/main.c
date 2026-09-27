@@ -12,6 +12,7 @@
 
 #ifndef BOOT_MINIMAL
 #include "netutil.h"
+#include "netmon.h"
 #include "httpd.h"
 #include "player.h"
 #include "httpsrc.h"
@@ -454,8 +455,8 @@ static void draw_lobby(Gfx *g, const char *ip, int net_ok) {
             ctext(g, py + ph + 28, "Browser helper, direct link, or DLNA / UPnP", 2, FAINT, 0);
         }
     } else {
-        ctext(g, 470, "No network connection", 5, TXT, 0);
-        ctext(g, 560, "Connect the PS4 to Wi-Fi or LAN, then relaunch.", 3, MUT, 0);
+        ctext(g, 470, "Waiting for network", 5, TXT, 0);
+        ctext(g, 560, "Connect the PS4 to Wi-Fi or LAN. PS4 Cast picks it up by itself.", 3, MUT, 0);
     }
 
     ctext(g, 1010, net_ok ? "L1 / R1  switch mode      Square  pair extension      Triangle  exit"
@@ -896,22 +897,17 @@ int main(void) {
     }
 #else
     player_init();    // before httpd: the pipeline guard + aseg cancel check must exist before any caller thread
-    int net_ok = (net_init() == 0);
-    char ip[32] = "0.0.0.0";
-    if (net_ok && net_get_ip(ip, sizeof(ip)) != 0)
-        net_ok = 0;
-
-    if (net_ok) {
-        httpd_start(PORT);
-        // SSDP discovery responder. The earlier in-app SSDP builds (01.50/01.51)
-        // destabilized boot because the socket never joined the multicast group
-        // and the receive loop busy-spun on error. Both are fixed in ssdp.c, so
-        // the PS4 can again advertise itself as a DLNA renderer to cast apps.
-        ssdp_start(ip, PORT);
-        // Explicit "ready" toast: tells the user (and the deploy script's /status
-        // poll) the app is fully up and accepting casts — no more guessing the gap.
-        notify("PS4 Cast " APP_VER " ready  -  http://%s:%d", ip, PORT);
-    }
+    // Settings, token, channels etc. load whether or not the network is up;
+    // the main loop reads them every frame.
+    httpd_init();
+    // Network: bring up the web server and SSDP discovery (DLNA renderer)
+    // now if there is an address, else as soon as one appears, and follow
+    // address changes (netmon.c). The first poll is synchronous, so a normal
+    // boot starts both before the first frame as it always did.
+    netmon_start(PORT);
+    char ip[32] = "";
+    unsigned ipGen = ~0u;
+    int net_ok = 0;
 
     char url[2048];
     int frameID = bootFrameID;
@@ -951,6 +947,12 @@ int main(void) {
 
     while (running) {
         g_heartbeat = sceKernelGetProcessTime();   // pet the freeze watchdog each frame
+        if (netmon_generation() != ipGen) {        // late Wi-Fi, a new DHCP lease, link lost
+            ipGen = netmon_generation();
+            netmon_ip(ip, sizeof(ip));
+            net_ok = ip[0] != '\0';
+            if (!net_ok) snprintf(ip, sizeof(ip), "0.0.0.0");
+        }
         g_wdBusy = 0;                               // loop is alive again -> back to the strict 15s grace
         uint64_t now = sceKernelGetProcessTime();
         uint32_t pressed = pad_poll(&pad);
@@ -1541,7 +1543,7 @@ int main(void) {
     if (player_shutdown() == 0) audio_shutdown();
     // Tell DLNA control points the renderer is leaving (ssdp:byebye) instead of
     // leaving a dead entry in their device lists until max-age expires.
-    if (net_ok) ssdp_shutdown();
+    ssdp_shutdown();   // no-op if SSDP never started
     // Clean close: returning from main / _exit can be read by the system as an
     // abnormal termination and pop the "application closed" crash dialog. LoadExec
     // ("exit") is the recognized normal app-exit path → returns to the home menu
