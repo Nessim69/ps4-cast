@@ -3,6 +3,7 @@
 #include "httpsrc.h"
 #include "aseg.h"
 #include "hls_parse.h"
+#include "hls_crypt.h"
 #include "trace.h"
 
 #include <stdio.h>
@@ -88,6 +89,8 @@ static int               g_liveFetchFailStreak;
 static volatile uint64_t g_hlsRxBytes;   // total bytes fetched (video+audio), for the stats overlay
 static char              g_vLastUrl[96] = "";
 static char              g_segFail[96] = "";   // last VOD-segment open failure detail
+static char              g_keyFail[96] = "";   // last AES-128 key/decrypt failure
+static char              g_unsupported[64] = "";   // hls_unsupported_reason()
 static int               g_forceAsegSeg = 0;   // httpsrc dead for this origin: serve via aseg
 static int               g_vLastRc, g_vLastBytes, g_vLastMs, g_vFailCount;
 static uint64_t          g_vOpenUs;
@@ -115,12 +118,14 @@ static void apref_start(void);
 // When present, the audio is its own playlist of audio-only segments. We parse
 // it into a second segment list and stream it through aseg (its own connection),
 // so the player can demux/decode it in parallel with the video segments.
-static char  **g_asegs;          // resolved audio segment URLs
-static int     g_asegCount;
+// The audio rendition's media playlist (segments, init, ranges, keys), with
+// the same field macros as the video playlist above.
+static HlsPlaylist g_apl;
+#define g_asegs        g_apl.segs
+#define g_asegCount    g_apl.segCount
+#define g_asegDurMs    g_apl.segDurMs
+#define g_aInit        g_apl.initSeg
 static int     g_asegIdx;        // current audio segment
-static int     g_asegDurMs[HLS_MAX_SEGMENTS];
-static int64_t g_aTotalDurMs;
-static char   *g_aInit;          // audio fMP4 init segment (EXT-X-MAP), or NULL
 static int     g_aInitPending;   // 1 = audio init still to be streamed first
 static int     g_audioReady;     // a separate audio rendition is parsed + usable
 static uint8_t *g_aBuf;          // current audio segment fetched into RAM
@@ -181,10 +186,11 @@ const char *hls_debug(void) {
             scePthreadMutexUnlock(&g_aprefMtx);
         }
         snprintf(b, sizeof(b),
-                 "hls v%d/%d %s %dp %dk%s%s%s seg=%d/%d pf=%d/%d vf=%dms/%dKB/rc%d/f%d af=%d/%d %dms/%dKB/rc%d/f%d st=%d[%s] reuse=%d hop=%d plen=%d p=%s VAR=%s SEG0=%s",
+                 "hls v%d/%d %s %dp %dk%s%s%s%s%s seg=%d/%d pf=%d/%d vf=%dms/%dKB/rc%d/f%d af=%d/%d %dms/%dKB/rc%d/f%d st=%d[%s] reuse=%d hop=%d plen=%d p=%s VAR=%s SEG0=%s",
                  g_curVariant + 1, g_variantCount, codec_name(v->codec), v->height,
                  v->bw / 1000, v->fps ? (v->fps > 30 ? "60" : "") : "",
                  g_sepAudio ? " SEPAUDIO" : "", g_initSeg ? " FMP4LOCK" : "",
+                 g_pl.keyCount ? " AES" : "", g_pl.segRef ? " RANGES" : "",
                  g_segIdx, g_segCount,
                  cached, g_prefUp ? g_prefDepth : 0,
                  g_vLastMs, g_vLastBytes / 1024, g_vLastRc, g_vFailCount,
@@ -202,16 +208,20 @@ const char *hls_debug(void) {
             scePthreadMutexUnlock(&g_prefMtx);
         }
         snprintf(b, sizeof(b),
-                 "hls media%s seg=%d/%d pf=%d/%d vf=%dms/%dKB/rc%d/f%d url=%s%s%s",
-                 g_isLive ? " live" : "", g_segIdx, g_segCount,
+                 "hls media%s%s%s seg=%d/%d pf=%d/%d vf=%dms/%dKB/rc%d/f%d url=%s%s%s%s%s",
+                 g_isLive ? " live" : "", g_pl.keyCount ? " AES" : "", g_pl.segRef ? " RANGES" : "",
+                 g_segIdx, g_segCount,
                  cached, g_prefUp ? g_prefDepth : 0,
                  g_vLastMs, g_vLastBytes / 1024, g_vLastRc, g_vFailCount,
                  g_vLastUrl,
-                 g_segFail[0] ? " segfail=" : "", g_segFail);
+                 g_segFail[0] ? " segfail=" : "", g_segFail,
+                 g_keyFail[0] ? " key=" : "", g_keyFail);
         return b;
     }
     return g_dbg;   // pre-roll / errors
 }
+
+const char *hls_unsupported_reason(void) { return g_unsupported; }
 
 int hls_is_url(const char *url) {
     const char *q = strchr(url, '?');
@@ -281,8 +291,128 @@ int hls_buffer_pct(void) {
     return pct > 100 ? 100 : pct;
 }
 
+// ---- ranged and AES-128 segments (EXT-X-BYTERANGE / EXT-X-KEY) -------------
+// Such segments are always fetched whole into RAM (aseg), cut to their range
+// and decrypted there; plain segments keep their old paths.
+
+// g_memSeg value while the in-RAM buffer holds the EXT-X-MAP init segment
+// (-1 = no buffer): draining it clears g_initPending, never advances g_segIdx.
+#define SEG_INIT (-2)
+
+// Keys by URI, as FFmpeg's HLS demuxer caches them: every segment under one
+// EXT-X-KEY shares its key, and live refreshes repeat the tag. A spinlock
+// (no init race) held only for the copies; fetches happen outside it.
+#define HLS_KEY_CACHE 8
+typedef struct { char uri[2048]; uint8_t key[16]; unsigned age; } HlsKeySlot;
+static HlsKeySlot   g_keys[HLS_KEY_CACHE];
+static unsigned     g_keyAge;
+static volatile int g_keyLock;
+
+static void key_lock(void) { while (__atomic_exchange_n(&g_keyLock, 1, __ATOMIC_ACQUIRE)) sceKernelUsleep(20); }
+static void key_unlock(void) { __atomic_store_n(&g_keyLock, 0, __ATOMIC_RELEASE); }
+
+static void key_cache_clear(void) {
+    key_lock();
+    for (int i = 0; i < HLS_KEY_CACHE; i++) g_keys[i].uri[0] = '\0';
+    g_keyFail[0] = '\0';
+    key_unlock();
+}
+
+// 16-byte key for `uri`: from the cache unless `refetch`, else fetched (on
+// the caller's channel, so the stream's headers/cookies apply) or decoded
+// from a data: URI. 0 = ok, -31 = unusable key.
+static int key_get(int ch, const char *uri, uint8_t key[16], int refetch) {
+    if (!refetch) {
+        int hit = 0;
+        key_lock();
+        for (int i = 0; i < HLS_KEY_CACHE && !hit; i++)
+            if (g_keys[i].uri[0] && strcmp(g_keys[i].uri, uri) == 0) {
+                memcpy(key, g_keys[i].key, 16); g_keys[i].age = ++g_keyAge; hit = 1;
+            }
+        key_unlock();
+        if (hit) return 0;
+    }
+    int drc = hls_key_from_data_uri(uri, key);
+    if (drc == -2) { snprintf(g_keyFail, sizeof(g_keyFail), "key data: URI is not 16 bytes"); return -31; }
+    if (drc != 0) {
+        uint8_t *b = NULL; int n = 0;
+        int rc = aseg_fetch_ch(ch, uri, &b, &n);
+        if (rc != 0 || !b || n != 16) {
+            snprintf(g_keyFail, sizeof(g_keyFail), "key fetch rc=%d len=%d st=%d", rc, n, aseg_last_status());
+            free(b);
+            return -31;
+        }
+        memcpy(key, b, 16);
+        free(b);
+    }
+    key_lock();
+    int slot = -1, lru = 0;          // same URI, else an empty slot, else the least recently used
+    for (int i = 0; i < HLS_KEY_CACHE && slot < 0; i++)
+        if (g_keys[i].uri[0] && strcmp(g_keys[i].uri, uri) == 0) slot = i;
+    for (int i = 0; i < HLS_KEY_CACHE && slot < 0; i++)
+        if (!g_keys[i].uri[0]) slot = i;
+    for (int i = 1; i < HLS_KEY_CACHE; i++)
+        if (g_keys[i].age < g_keys[lru].age) lru = i;
+    if (slot < 0) slot = lru;
+    snprintf(g_keys[slot].uri, sizeof(g_keys[slot].uri), "%s", uri);
+    memcpy(g_keys[slot].key, key, 16);
+    g_keys[slot].age = ++g_keyAge;
+    key_unlock();
+    return 0;
+}
+
+// Everything one segment fetch needs, copied out of the playlist (under the
+// owner's lock) so it stays valid while the playlist is refreshed or freed.
+typedef struct {
+    char    url[2048];
+    int64_t off, len;          // byte range; len 0 = whole resource
+    int     encrypted;
+    char    keyUri[2048];
+    uint8_t iv[16];
+} SegJob;
+
+static SegJob *seg_job(const HlsPlaylist *pl, int seg, const char *url) {
+    SegJob *j = malloc(sizeof(*j));
+    if (!j) return NULL;
+    snprintf(j->url, sizeof(j->url), "%s", url ? url : "");
+    hlspl_seg_range(pl, seg, &j->off, &j->len);
+    const HlsKey *k = hlspl_seg_key(pl, seg, j->iv);
+    j->encrypted = k != NULL;
+    snprintf(j->keyUri, sizeof(j->keyUri), "%s", k ? k->uri : "");
+    return j;
+}
+
+// Fetch a segment whole on channel `ch`, cut to its range and decrypted.
+// aseg's codes, plus -31 (key unusable) and -32 (decrypt failed: wrong key).
+static int fetch_job(int ch, const SegJob *j, uint8_t **buf, int *len) {
+    AsegOpts o;
+    memset(&o, 0, sizeof(o));
+    o.rangeOff = j->off; o.rangeLen = j->len;
+    int rc = aseg_fetch_opts(ch, j->url, buf, len, j->len > 0 ? &o : NULL);
+    if (rc != 0 || !j->encrypted) return rc;
+    uint8_t key[16];
+    int krc = key_get(ch, j->keyUri, key, 0);
+    if (krc == 0 && !hls_aes128_padding_ok(key, j->iv, *buf, *len)) {
+        // A cached key that no longer decrypts: the server may have rotated
+        // it behind the same URI. Fetch it once more before giving up.
+        krc = key_get(ch, j->keyUri, key, 1);
+        if (krc == 0 && !hls_aes128_padding_ok(key, j->iv, *buf, *len)) {
+            snprintf(g_keyFail, sizeof(g_keyFail), "decrypt failed len=%d (wrong key or IV)", *len);
+            krc = -32;
+        }
+    }
+    if (krc == 0 && hls_aes128_cbc_decrypt(key, j->iv, *buf, len) != 0) {
+        snprintf(g_keyFail, sizeof(g_keyFail), "decrypt failed len=%d", *len);
+        krc = -32;
+    }
+    if (krc != 0) { free(*buf); *buf = NULL; *len = 0; }
+    return krc;
+}
+
 static void free_segs(void) {
-    hlspl_free(&g_pl);
+    // Media playlist only: a variant switch reloads it but still needs the
+    // master's variant list (hls_open resets that one).
+    hlspl_free_media(&g_pl);
     g_mediaUrl[0] = '\0';
     g_segIdx = 0;
 }
@@ -361,15 +491,21 @@ static void *prefetch_main(void *arg) {
             continue;
         }
 
-        strncpy(url, g_segs[seg], sizeof(url) - 1);
-        url[sizeof(url) - 1] = '\0';
+        SegJob *job = seg_job(&g_pl, seg, g_segs[seg]);
+        if (!job) {
+            scePthreadCondTimedwait(&g_prefCond, &g_prefMtx, 300 * 1000);
+            scePthreadMutexUnlock(&g_prefMtx);
+            continue;
+        }
+        snprintf(url, sizeof(url), "%s", job->url);
         g_pref[slot].seg = seg;
         g_pref[slot].fetching = 1;
         scePthreadMutexUnlock(&g_prefMtx);
 
         uint8_t *buf = NULL; int len = 0;
         uint64_t t0 = sceKernelGetProcessTime();
-        int rc = aseg_fetch_ch(ASEG_CH_VIDEO, url, &buf, &len);
+        int rc = fetch_job(ASEG_CH_VIDEO, job, &buf, &len);
+        free(job);
         int ms = (int)((sceKernelGetProcessTime() - t0) / 1000);
         short_url(url, g_vLastUrl, sizeof(g_vLastUrl));
         g_vLastRc = rc; g_vLastMs = ms; g_vLastBytes = len;
@@ -623,15 +759,21 @@ static void *apref_main(void *arg) {
             continue;
         }
 
-        strncpy(url, g_asegs[seg], sizeof(url) - 1);
-        url[sizeof(url) - 1] = '\0';
+        SegJob *job = seg_job(&g_apl, seg, g_asegs[seg]);
+        if (!job) {
+            scePthreadCondTimedwait(&g_aprefCond, &g_aprefMtx, 300 * 1000);
+            scePthreadMutexUnlock(&g_aprefMtx);
+            continue;
+        }
+        snprintf(url, sizeof(url), "%s", job->url);
         g_apref[slot].seg = seg;
         g_apref[slot].fetching = 1;
         scePthreadMutexUnlock(&g_aprefMtx);
 
         uint8_t *buf = NULL; int len = 0;
         uint64_t t0 = sceKernelGetProcessTime();
-        int rc = aseg_fetch_ch(ASEG_CH_AUDIO, url, &buf, &len);
+        int rc = fetch_job(ASEG_CH_AUDIO, job, &buf, &len);
+        free(job);
         int ms = (int)((sceKernelGetProcessTime() - t0) / 1000);
         short_url(url, g_aLastUrl, sizeof(g_aLastUrl));
         g_aLastRc = rc; g_aLastMs = ms; g_aLastBytes = len;
@@ -678,6 +820,7 @@ static void apref_start(void) {
     }
 }
 
+// Fetch segment `seg` (SEG_INIT = the init segment) whole into g_memBuf.
 static int open_mem_segment(const char *u, int seg) {
     uint8_t *buf = NULL;
     int len = 0;
@@ -685,7 +828,9 @@ static int open_mem_segment(const char *u, int seg) {
     trace_mark("hls mem_fetch2 begin seg=%d idx=%d/%d url=%s", seg, g_segIdx, g_segCount, g_vLastUrl);
     uint64_t t0 = sceKernelGetProcessTime();
 
-    int rc = aseg_fetch_ch(ASEG_CH_VIDEO, u, &buf, &len);
+    SegJob *job = seg_job(&g_pl, seg == SEG_INIT ? -1 : seg, u);
+    int rc = job ? fetch_job(ASEG_CH_VIDEO, job, &buf, &len) : -6;
+    free(job);
     trace_mark("hls mem_fetch2 fetched seg=%d rc=%d len=%d", seg, rc, len);
 
     int ms = (int)((sceKernelGetProcessTime() - t0) / 1000);
@@ -846,33 +991,16 @@ static int find_audio_uri(const char *body, const char *base, const char *group,
 // Parse an audio media playlist body into the audio segment list (mirrors
 // parse_media but for the separate audio path). base = the audio playlist URL.
 static int parse_audio_segs(char *body, const char *base) {
-    HlsPlaylist *apl = calloc(1, sizeof(*apl));
-    if (!apl) return -1;
-    hlspl_init(apl);
-    int rc = hlspl_parse_media(apl, body, base);
-    if (rc == 0) {
-        g_asegs = apl->segs;
-        g_asegCount = apl->segCount;
-        g_aInit = apl->initSeg;
-        g_aTotalDurMs = apl->totalDurMs;
-        memcpy(g_asegDurMs, apl->segDurMs, sizeof(g_asegDurMs));
-        apl->segs = NULL;
-        apl->initSeg = NULL;
-    }
-    hlspl_free(apl);
-    free(apl);
+    hlspl_free(&g_apl);
+    int rc = hlspl_parse_media(&g_apl, body, base);
+    if (rc != 0) hlspl_free(&g_apl);
     return rc;
 }
 
 static void free_asegs(void) {
-    if (g_asegs) {
-        for (int i = 0; i < g_asegCount; i++) free(g_asegs[i]);
-        free(g_asegs); g_asegs = NULL;
-    }
-    free(g_aInit); g_aInit = NULL;
+    hlspl_free(&g_apl);
     if (g_aBuf) { free(g_aBuf); g_aBuf = NULL; }
-    g_asegCount = 0; g_asegIdx = 0; g_aInitPending = 0; g_aTotalDurMs = 0;
-    memset(g_asegDurMs, 0, sizeof(g_asegDurMs));
+    g_asegIdx = 0; g_aInitPending = 0;
     g_aBufLen = g_aBufPos = 0; g_audioReady = 0;
 }
 
@@ -960,6 +1088,8 @@ int hls_open(const char *url) {
     g_fastFetchStreak = 0; g_estBandwidth = 0; g_autoMaxHeight = g_requestedMaxHeight; g_sepAudio = 0;
     g_vLastRc = g_vLastBytes = g_vLastMs = g_vFailCount = 0; g_vLastUrl[0] = '\0';
     g_segFail[0] = '\0'; g_forceAsegSeg = 0;
+    key_cache_clear();
+    g_unsupported[0] = '\0';
     g_aLastRc = g_aLastBytes = g_aLastMs = g_aFailCount = 0; g_aLastUrl[0] = '\0';
 
     int len = 0;
@@ -989,9 +1119,14 @@ int hls_open(const char *url) {
             startVar = g_preferVariant;       // carried across a quality-switch reopen
         if (load_variant(startVar) != 0) {
             free(body);
-            snprintf(g_dbg, sizeof(g_dbg), "variant fetch failed st=%d[%s] at=%s %s",
-                     aseg_last_status(), aseg_last_line(), aseg_bad_stage(),
-                     aseg_native_debug());
+            if (g_pl.unsupported[0]) {
+                snprintf(g_unsupported, sizeof(g_unsupported), "%s", g_pl.unsupported);
+                snprintf(g_dbg, sizeof(g_dbg), "encrypted stream not supported: %s", g_pl.unsupported);
+            }
+            else
+                snprintf(g_dbg, sizeof(g_dbg), "variant fetch failed st=%d[%s] at=%s %s",
+                         aseg_last_status(), aseg_last_line(), aseg_bad_stage(),
+                         aseg_native_debug());
             { aseg_set_playlist_budget(0); return -4; }
         }
         if (g_initSeg) {
@@ -1010,7 +1145,16 @@ int hls_open(const char *url) {
         if (g_sepAudio) setup_audio_rendition(body, url);
         free(body);
     } else {
-        if (hlspl_parse_media(&g_pl, body, url) != 0) { snprintf(g_dbg, sizeof(g_dbg), "no segments"); free(body); hls_close(); { aseg_set_playlist_budget(0); return -5; } }
+        int prc = hlspl_parse_media(&g_pl, body, url);
+        if (prc != 0) {
+            if (prc == -2) {
+                snprintf(g_unsupported, sizeof(g_unsupported), "%s", g_pl.unsupported);
+                snprintf(g_dbg, sizeof(g_dbg), "encrypted stream not supported: %s", g_pl.unsupported);
+            } else {
+                snprintf(g_dbg, sizeof(g_dbg), "no segments");
+            }
+            free(body); hls_close(); { aseg_set_playlist_budget(0); return -5; }
+        }
         strncpy(g_mediaUrl, url, sizeof(g_mediaUrl) - 1);
         g_mediaUrl[sizeof(g_mediaUrl) - 1] = '\0';
         free(body);
@@ -1089,8 +1233,12 @@ static int ensure_segment(void) {
         if (refresh_live_playlist() == 0 && g_segIdx < g_segCount) u = g_segs[g_segIdx];
         else return g_isLive ? -2 : -1; // live: wait for next segment; VOD: EOF
     }
+    // Ranged/encrypted segments (and init segments) are fetched whole into
+    // RAM by fetch_job; httpsrc streams only plain whole resources.
+    int memSeg = g_initPending ? SEG_INIT : g_segIdx;
+    int plain = hlspl_seg_is_plain(&g_pl, g_initPending ? -1 : g_segIdx);
     if (g_isLive && !g_initPending) {
-        if (open_mem_segment(u, g_segIdx) == 0) return 0;
+        if (open_mem_segment(u, memSeg) == 0) return 0;
         // A CDN-backed live playlist can expose a segment before every edge has
         // it. Do not advance into segCount on a fetch miss; retry briefly and
         // refresh the playlist so only a real sliding-window jump creates a gap.
@@ -1101,7 +1249,7 @@ static int ensure_segment(void) {
         return -2;
     }
     short_url(u, g_vLastUrl, sizeof(g_vLastUrl));
-    if (!g_forceAsegSeg) {
+    if (!g_forceAsegSeg && plain) {
         int orc = httpsrc_open(u);
         g_vLastRc = orc;
         if (orc == 0) {
@@ -1123,11 +1271,14 @@ static int ensure_segment(void) {
     // fallback already proved it can reach origins that stall BearSSL. Served
     // from memory exactly like a live segment. Once one segment succeeds this
     // way, skip the (dead) httpsrc attempt for the rest of the stream.
-    if (open_mem_segment(u, g_segIdx) == 0) {
-        g_forceAsegSeg = 1;
+    // The init segment is marked SEG_INIT: it used to be stored as media
+    // segment g_segIdx, so draining it advanced g_segIdx while g_initPending
+    // stayed set -- init streamed again, and a segment was skipped, forever.
+    if (open_mem_segment(u, memSeg) == 0) {
+        if (plain) g_forceAsegSeg = 1;
         return 0;
     }
-    snprintf(g_segFail, sizeof(g_segFail), "aseg fallback also failed");
+    snprintf(g_segFail, sizeof(g_segFail), "%s", g_keyFail[0] ? g_keyFail : "aseg fallback also failed");
     g_vFailCount++;
     return -1;
 }
@@ -1166,8 +1317,14 @@ int hls_read(uint8_t *buf, uint32_t len) {
                 g_memPos += take;
                 return take;
             }
+            int wasInit = (g_memSeg == SEG_INIT);
             free(g_memBuf);
             g_memBuf = NULL; g_memLen = g_memPos = 0; g_memSeg = -1;
+            if (wasInit) {                 // init streamed; media segments follow
+                g_initPending = 0;
+                trace_mark("hls mem init drained idx=%d/%d", g_segIdx, g_segCount);
+                continue;
+            }
             g_segIdx++;
             g_segGen++;
             trace_mark("hls mem drained next_idx=%d/%d gen=%d", g_segIdx, g_segCount, g_segGen);
@@ -1332,17 +1489,21 @@ static int ensure_audio_buf(void) {
     if (g_aBuf) { free(g_aBuf); g_aBuf = NULL; g_aBufLen = g_aBufPos = 0; }
 
     const char *u = NULL;
+    int seg = -1;
     if (g_aInitPending)               u = g_aInit;
     else if (g_asegIdx < g_asegCount) {
         if (apref_wait_take(g_asegIdx)) { g_asegIdx++; return 0; }
         if (g_aprefUp) { g_asegIdx++; return -2; }
-        u = g_asegs[g_asegIdx];
+        seg = g_asegIdx;
+        u = g_asegs[seg];
     }
     else                              return -1;          // EOF
 
     uint8_t *buf = NULL; int len = 0;
     uint64_t t0 = sceKernelGetProcessTime();
-    int rc = aseg_fetch_ch(ASEG_CH_AUDIO, u, &buf, &len);
+    SegJob *job = seg_job(&g_apl, seg, u);
+    int rc = job ? fetch_job(ASEG_CH_AUDIO, job, &buf, &len) : -6;
+    free(job);
     int ms = (int)((sceKernelGetProcessTime() - t0) / 1000);
     short_url(u, g_aLastUrl, sizeof(g_aLastUrl));
     g_aLastRc = rc; g_aLastMs = ms; g_aLastBytes = len;

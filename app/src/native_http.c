@@ -290,6 +290,7 @@ int native_http_fetch(int slot, const char *url, const char *headers,
     add_option_header(req, headers, "Origin");
     add_option_header(req, headers, "User-Agent");
     add_option_header(req, headers, "Cookie");
+    add_option_header(req, headers, "Range");       // HLS EXT-X-BYTERANGE (aseg)
 
     int rc = pSendRequest(req, NULL, 0);
     if (rc < 0 || pGetStatus(req, status) < 0) {

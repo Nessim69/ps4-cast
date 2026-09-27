@@ -606,7 +606,7 @@ static const char WEB_UI_HTML[] =
 "async function replayStored(){setMode('cast');$('failure').hidden=true;busy(true);msg('Opening uploaded video…');var r=await post('/upload/replay');if(!r||!r.ok){busy(false);msg('Uploaded file is no longer available');loadStored()}}\n"
 "async function deleteStored(){if(!confirm('Delete this uploaded video from PS4 storage?'))return;await post('/upload/delete');storedInfo=null;$('stored').hidden=true;busy(false);msg('Uploaded video deleted')}\n"
 "\n"
-"function failureName(code){var m={source:'Source unavailable',format:'Format not recognized','stream-info':'Stream could not be read','no-video':'No video track',decoder:'Codec not supported',memory:'Not enough memory','no-frames':'Video could not be decoded'};return m[code]||'Playback failed'}\n"
+"function failureName(code){var m={source:'Source unavailable',format:'Format not recognized','stream-info':'Stream could not be read','no-video':'No video track',decoder:'Codec not supported',memory:'Not enough memory','no-frames':'Video could not be decoded',certificate:'Certificate rejected',drm:'Protected stream'};return m[code]||'Playback failed'}\n"
 "function showFailure(j){lastFailureUrl=j.last_push||'';lastFailureLocal=!!(storedInfo&&lastFailureUrl===storedInfo.name);lastFailureChan=j.chan_cur==null?-1:+j.chan_cur;\n"
 " $('failureTitle').textContent=failureName(j.error_code);$('failureDetail').textContent=j.error_message||'PS4 Cast could not play this source.';\n"
 " $('failureSw').hidden=!(hw&&(j.error_code==='decoder'||j.error_code==='no-frames'));$('failure').hidden=false;busy(false);msg('Playback stopped')}\n"

@@ -535,3 +535,26 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
   honours the same switch.
 - Stream cookies (`|Cookie=`) are only sent to the page's own host and its
   parent domain, never to CDNs on unrelated hosts after a redirect.
+
+## HLS AES-128 and byte ranges
+
+- `EXT-X-KEY:METHOD=AES-128` (identity key format) and `EXT-X-BYTERANGE` /
+  `EXT-X-MAP BYTERANGE` are supported for video, init and separate-audio
+  segments. `hls_parse.c` records a per-segment range and key (`HlsSegRef`,
+  `HlsKey`; nothing is allocated for plain playlists), `hls_crypt.c` decrypts
+  with BearSSL (AES-NI when present, as the TLS path already uses), and
+  `hls.c`'s `fetch_job` fetches ranged/encrypted segments whole through aseg
+  (Range requests; a server that ignores Range gets its 200 body sliced).
+  Plain segments keep their old httpsrc/aseg paths unchanged.
+- IVs: explicit `IV=`, else the segment's media sequence number. Keys are
+  cached by URI (inline `data:` URIs too); a cached key whose padding check
+  fails is refetched once before the segment is declared undecryptable.
+- Refused with a clear player error (`drm`): SAMPLE-AES / SAMPLE-AES-CTR and
+  playlists that only offer a DRM key format (FairPlay, Widevine, PlayReady).
+  A playlist offering identity AES-128 next to a DRM format plays.
+- Fixed alongside: `hlspl_free` wiped the master's variant list whenever a
+  variant was (re)loaded (since v04.49), so ABR up/downshift and the fMP4
+  variant lock never ran. They are live again -- watch quality switching on
+  the console. Also fixed: an fMP4 init segment served through the aseg
+  fallback was replayed forever while media segments were skipped.
+- `tests/hls-e2e/run.sh` exercises all of this against a local server.

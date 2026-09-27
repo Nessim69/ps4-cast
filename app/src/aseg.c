@@ -72,6 +72,10 @@ typedef struct {
     int          truncate;          // AsegOpts.maxBytes: keep the head, drop the connection
     int        (*stopAfterHeaders)(const char *ctype);
     char         ctype[96];         // Content-Type of the last response
+    int64_t      rangeOff, rangeLen; // AsegOpts range; rangeLen 0 = whole resource
+    int64_t      crStart;           // Content-Range start of the last response, -1 = none
+    int          okStatus;          // status of the successful response (200/206)
+    int          okNative;          // ...and it came from the SceHttp fallback
     char         host[256];
     char         path[1024];
     uint16_t     port;
@@ -404,7 +408,14 @@ static void native_pin(const char *host) {   // NULL = unpin
 // SceHttp retry on this channel's own native slot: aseg_abort() reaches it,
 // and the channel's header policy applies (UI: none).
 static int native_fetch(AsegCh *c, const char *url, uint8_t **outBuf, int *outLen, int *status) {
-    return native_http_fetch((int)(c - g_ch), url, c->stream ? urlopt_headers_for_url(url) : "", outBuf, outLen, status,
+    const char *xh = c->stream ? urlopt_headers_for_url(url) : "";
+    char hb[1600];
+    if (c->rangeLen > 0) {
+        snprintf(hb, sizeof(hb), "%sRange: bytes=%lld-%lld\r\n", xh,
+                 (long long)c->rangeOff, (long long)(c->rangeOff + c->rangeLen - 1));
+        xh = hb;
+    }
+    return native_http_fetch((int)(c - g_ch), url, xh, outBuf, outLen, status,
                              c->budgetUs, c->truncate ? c->maxBytes : 0, &c->abort);
 }
 
@@ -430,16 +441,21 @@ static int do_request(AsegCh *c, int reuse, int *status, char *loc, int loccap,
     // ASEG_CH_UI is not part of the stream: never send the stream's Referer/
     // Cookie/UA to an unrelated list host -- the default User-Agent only.
     const char *xh = opt_headers(c, c->host);
+    char range[64] = "";
+    if (c->rangeLen > 0)
+        snprintf(range, sizeof(range), "Range: bytes=%lld-%lld\r\n",
+                 (long long)c->rangeOff, (long long)(c->rangeOff + c->rangeLen - 1));
     int n = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
+        "%s"
         "%s"
         "%s"
         "Accept: */*\r\n"
         "Connection: keep-alive\r\n"
         "\r\n",
         c->path, c->host, xh,
-        strstr(xh, "User-Agent:") ? "" : "User-Agent: PS4Cast/1.0\r\n");
+        strstr(xh, "User-Agent:") ? "" : "User-Agent: PS4Cast/1.0\r\n", range);
     if (n <= 0 || n >= (int)sizeof(req)) { conn_close(c); diag_stage(c, "req"); return -3; }
     // Re-arm every request: a kept-alive TLS context outlives the fetch that
     // created it, so a deadline set at handshake time would already be in the
@@ -487,6 +503,17 @@ static int do_request(AsegCh *c, int reuse, int *status, char *loc, int loccap,
         const char *coding = te ? ci_strstr(te, "chunked") : NULL;
         *chunked = coding && (!eol || coding < eol);
         if (*chunked && clen) *clen = -1;  // Transfer-Encoding wins over Content-Length.
+    }
+    c->crStart = -1;
+    {
+        const char *cr = ci_strstr(hdr, "\r\nContent-Range:");
+        if (cr && cr < hdr + end) {
+            cr += 16; while (*cr == ' ' || *cr == '\t') cr++;
+            if (strncasecmp(cr, "bytes", 5) == 0) {
+                cr += 5; while (*cr == ' ') cr++;
+                if (*cr >= '0' && *cr <= '9') c->crStart = strtoll(cr, NULL, 10);
+            }
+        }
     }
     // Per response: a 3xx carries its own (usually text/html), so a probe's
     // stopAfterHeaders only ever sees the final 2xx response's type.
@@ -689,6 +716,7 @@ static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *o
         if (rc == 0 && (status == 200 || status == 206)) {
             diag_clear(c);
             c->d.lastStatus = status;
+            c->okStatus = status; c->crStart = -1; c->okNative = 1;
             snprintf(c->d.lastLine, sizeof(c->d.lastLine), "native HTTP");
             return 0;
         }
@@ -748,6 +776,7 @@ static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *o
                     native_pin(c->host);
                     diag_clear(c);
                     c->d.lastStatus = nstatus;
+                    c->okStatus = nstatus; c->crStart = -1; c->okNative = 1;
                     snprintf(c->d.lastLine, sizeof(c->d.lastLine), "native HTTP");
                     return 0;
                 }
@@ -796,6 +825,7 @@ static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *o
                     native_pin(c->host);
                     diag_clear(c);
                     c->d.lastStatus = native_status;
+                    c->okStatus = native_status; c->crStart = -1; c->okNative = 1;
                     snprintf(c->d.lastLine, sizeof(c->d.lastLine), "native HTTP");
                     return 0;
                 }
@@ -803,6 +833,7 @@ static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *o
             }
             return -4;
         }
+        c->okStatus = status;
         opened = 1;
     }
     if (!opened) { conn_close(c); c->kaAlive = 0; return -5; }
@@ -945,6 +976,34 @@ void aseg_init(void) {
     g_chInit = 1;
 }
 
+// A ranged fetch returned *outBuf: keep exactly the requested bytes. 206 is the
+// range itself (checked against Content-Range when the response carried one);
+// 200 means the server ignored Range and sent the resource from byte 0.
+// The BearSSL path reads exactly Content-Length (a short body fails the
+// fetch), so fewer bytes than asked means the resource ends there. SceHttp
+// stops at the time budget and keeps what it has, so from it only a complete
+// range counts.
+static int range_fixup(AsegCh *c, uint8_t **outBuf, int *outLen) {
+    int64_t have = *outLen;
+    if (c->okStatus == 206) {
+        if (c->crStart >= 0 && c->crStart != c->rangeOff) return -13;
+        if (c->okNative && have < c->rangeLen) return -13;
+        if (have > c->rangeLen) *outLen = (int)c->rangeLen;
+        return 0;
+    }
+    if (have <= c->rangeOff) return -13;          // body ends before the range (or past our cap)
+    if (have < c->rangeOff + c->rangeLen) {
+        // Short: fine only if the resource really ends here -- not SceHttp's
+        // budget cut, and not our own read cap (see aseg_fetch_opts).
+        if (c->okNative || have >= c->maxBytes) return -13;
+    }
+    int64_t keep = have - c->rangeOff;
+    if (keep > c->rangeLen) keep = c->rangeLen;
+    memmove(*outBuf, *outBuf + c->rangeOff, (size_t)keep);
+    *outLen = (int)keep;
+    return 0;
+}
+
 int aseg_fetch_opts(int ch, const char *url, uint8_t **outBuf, int *outLen, AsegOpts *o) {
     if (!g_chInit || ch < 0 || ch >= ASEG_CH_COUNT) return -1;   // aseg_init() not run: fail, never race an init
     AsegCh *c = &g_ch[ch];
@@ -955,12 +1014,30 @@ int aseg_fetch_opts(int ch, const char *url, uint8_t **outBuf, int *outLen, Aseg
                 : (ch == ASEG_CH_PLAYLIST && g_playlistBudget) ? ASEG_BUDGET_PLAYLIST_US
                 : ASEG_BUDGET_SEGMENT_US;
     c->maxBytes = ASEG_FETCH_CAP; c->truncate = 0; c->stopAfterHeaders = NULL; c->ctype[0] = '\0';
+    c->rangeOff = c->rangeLen = 0; c->okStatus = 0; c->okNative = 0; c->crStart = -1;
     if (o) {
         if (o->budgetUs) c->budgetUs = o->budgetUs;
         if (o->maxBytes > 0 && o->maxBytes < ASEG_FETCH_CAP) { c->maxBytes = o->maxBytes; c->truncate = 1; }
         c->stopAfterHeaders = o->stopAfterHeaders;
+        if (o->rangeLen > 0) {
+            if (o->rangeOff < 0 || o->rangeLen > ASEG_FETCH_CAP) {
+                scePthreadMutexUnlock(&c->mtx);
+                return -10;
+            }
+            c->rangeOff = o->rangeOff; c->rangeLen = o->rangeLen;
+            // A server that ignores Range sends from byte 0: read no further
+            // than the end of the range (capped) and cut the slice out.
+            int64_t need = o->rangeOff + o->rangeLen;
+            c->maxBytes = need < ASEG_FETCH_CAP ? (int)need : ASEG_FETCH_CAP;
+            c->truncate = 1;
+        }
     }
     int rc = aseg_fetch_inner(c, url, outBuf, outLen);
+    if (rc == 0 && c->rangeLen > 0 && *outBuf && range_fixup(c, outBuf, outLen) != 0) {
+        free(*outBuf); *outBuf = NULL; *outLen = 0;
+        rc = -13;
+    }
+    c->rangeOff = c->rangeLen = 0;
     if (o) snprintf(o->contentType, sizeof(o->contentType), "%s", c->ctype);
     c->stopAfterHeaders = NULL;
     scePthreadMutexUnlock(&c->mtx);

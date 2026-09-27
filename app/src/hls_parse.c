@@ -5,14 +5,33 @@
 #include <string.h>
 #include <strings.h>
 
-void hlspl_init(HlsPlaylist *pl) { memset(pl, 0, sizeof(*pl)); pl->targetDurMs = 3000; }
+void hlspl_init(HlsPlaylist *pl) {
+    memset(pl, 0, sizeof(*pl));
+    pl->targetDurMs = 3000;
+    pl->initRef.key = -1;
+}
 
-void hlspl_free(HlsPlaylist *pl) {
+void hlspl_free_media(HlsPlaylist *pl) {
     if (pl->segs) {
         for (int i = 0; i < pl->segCount; i++) free(pl->segs[i]);
         free(pl->segs);
     }
     free(pl->initSeg);
+    free(pl->segRef);
+    for (int i = 0; i < pl->keyCount; i++) free(pl->keys[i].uri);
+    free(pl->keys);
+    pl->segs = NULL; pl->segCount = 0;
+    pl->initSeg = NULL; pl->segRef = NULL;
+    pl->keys = NULL; pl->keyCount = 0;
+    memset(&pl->initRef, 0, sizeof(pl->initRef));
+    pl->initRef.key = -1;
+    pl->totalDurMs = 0; pl->pendDisc = 0; pl->isLive = 0;
+    pl->targetDurMs = 3000; pl->mediaSeq = 0;
+    pl->unsupported[0] = '\0';
+}
+
+void hlspl_free(HlsPlaylist *pl) {
+    hlspl_free_media(pl);
     hlspl_init(pl);
 }
 
@@ -135,23 +154,110 @@ static void rstrip(char *s) {
         s[--n] = '\0';
 }
 
-static int has_unsupported_hls_tags(const char *body) {
-    // Only reject ACTUAL encryption. "#EXT-X-KEY:METHOD=NONE" explicitly means
-    // the segments are NOT encrypted (RFC 8216 4.3.2.4) and is emitted by real
-    // broadcasters (e.g. DW), so treating any EXT-X-KEY as encrypted rejected
-    // perfectly playable streams.
-    for (const char *k = strstr(body, "#EXT-X-KEY"); k; k = strstr(k + 1, "#EXT-X-KEY")) {
-        const char *m = strstr(k, "METHOD=");
-        const char *eol = strchr(k, '\n');
-        if (!m || (eol && m > eol)) continue;
-        if (strncmp(m + 7, "NONE", 4) == 0) continue;
-        return 1;
+// Value of attribute `name` in an attribute list (RFC 8216 4.2), quoted or
+// not, into out. Matches whole names only (URI never matches KEYURI). 1 if
+// present.
+static int attr_value(const char *list, const char *name, char *out, int cap) {
+    size_t nl = strlen(name);
+    const char *p = list;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        const char *eq = p;
+        while (*eq && *eq != '=' && *eq != ',') eq++;
+        if (*eq != '=') { p = eq; continue; }
+        int match = (size_t)(eq - p) == nl && strncmp(p, name, nl) == 0;
+        const char *v = eq + 1, *ve;
+        if (*v == '"') { v++; ve = strchr(v, '"'); if (!ve) ve = v + strlen(v); p = *ve ? ve + 1 : ve; }
+        else { ve = v; while (*ve && *ve != ',') ve++; p = ve; }
+        if (match) {
+            int l = (int)(ve - v);
+            if (l >= cap) l = cap - 1;
+            memcpy(out, v, (size_t)l); out[l] = '\0';
+            return 1;
+        }
     }
-    return strstr(body, "#EXT-X-BYTERANGE") != NULL;
+    return 0;
 }
 
+// RFC 3986 scheme ("data:", "skd:", "https:") at the start of a reference.
+static int has_scheme(const char *u) {
+    if (!((*u >= 'a' && *u <= 'z') || (*u >= 'A' && *u <= 'Z'))) return 0;
+    for (const char *p = u + 1; *p; p++) {
+        if (*p == ':') return 1;
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
+              *p == '+' || *p == '-' || *p == '.')) return 0;
+    }
+    return 0;
+}
+
+// "0x" + up to 32 hex digits, right-aligned into 16 bytes. 1 if valid.
+static int parse_iv(const char *s, uint8_t iv[16]) {
+    if (s[0] != '0' || (s[1] != 'x' && s[1] != 'X')) return 0;
+    s += 2;
+    int n = (int)strlen(s);
+    if (n < 1 || n > 32) return 0;
+    memset(iv, 0, 16);
+    for (int i = 0; i < n; i++) {
+        char c = s[n - 1 - i];
+        int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+              : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+        if (d < 0) return 0;
+        iv[15 - i / 2] |= (uint8_t)(i % 2 ? d << 4 : d);
+    }
+    return 1;
+}
+
+// "<n>[@<o>]" (EXT-X-BYTERANGE, EXT-X-MAP BYTERANGE). *off = -1 when absent.
+static int parse_byterange(const char *s, int64_t *len, int64_t *off) {
+    char *e;
+    long long n = strtoll(s, &e, 10);
+    if (e == s || n <= 0) return 0;
+    *len = n; *off = -1;
+    if (*e == '@') {
+        const char *o = e + 1;
+        long long v = strtoll(o, &e, 10);
+        if (e == o || v < 0) return 0;
+        *off = v;
+    }
+    return 1;
+}
+
+// segRef is allocated the first time a segment needs a range or a key; the
+// segments before it are plain.
+static int ensure_seg_refs(HlsPlaylist *pl) {
+    if (pl->segRef) return 0;
+    pl->segRef = malloc(sizeof(HlsSegRef) * HLS_MAX_SEGMENTS);
+    if (!pl->segRef) return -1;
+    for (int i = 0; i < HLS_MAX_SEGMENTS; i++) { pl->segRef[i].off = 0; pl->segRef[i].len = 0; pl->segRef[i].key = -1; }
+    return 0;
+}
+
+// Index of an AES-128 key (reusing the previous entry when a tag repeats it
+// unchanged, as live playlists do every refresh), or -1 on allocation failure.
+static int add_key(HlsPlaylist *pl, const char *uri, const uint8_t *iv) {
+    if (pl->keyCount > 0) {
+        HlsKey *k = &pl->keys[pl->keyCount - 1];
+        if (strcmp(k->uri, uri) == 0 && k->hasIv == (iv != NULL) && (!iv || memcmp(k->iv, iv, 16) == 0))
+            return pl->keyCount - 1;
+    }
+    if (pl->keyCount >= HLS_MAX_SEGMENTS) return -1;
+    if ((pl->keyCount & 15) == 0) {
+        HlsKey *nk = realloc(pl->keys, sizeof(HlsKey) * (size_t)(pl->keyCount + 16));
+        if (!nk) return -1;
+        pl->keys = nk;
+    }
+    HlsKey *k = &pl->keys[pl->keyCount];
+    k->uri = strdup(uri);
+    if (!k->uri) return -1;
+    k->hasIv = iv != NULL;
+    if (iv) memcpy(k->iv, iv, 16); else memset(k->iv, 0, 16);
+    return pl->keyCount++;
+}
+
+#define KEY_CLEAR  (-1)
+#define KEY_NOPLAY (-2)   // SAMPLE-AES, or only a DRM key format was offered
+
 int hlspl_parse_media(HlsPlaylist *pl, char *body, const char *base) {
-    if (has_unsupported_hls_tags(body)) return -2;
     pl->segs = malloc(sizeof(char *) * HLS_MAX_SEGMENTS);
     if (!pl->segs) return -1;
     pl->segCount = 0;
@@ -160,9 +266,22 @@ int hlspl_parse_media(HlsPlaylist *pl, char *body, const char *base) {
     pl->mediaSeq = 0;
     pl->pendDisc = 0;
     pl->totalDurMs = 0;
+    pl->unsupported[0] = '\0';
+    pl->initRef.off = pl->initRef.len = 0; pl->initRef.key = KEY_CLEAR;
     int pendingDurMs = 0;
 
-    char resolved[2048];
+    // Key state (RFC 8216 4.3.2.4): a key applies to every following segment
+    // until the next EXT-X-KEY. Consecutive EXT-X-KEY tags offer the SAME
+    // segments under different KEYFORMATs (e.g. identity AES-128 next to
+    // FairPlay); only "identity" is playable, so a group that offers nothing
+    // else is DRM.
+    int curKey = KEY_CLEAR, groupIdentity = 0, keySinceSeg = 0;
+    // EXT-X-BYTERANGE: pending sub-range for the next URI; without "@o" it
+    // continues right after the previous sub-range of the same resource.
+    int64_t pendLen = 0, pendOff = -1, prevEnd = 0;
+    char prevRangeUri[2048] = "";
+
+    char resolved[2048], val[2048];
     char *save = NULL;
     for (char *line = strtok_r(body, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         rstrip(line);
@@ -179,32 +298,93 @@ int hlspl_parse_media(HlsPlaylist *pl, char *body, const char *base) {
                     pendingDurMs = (int)(sec * 1000.0 + 0.5);
             }
             if (strstr(line, "#EXT-X-DISCONTINUITY")) pl->pendDisc = 1;
+            if (strncmp(line, "#EXT-X-BYTERANGE:", 17) == 0) {
+                if (!parse_byterange(line + 17, &pendLen, &pendOff)) pendLen = 0;
+                continue;
+            }
+            if (strncmp(line, "#EXT-X-KEY:", 11) == 0) {
+                const char *attrs = line + 11;
+                if (keySinceSeg == 0) { groupIdentity = 0; keySinceSeg = 1; }
+                char fmt[96] = "identity";
+                attr_value(attrs, "KEYFORMAT", fmt, sizeof(fmt));
+                char method[32] = "";
+                attr_value(attrs, "METHOD", method, sizeof(method));
+                if (strcmp(fmt, "identity") != 0) {
+                    if (!groupIdentity && strcmp(method, "NONE") != 0) {
+                        curKey = KEY_NOPLAY;
+                        snprintf(pl->unsupported, sizeof(pl->unsupported), "DRM (%.40s)", fmt);
+                    }
+                    continue;
+                }
+                groupIdentity = 1;
+                if (strcmp(method, "NONE") == 0) {
+                    curKey = KEY_CLEAR;
+                } else if (strcmp(method, "AES-128") == 0) {
+                    uint8_t iv[16];
+                    int hasIv = attr_value(attrs, "IV", val, sizeof(val)) && parse_iv(val, iv);
+                    if (!attr_value(attrs, "URI", val, sizeof(val)) || !val[0]) {
+                        curKey = KEY_NOPLAY;
+                        snprintf(pl->unsupported, sizeof(pl->unsupported), "AES-128 key without URI");
+                        continue;
+                    }
+                    // Keys may be inline (data:) or use another scheme:
+                    // only http(s) and relative references are resolved.
+                    if (has_scheme(val) && strncasecmp(val, "http", 4) != 0)
+                        snprintf(resolved, sizeof(resolved), "%s", val);
+                    else
+                        hlspl_resolve_url(base, val, resolved, sizeof(resolved));
+                    curKey = add_key(pl, resolved, hasIv ? iv : NULL);
+                    if (curKey < 0) return -1;
+                } else {
+                    curKey = KEY_NOPLAY;
+                    snprintf(pl->unsupported, sizeof(pl->unsupported), "%.40s encryption",
+                             method[0] ? method : "unknown");
+                }
+                continue;
+            }
             const char *map = strstr(line, "#EXT-X-MAP:");
             if (map) {
-                const char *uri = strstr(map, "URI=\"");
-                if (uri) {
-                    uri += 5;
-                    const char *end = strchr(uri, '"');
-                    if (end) {
-                        char raw[2048];
-                        int l = (int)(end - uri);
-                        if (l >= (int)sizeof(raw)) l = sizeof(raw) - 1;
-                        memcpy(raw, uri, (size_t)l); raw[l] = '\0';
-                        hlspl_resolve_url(base, raw, resolved, sizeof(resolved));
-                        free(pl->initSeg);
-                        pl->initSeg = strdup(resolved);
+                if (attr_value(map + 11, "URI", val, sizeof(val)) && val[0]) {
+                    hlspl_resolve_url(base, val, resolved, sizeof(resolved));
+                    free(pl->initSeg);
+                    pl->initSeg = strdup(resolved);
+                    pl->initRef.off = pl->initRef.len = 0;
+                    char br[64];
+                    int64_t l, o;
+                    if (attr_value(map + 11, "BYTERANGE", br, sizeof(br)) && parse_byterange(br, &l, &o)) {
+                        pl->initRef.len = l;
+                        pl->initRef.off = o < 0 ? 0 : o;
                     }
+                    // The init segment is encrypted with the key in effect here.
+                    pl->initRef.key = curKey;
+                    if (curKey == KEY_NOPLAY) return -2;
                 }
             }
             continue;
         }
         if (pl->segCount >= HLS_MAX_SEGMENTS) break;
+        keySinceSeg = 0;
+        if (curKey == KEY_NOPLAY) return -2;
         hlspl_resolve_url(base, line, resolved, sizeof(resolved));
+        int64_t rOff = 0, rLen = 0;
+        if (pendLen > 0) {
+            rLen = pendLen;
+            rOff = pendOff >= 0 ? pendOff : (strcmp(prevRangeUri, resolved) == 0 ? prevEnd : 0);
+            prevEnd = rOff + rLen;
+            snprintf(prevRangeUri, sizeof(prevRangeUri), "%s", resolved);
+            pendLen = 0; pendOff = -1;
+        }
+        if ((rLen > 0 || curKey >= 0) && ensure_seg_refs(pl) != 0) return -1;
         pl->segs[pl->segCount] = strdup(resolved);
         if (pl->segs[pl->segCount]) {
             int dur = pendingDurMs > 0 ? pendingDurMs : pl->targetDurMs;
             pl->segDisc[pl->segCount] = (unsigned char)pl->pendDisc;
             pl->segDurMs[pl->segCount] = dur;
+            if (pl->segRef) {
+                pl->segRef[pl->segCount].off = rOff;
+                pl->segRef[pl->segCount].len = rLen;
+                pl->segRef[pl->segCount].key = curKey;
+            }
             pl->totalDurMs += dur;
             pl->pendDisc = 0;
             pendingDurMs = 0;
@@ -212,6 +392,41 @@ int hlspl_parse_media(HlsPlaylist *pl, char *body, const char *base) {
         }
     }
     return pl->segCount > 0 ? 0 : -1;
+}
+
+void hlspl_seg_range(const HlsPlaylist *pl, int seg, int64_t *off, int64_t *len) {
+    const HlsSegRef *r = seg < 0 ? &pl->initRef
+                       : (pl->segRef && seg < pl->segCount) ? &pl->segRef[seg] : NULL;
+    *off = r ? r->off : 0;
+    *len = r ? r->len : 0;
+}
+
+const HlsKey *hlspl_seg_key(const HlsPlaylist *pl, int seg, uint8_t iv[16]) {
+    const HlsSegRef *r = seg < 0 ? &pl->initRef
+                       : (pl->segRef && seg < pl->segCount) ? &pl->segRef[seg] : NULL;
+    if (!r || r->key < 0 || r->key >= pl->keyCount) return NULL;
+    const HlsKey *k = &pl->keys[r->key];
+    if (k->hasIv) {
+        memcpy(iv, k->iv, 16);
+    } else {
+        // The segment's media sequence number, big-endian (RFC 8216 5.2). The
+        // init segment has none (its IV is mandatory); fall back to the first
+        // segment's.
+        uint64_t seq = (uint64_t)(int64_t)pl->mediaSeq + (uint64_t)(seg < 0 ? 0 : seg);
+        memset(iv, 0, 16);
+        for (int i = 0; i < 8; i++) iv[15 - i] = (uint8_t)(seq >> (8 * i));
+    }
+    return k;
+}
+
+int hlspl_has_seg_refs(const HlsPlaylist *pl) {
+    return pl->segRef != NULL || pl->initRef.len > 0 || pl->initRef.key >= 0;
+}
+
+int hlspl_seg_is_plain(const HlsPlaylist *pl, int seg) {
+    const HlsSegRef *r = seg < 0 ? &pl->initRef
+                       : (pl->segRef && seg < pl->segCount) ? &pl->segRef[seg] : NULL;
+    return !r || (r->len <= 0 && (r->key < 0 || r->key >= pl->keyCount));
 }
 
 int hlspl_collect_variants(HlsPlaylist *pl, const char *body, const char *base) {

@@ -46,6 +46,10 @@ typedef struct {
     // headers; maxBytes and budgetUs still bound it.)
     int     (*stopAfterHeaders)(const char *contentType);
     char      contentType[96];   // out: Content-Type of the final response
+    // rangeLen > 0: fetch only bytes [rangeOff, rangeOff + rangeLen) (HLS
+    // EXT-X-BYTERANGE). Sent as a Range request; a server that ignores it and
+    // answers 200 gets the slice cut out of the full body (up to 16 MB in).
+    int64_t   rangeOff, rangeLen;
 } AsegOpts;
 #define ASEG_STOPPED 1
 int aseg_fetch_opts(int ch, const char *url, uint8_t **buf, int *len, AsegOpts *o);

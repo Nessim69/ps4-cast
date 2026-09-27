@@ -41,7 +41,8 @@ The build output is **`dist/PS4-Cast-v<version>.pkg`**. Two ways to install:
 3. Paste a **direct** video link (`.mp4`, `.mkv`, or HLS `.m3u8`) and tap
    **Cast**, or choose **Choose a local file** to upload and play a video from
    that phone or computer. Page URLs such as YouTube watch pages are not media
-   URLs and will not work.
+   URLs and will not work. HLS streams encrypted with AES-128 and byte-range
+   playlists play; DRM (FairPlay, Widevine, PlayReady, SAMPLE-AES) does not.
 4. Uploaded videos use PS4 internal storage. The web UI shows the saved file and
    its size; use the trash button there to remove it. A new upload replaces the
    previous one, so PS4 Cast never accumulates an upload library silently.
@@ -81,7 +82,10 @@ way. `./build.sh WERROR=1` fails the build on any warning (CI, or before a
 release).
 
 Pure-logic regression tests run on the Mac alone (HLS parsing, URL options,
-page scraping): `make -C tests/host test`. Cut a release with
+page scraping): `make -C tests/host test`. `tests/hls-e2e/run.sh` plays AES-128,
+byte-range, fMP4 and separate-audio HLS scenarios through the app's real HLS
+and HTTP code against a local server (needs `pip3 install cryptography` and
+`portlibs/fetch.sh`). Cut a release with
 `scripts/release.sh <version>` — bumps `app/Makefile`, builds, and appends the
 pkg SHA-256 to STEERING.md.
 

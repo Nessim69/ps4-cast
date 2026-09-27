@@ -61,5 +61,8 @@ void hls_request_downshift(void);
 
 // One-line diagnostic for /status.
 const char *hls_debug(void);
+// Why the last hls_open refused the stream's encryption ("DRM (com.apple...)",
+// "SAMPLE-AES encryption"), or "" if it didn't.
+const char *hls_unsupported_reason(void);
 
 #endif

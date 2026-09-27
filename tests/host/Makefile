@@ -8,6 +8,17 @@ SRC = ../../app/src
 
 TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_agent_crypto
 
+# HLS AES-128 decryption (app/src/hls_crypt.c) against BearSSL's AES, built
+# from the pinned source tree that portlibs/fetch.sh unpacks. Skipped (with a
+# note) when that tree isn't there.
+BEARSSL_SRC ?= ../../portlibs/src/bearssl-0.6
+BEARSSL_AES = $(addprefix $(BEARSSL_SRC)/src/symcipher/,aes_big_cbcdec.c aes_big_dec.c aes_common.c aes_x86ni.c aes_x86ni_cbcdec.c)
+ifneq ($(wildcard $(BEARSSL_SRC)/inc/bearssl.h),)
+TESTS += test_hls_crypt
+else
+SKIP_NOTE = test_hls_crypt: skipped (no BearSSL source at $(BEARSSL_SRC); run portlibs/fetch.sh)
+endif
+
 all: $(TESTS)
 
 test_hls_parse: test_hls_parse.c $(SRC)/hls_parse.c
@@ -40,14 +51,18 @@ test_agent_crypto: test_agent_crypto.c $(AGENT)/sha256.c $(AGENT)/agent_proto.c
 test_token: test_token.c $(SRC)/pairing.c
 	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_token.c $(SRC)/pairing.c
 
+test_hls_crypt: test_hls_crypt.c $(SRC)/hls_crypt.c
+	$(CC) $(CFLAGS) -I$(SRC) -I$(BEARSSL_SRC)/inc -I$(BEARSSL_SRC)/src -o $@ test_hls_crypt.c $(SRC)/hls_crypt.c $(BEARSSL_AES)
+
 test: all
 	@for t in $(TESTS); do ./$$t || exit 1; done
+	@$(if $(SKIP_NOTE),echo "$(SKIP_NOTE)",true)
 	@./test_qr > /tmp/qr_now.txt
 	@golden=./test_qr_golden.txt; \
 	 [ -f "$$golden" ] || golden=../../tests/host/test_qr_golden.txt; \
 	 cmp -s /tmp/qr_now.txt "$$golden" && echo "test_qr: goldens match" || { echo "test_qr: GOLDEN MISMATCH"; diff "$$golden" /tmp/qr_now.txt | head; exit 1; }
 
 clean:
-	rm -f $(TESTS)
+	rm -f $(TESTS) test_hls_crypt
 
 .PHONY: all test clean

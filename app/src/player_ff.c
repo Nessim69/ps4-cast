@@ -712,8 +712,18 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
                  g_isLocal ? "The uploaded file is no longer available. Upload it again."
                            : (g_isHls ? "The HLS source could not be opened. Check the link or server."
                                       : "The video source could not be reached. Check the link and try again."));
+        char why[64] = "";
+        if (g_isHls) snprintf(why, sizeof(why), "%s", hls_unsupported_reason());
         player_teardown();
-        if (!set_cert_error(vfGen0)) player_set_error("source", detail);
+        if (why[0]) {
+            // Not a broken link: the stream uses encryption only its own app
+            // can play (SAMPLE-AES / a DRM system). AES-128 HLS is supported.
+            char msg[200];
+            snprintf(msg, sizeof(msg), "This stream is protected (%s) and can't be played here.", why);
+            player_set_error("drm", msg);
+        } else if (!set_cert_error(vfGen0)) {
+            player_set_error("source", detail);
+        }
         return -1;
     }
     if (open_cancelled()) { player_teardown(); return OPEN_RC_CANCELLED; }
