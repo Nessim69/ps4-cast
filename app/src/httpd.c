@@ -391,7 +391,16 @@ static int json_list(char *out, int cap, char arr[][URL_MAX], int n) {
 // return a single entry that points at the original URL so it can be cast.
 #define PLAYLIST_MAX_ENTRIES 200
 extern int aseg_fetch(const char *url, uint8_t **buf, int *len);
-extern void aseg_resume(void);
+// Independent connection for the web UI's /playlist fetch: no stream headers
+// (Referer/Cookie), and untouched by the playing stream's sticky abort, so
+// loading a channel list can't fail or hang on account of what's currently
+// casting. Implemented in aseg.c by another agent; not yet linkable here.
+extern int aseg_fetch_ui(const char *url, uint8_t **buf, int *len);
+// Bumped whenever the channel store changes (chan_ver, for /status); another
+// agent is adding this to httpd_channels.c/.h, which isn't ours to edit, so
+// declare it locally the same way. Won't link in this worktree -- the
+// compile check is enough here.
+extern int httpd_channels_version(void);  /* httpd_channels.c */
 
 // Append a JSON-escaped, length-capped string (with surrounding quotes).
 static void json_str(char *out, int cap, int *po, const char *s, int maxchars) {
@@ -1951,14 +1960,13 @@ static void handle_client(OrbisNetId c) {
         char url[URL_MAX];
         strncpy(url, body, sizeof(url) - 1); url[sizeof(url) - 1] = '\0';
         for (int i = (int)strlen(url) - 1; i >= 0 && (url[i]=='\r'||url[i]=='\n'||url[i]==' '||url[i]=='\t'); i--) url[i] = '\0';
-        const int CAP = 512 * 1024;
+        const int CAP = 3 * 1024 * 1024;   // the channel store holds up to 2000 entries
         char *out = malloc(CAP);
         if (!out) { send_response(c, "200 OK", "application/json", "[]", 2); return; }
         int n = 0;
         if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {
             uint8_t *buf = NULL; int len = 0;
-            aseg_resume();   // sticky abort from a previous Stop must not block a web-UI playlist load
-            if (aseg_fetch(url, &buf, &len) == 0 && buf && len > 0) {
+            if (aseg_fetch_ui(url, &buf, &len) == 0 && buf && len > 0) {
                 uint8_t *txt = realloc(buf, (size_t)len + 1);
                 if (txt) {
                     buf = txt; buf[len] = '\0';
