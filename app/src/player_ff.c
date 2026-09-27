@@ -423,6 +423,54 @@ void player_stop(void) {
 void player_set_hw(int on) { g_hwEnabled = on ? 1 : 0; }
 int  player_hw_enabled(void) { return g_hwEnabled; }
 
+// Adaptive in-loop deblocking for software decode. Skipping it (AVDISCARD_ALL)
+// is the single biggest software-decode speedup, but doing so unconditionally
+// made every software-decoded stream visibly blocky. Up to 720p the filter now
+// starts ON and steps down only once decode demonstrably can't keep up: first
+// skipped on non-reference frames (nothing predicts from those, so no drift),
+// then on all. Larger frames keep skipping from the start, where the CPU cost
+// demands it. One-way per decoder: stepping back up would just re-stall.
+// Changing it mid-stream is safe with frame threads (FFmpeg 6.1): each packet's
+// submit_packet copies skip_loop_filter from this user context into that frame
+// thread's own context under its lock (pthread_frame.c
+// update_context_from_user), and h264_slice.c / hevc_filter.c read it from the
+// thread's copy. Only the thread calling avcodec_send_packet writes it here.
+static const enum AVDiscard LF_LEVEL[3] = { AVDISCARD_DEFAULT, AVDISCARD_NONREF, AVDISCARD_ALL };
+static int      g_lfLevel;
+static long     g_lfRebufSeen, g_lfLateSeen;
+static uint64_t g_lfLateT0, g_lfSettleUntil;
+
+// Is the decoder being fed? Then a starving frame queue means decoding itself
+// is too slow, not the network. Unknown counts as not healthy.
+static int sw_input_healthy(void) {
+    if (g_isLocal) return 1;
+    if (g_hlsSegDemux) return g_segReadAhead && g_srCount > 0;   // a whole segment waiting
+    if (g_isHls) return hls_buffer_pct() >= 50;
+    if (g_bytesPerSec > 0) return (double)httpsrc_ahead_bytes() / g_bytesPerSec >= 2.0;
+    return httpsrc_fill_pct() >= 50;
+}
+
+// Decode thread, before each software avcodec_send_packet. A strike is a
+// rebuffer, or 12+ late drops within 5s, while the input is healthy; each
+// strike steps the filter down one level, then waits 3s for the queue to
+// refill before judging again.
+static void sw_adapt_loop_filter(void) {
+    if (!g_vdec || g_lfLevel >= 2) return;
+    uint64_t now = sceKernelGetProcessTime();
+    long rebuf = g_rebufTotal, late = g_lateDrops;
+    int strike = 0;
+    if (rebuf < g_lfRebufSeen) g_lfRebufSeen = rebuf;   // counters reset by a new playback
+    if (late < g_lfLateSeen) g_lfLateSeen = late;
+    if (rebuf > g_lfRebufSeen) { g_lfRebufSeen = rebuf; strike = 1; }
+    if (now - g_lfLateT0 > 5000000ULL) { g_lfLateSeen = late; g_lfLateT0 = now; }
+    else if (late - g_lfLateSeen >= 12) { g_lfLateSeen = late; g_lfLateT0 = now; strike = 1; }
+    if (!strike || now < g_lfSettleUntil || !sw_input_healthy()) return;
+    g_lfLevel++;
+    g_vdec->skip_loop_filter = LF_LEVEL[g_lfLevel];
+    g_lfSettleUntil = now + 3000000ULL;
+    trace_mark("sw loop filter level %d (rebuf=%ld late=%ld)", g_lfLevel, rebuf, late);
+}
+
 // Open the multi-threaded software H.264/etc decoder into g_vdec. Returns 0/-1.
 // Used for the normal software path and as the hardware-failure fallback.
 static int open_sw_video(const AVCodec *dec) {
@@ -430,12 +478,16 @@ static int open_sw_video(const AVCodec *dec) {
     if (!g_vdec) return -1;
     avcodec_parameters_to_context(g_vdec, g_fmt->streams[g_vstream]->codecpar);
     // Multi-core software decode — the PS4 has ~6 usable Jaguar cores. Frame +
-    // slice threading is the biggest win for smooth HD playback. Disabling the
-    // in-loop deblocking filter is the single biggest software-decode speedup;
-    // FLAG2_FAST allows non-compliant shortcuts (slight blockiness for fps).
+    // slice threading is the biggest win for smooth HD playback. Deblocking is
+    // adaptive (sw_adapt_loop_filter); FLAG2_FAST allows non-compliant
+    // shortcuts (slight blockiness for fps).
     g_vdec->thread_count = 6;
     g_vdec->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
-    g_vdec->skip_loop_filter = AVDISCARD_ALL;
+    g_lfLevel = (int64_t)g_vdec->width * g_vdec->height > 1280 * 720 ? 2 : 0;
+    g_vdec->skip_loop_filter = LF_LEVEL[g_lfLevel];
+    g_lfRebufSeen = g_rebufTotal; g_lfLateSeen = g_lateDrops;
+    g_lfLateT0 = sceKernelGetProcessTime();
+    g_lfSettleUntil = g_lfLateT0 + 3000000ULL;    // startup queue fill is not a strike
     g_vdec->flags2 |= AV_CODEC_FLAG2_FAST;
     if (avcodec_open2(g_vdec, dec, NULL) < 0) return -1;
     return 0;
@@ -1062,7 +1114,7 @@ void player_debug(char *out, int len) {
     uint64_t fbReused = 0, fbReshown = 0;   // presents that needed no drawing (see gfx.h)
     gfx_reuse_stats(&fbReused, &fbReshown);
     snprintf(out, len,
-             "ff%s%s%s %dx%d | fr=%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%llu/%llu dc=%llu/%llu qw=%llu/%llu flip=%llu/%llu(w%llu/%llu)us reuse=%llu/%llu ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
+             "ff%s%s%s %dx%d | fr=%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%llu/%llu dc=%llu/%llu qw=%llu/%llu flip=%llu/%llu(w%llu/%llu)us reuse=%llu/%llu lf=%d ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
              g_useHw ? "/HW" : "", g_isHls ? (g_hlsSegDemux ? "/hls-seg" : "/hls") : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
              g_frames, g_drops, g_queueDrops, g_lateDrops, g_reorderDrops, g_fqCount, FQ_SLOTS,
              g_hwReorder,
@@ -1074,7 +1126,7 @@ void player_debug(char *out, int len) {
              (unsigned long long)g_fqWaitUsMax,
              (unsigned long long)flipAvg, (unsigned long long)flipMax,
              (unsigned long long)flipWaitAvg, (unsigned long long)flipWaitMax,
-             (unsigned long long)fbReused, (unsigned long long)fbReshown,
+             (unsigned long long)fbReused, (unsigned long long)fbReshown, g_useHw ? -1 : g_lfLevel,
              g_srCount, SEG_RING, g_rebufTotal, ahead,
              (long long)(g_lastLagUs / 1000), g_lastErr, vdec_hw_dmem_outstanding() / 1024,
              g_sepAudioMode ? g_aastream : g_astream, g_sepAudioMode ? "/sep" : "",
@@ -1527,6 +1579,7 @@ static int decode_video_packet(AVPacket *pkt) {
         return !g_decStop && !g_seekPending;
     }
 
+    sw_adapt_loop_filter();
     if (avcodec_send_packet(g_vdec, pkt) < 0) return 1;
     for (;;) {
         int got = avcodec_receive_frame(g_vdec, g_frame);
@@ -2253,6 +2306,7 @@ static void *decode_segment_thread_main(void *arg) {
                 decode_video_hw_seg(g_pkt, vtb);
                 av_packet_unref(g_pkt);
             } else {
+                sw_adapt_loop_filter();
                 if (avcodec_send_packet(g_vdec, g_pkt) < 0) { av_packet_unref(g_pkt); continue; }
                 av_packet_unref(g_pkt);
                 queue_sw_frame_us(vtb);
