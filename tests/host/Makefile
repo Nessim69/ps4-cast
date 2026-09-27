@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -Wno-unused-parameter -g -O1 -std=gnu11
 
 SRC = ../../app/src
 
-TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_netwatch test_lang test_agent_crypto
+TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_netwatch test_lang test_m3u test_agent_crypto
 
 # HLS AES-128 decryption (app/src/hls_crypt.c) against BearSSL's AES, built
 # from the pinned source tree that portlibs/fetch.sh unpacks. Skipped (with a
@@ -58,6 +58,10 @@ test_netpolicy: test_netpolicy.c $(SRC)/netpolicy.c
 # Address appeared/changed/lost detector (app/src/netwatch.c).
 test_netwatch: test_netwatch.c $(SRC)/netwatch.c
 	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_netwatch.c $(SRC)/netwatch.c
+
+# M3U/IPTV parsing and per-channel options, through urlopt into headers.
+test_m3u: test_m3u.c $(SRC)/m3u.c $(SRC)/urlopt.c $(SRC)/netpolicy.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_m3u.c $(SRC)/m3u.c $(SRC)/urlopt.c $(SRC)/netpolicy.c
 
 # Audio-language normalisation and matching (app/src/lang.c).
 test_lang: test_lang.c $(SRC)/lang.c

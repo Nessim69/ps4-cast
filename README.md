@@ -51,7 +51,9 @@ The build output is **`dist/PS4-Cast-v<version>.pkg`**. Two ways to install:
    PS4 address. Detected videos always show a confirmation before casting.
 6. The TV and web interfaces have two modes: **Cast receiver** for direct links,
    uploads and DLNA, and **Live TV** for M3U playlists, bouquets and channels.
-   The receiver keeps listening in both modes.
+   The receiver keeps listening in both modes. Per-channel Referer/User-Agent
+   options in the list (`#EXTVLCOPT`, `#EXTHTTP`, `#KODIPROP`, `url|Referer=`)
+   are honoured.
 7. During IPTV playback, **Down** opens the channel guide, **L1/R1** changes
    channel and **L2/R2** changes bouquet. During cast playback, Left/Right and
    L1/R1 seek instead. Cross pauses, Circle stops and Triangle exits. When a

@@ -439,7 +439,7 @@ static const char WEB_UI_HTML[] =
 "function fmt(s){s=Math.max(0,s|0);var h=(s/3600)|0,m=((s/60)|0)%60,x=s%60,p=function(n){return(n<10?'0':'')+n};return h>0?h+':'+p(m)+':'+p(x):m+':'+p(x)}\n"
 "function esc(s){return(''+s).replace(/[&<>\"']/g,function(c){return c=='<'?'&lt;':c=='>'?'&gt;':c=='&'?'&amp;':c=='\"'?'&quot;':'&#39;'})}\n"
 "function shorten(u){try{u=decodeURIComponent(u)}catch(e){}return u.length>60?u.slice(0,34)+'…'+u.slice(-22):u}\n"
-"function nameFromUrl(u){try{u=decodeURIComponent(u)}catch(e){}u=u.split(/[?#]/)[0];var p=u.split('/').filter(Boolean);return p.length?p[p.length-1]:u}\n"
+"function nameFromUrl(u){u=(''+u).split('|')[0];try{u=decodeURIComponent(u)}catch(e){}u=u.split(/[?#]/)[0];var p=u.split('/').filter(Boolean);return p.length?p[p.length-1]:u}\n"
 "async function post(p,b){try{return noteAuth(await fetch(withT(p),{method:'POST',headers:{'Content-Type':'text/plain','X-PS4Cast-Token':TOKEN||''},body:b||''}))}catch(e){}}\n"
 "async function getj(p){try{var r=noteAuth(await fetch(withT(p),{headers:{'X-PS4Cast-Token':TOKEN||''}}));if(r.status===401)return null;return await r.json()}catch(e){return null}}\n"
 "/* A 401 means the receiver's token changed after this page loaded (regenerated\n"

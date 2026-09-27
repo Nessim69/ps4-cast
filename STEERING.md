@@ -596,3 +596,17 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
   normalises en/eng/English, fre/fra, ger/deu, ...).
 - Host tests: `test_lang`; `test_audiotrack` with `FFMPEG_HOST=<host ffmpeg
   prefix>`; the rendition choice runs in `tests/hls-e2e`.
+
+## IPTV per-channel options
+
+- M3U parsing moved to `m3u.c` (pure, `tests/host/test_m3u.c`). Channels now
+  carry the HTTP options IPTV lists use, rewritten into the player's
+  `url|User-Agent=..&Referer=..` form (percent-encoding `%`, `&`, `|`):
+  `#EXTVLCOPT:http-referrer=/http-user-agent=/http-origin=`, `#EXTHTTP:{json}`,
+  `#KODIPROP:inputstream.adaptive.stream_headers=` (and manifest/common),
+  `#EXTINF` attributes (`user-agent=`, `referrer=`, `http-*`), and list-wide
+  defaults on the `#EXTM3U` line. Options already on a `url|...` entry win;
+  directives apply to the next URL only.
+- Options that don't fit the 1 KB channel URL are dropped whole, least useful
+  last (User-Agent, Referer, Origin, Cookie). Cookie is still scoped to the
+  channel's own host by urlopt.

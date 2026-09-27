@@ -1,6 +1,7 @@
 // httpd_channels.c — channel store + M3U parsing + channel endpoints.
 // Extracted from httpd.c verbatim (v04.49); behavior unchanged.
 #include "httpd_channels.h"
+#include "m3u.h"
 #include "httpd.h"
 
 #include <stdio.h>
@@ -128,19 +129,15 @@ static void chan_add(const char *name, const char *group, const char *url) {
     g_chanN++;
 }
 
-// Pull a quoted #EXTINF attribute value, e.g. key = "group-title=\"".
-static void extinf_attr(const char *line, const char *key, char *out, int cap) {
-    out[0] = '\0';
-    const char *k = strstr(line, key);
-    if (!k) return;
-    k += strlen(key);
-    int i = 0;
-    while (k[i] && k[i] != '"' && i < cap - 1) { out[i] = k[i]; i++; }
-    out[i] = '\0';
+static int m3u_add(void *ctx, const M3uEntry *e) {
+    (void)ctx;
+    chan_add(e->name, e->group, e->spec);
+    return g_chanN >= MAX_CHAN;          // full: stop parsing
 }
 
 // Parse a fetched M3U/IPTV playlist into the shared channel store (caller holds
 // g_mtx). A genuine HLS stream (#EXT-X- tags) is one castable entry, not a list.
+// m3u.c does the parsing, including the per-channel Referer/User-Agent options.
 static void playlist_store(const char *text, const char *srcUrl) {
     g_chanN = 0; g_chanCur = -1;
     if (strstr(text, "#EXT-X-STREAM-INF") || strstr(text, "#EXT-X-TARGETDURATION") ||
@@ -150,46 +147,7 @@ static void playlist_store(const char *text, const char *srcUrl) {
         g_chanVer++;
         return;
     }
-    char pend[256]; pend[0] = '\0';
-    char pendGrp[CHAN_GRP_MAX]; pendGrp[0] = '\0';
-    char sticky[CHAN_GRP_MAX]; sticky[0] = '\0';   // #EXTGRP applies until changed
-    for (const char *p = text; *p && g_chanN < MAX_CHAN; ) {
-        const char *nl = strchr(p, '\n');
-        int len = nl ? (int)(nl - p) : (int)strlen(p);
-        char line[1100];
-        int ll = len < (int)sizeof(line) - 1 ? len : (int)sizeof(line) - 1;
-        memcpy(line, p, ll); line[ll] = '\0';
-        for (int i = (int)strlen(line) - 1; i >= 0 && (line[i]=='\r'||line[i]==' '||line[i]=='\t'); i--) line[i] = '\0';
-        char *s = line; while (*s == ' ' || *s == '\t') s++;
-        if (*s) {
-            if (strncmp(s, "#EXTINF:", 8) == 0) {
-                // Channel name = text after the first comma outside quotes
-                // (attributes like group-title="A,B" may contain commas).
-                const char *cur = s + 8; int inq = 0; const char *name = NULL;
-                for (; *cur; cur++) {
-                    if (*cur == '"') inq = !inq;
-                    else if (*cur == ',' && !inq) { name = cur + 1; break; }
-                }
-                if (name) {
-                    while (*name == ' ' || *name == '\t') name++;
-                    strncpy(pend, name, sizeof(pend) - 1); pend[sizeof(pend) - 1] = '\0';
-                }
-                extinf_attr(s, "group-title=\"", pendGrp, sizeof(pendGrp));
-            } else if (strncmp(s, "#EXTGRP:", 8) == 0) {
-                const char *g = s + 8; while (*g == ' ' || *g == '\t') g++;
-                strncpy(sticky, g, sizeof(sticky) - 1); sticky[sizeof(sticky) - 1] = '\0';
-            } else if (s[0] != '#') {
-                char nm[CHAN_NAME_MAX];
-                if (pend[0]) { strncpy(nm, pend, sizeof(nm) - 1); nm[sizeof(nm) - 1] = '\0'; }
-                else name_from_url(s, nm, sizeof(nm));
-                chan_add(nm, pendGrp[0] ? pendGrp : sticky, s);
-                pend[0] = '\0'; pendGrp[0] = '\0';
-            }
-            // other #directives (#EXTM3U, #EXTVLCOPT, ...) are ignored
-        }
-        if (!nl) break;
-        p = nl + 1;
-    }
+    m3u_parse(text, URL_MAX, m3u_add, NULL);
     g_chanVer++;
 }
 
