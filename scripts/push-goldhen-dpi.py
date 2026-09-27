@@ -5,18 +5,26 @@ Push the current PS4 Cast PKG through GoldHEN's HTTP payload server.
 This mirrors DirectPackageInstaller's flow, but avoids the GUI/CLI mismatch on
 newer GoldHEN builds:
   1. serve a BGFT JSON manifest on the Mac,
-  2. patch DPI's installer payload with Mac IP + metadata callback port,
-  3. POST the payload to GoldHEN /payload,
-  4. send DPI's package metadata packet when the payload connects back.
+  2. bootstrap the resident deploy agent (payloads/ps4cast-dpi) through
+     GoldHEN /payload once per boot, with a fresh secret patched in,
+  3. send DPI's package metadata packet to the agent on :9192, authenticated
+     with HMAC-SHA256 under that secret (protocol: payloads/ps4cast-dpi/
+     agent_proto.h). The secret stays in the git-ignored .ps4cast-agent-secret
+     so later deploys reuse the resident agent; nobody else can drive it.
 """
 
 from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
+import hmac
 import http.client
 import http.server
 import json
+import os
+import re
+import secrets
 import socket
 import struct
 import subprocess
@@ -30,6 +38,62 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PAYLOAD = ROOT / "scripts" / "dpi-payload.bin"
+SECRET_FILE = ROOT / ".ps4cast-agent-secret"
+TOKEN_FILE = ROOT / ".ps4cast-token"
+
+# Wire protocol shared with payloads/ps4cast-dpi/agent_proto.h.
+AGENT_GREETING = b"PCAG1"
+AGENT_REQUEST_MAGIC = b"PCAR"
+AGENT_MAC_LABEL = b"ps4cast-agent-v1"
+AGENT_SECRET_PLACEHOLDER = b"PS4CAST_AGENT_SECRET_PLACEHOLDER"
+
+
+def pairing_token(ps4: str) -> str:
+    """PS4 Cast pairing token for /quit: $PS4CAST_TOKEN, .ps4cast-token, or
+    GET /token (answers only while the TV's pairing window is open)."""
+    tok = os.environ.get("PS4CAST_TOKEN", "").strip()
+    if not tok and TOKEN_FILE.exists():
+        tok = TOKEN_FILE.read_text().strip()
+    if not tok:
+        try:
+            with urllib.request.urlopen(f"http://{ps4}:8080/token", timeout=3) as resp:
+                tok = resp.read().decode("ascii", "replace").strip()
+        except Exception:
+            tok = ""
+    return tok if re.fullmatch(r"[A-Z2-9]{8}", tok) else ""
+
+
+def load_secret() -> bytes | None:
+    try:
+        raw = bytes.fromhex(SECRET_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return raw if len(raw) == 32 else None
+
+
+def new_secret() -> bytes:
+    secret = secrets.token_bytes(32)
+    SECRET_FILE.write_text(secret.hex() + "\n")
+    try:
+        os.chmod(SECRET_FILE, 0o600)
+    except OSError:
+        pass
+    return secret
+
+
+def patch_payload(payload: bytes, secret: bytes) -> bytes:
+    """Put the secret into the agent binary (the agent refuses to run unpatched)."""
+    count = payload.count(AGENT_SECRET_PLACEHOLDER)
+    if count != 1:
+        raise SystemExit(f"{DEFAULT_PAYLOAD.name}: expected exactly one secret placeholder, found {count} "
+                         "(rebuild it: make -C payloads/ps4cast-dpi install)")
+    return payload.replace(AGENT_SECRET_PLACEHOLDER, secret)
+
+
+def agent_request(secret: bytes, nonce: bytes, packet: bytes) -> bytes:
+    length = struct.pack("<I", len(packet))
+    mac = hmac.new(secret, AGENT_MAC_LABEL + nonce + length + packet, hashlib.sha256).digest()
+    return AGENT_REQUEST_MAGIC + length + packet + mac
 
 
 def close_running_app(ps4: str, attempts: int = 5) -> bool:
@@ -42,6 +106,11 @@ def close_running_app(ps4: str, attempts: int = 5) -> bool:
     is what makes a bootstrap attempt reliable.
     """
     status_url = f"http://{ps4}:8080/status"
+    token = pairing_token(ps4)
+    if not token:
+        print("WARNING: no pairing token (set PS4CAST_TOKEN or .ps4cast-token); "
+              "/quit is refused while pairing is on",
+              file=sys.stderr)
     for i in range(attempts):
         try:
             with urllib.request.urlopen(status_url, timeout=3) as resp:
@@ -50,7 +119,8 @@ def close_running_app(ps4: str, attempts: int = 5) -> bool:
             return True  # not running (or unreachable): safe to proceed
         print(f"app running; close attempt {i + 1}: POST /quit")
         try:
-            req = urllib.request.Request(f"http://{ps4}:8080/quit", data=b"", method="POST")
+            req = urllib.request.Request(f"http://{ps4}:8080/quit?t={token}", data=b"", method="POST",
+                                         headers={"X-PS4Cast-Token": token})
             urllib.request.urlopen(req, timeout=5).read()
         except Exception:
             pass
@@ -304,12 +374,17 @@ class AgentUnavailable(ConnectionError):
     pass
 
 
+class AgentRefused(ConnectionError):
+    """An agent is listening but this checkout cannot (or may not) drive it."""
+
+
 def send_agent_command(
     ps4_ip: str,
     port: int,
     packet: bytes,
     connect_timeout: float,
     status_timeout: int,
+    secret: bytes | None,
 ) -> str:
     deadline = time.monotonic() + connect_timeout
     last_error: OSError | None = None
@@ -327,8 +402,28 @@ def send_agent_command(
 
     with sock:
         print(f"agent: connected to {ps4_ip}:{port}")
-        sock.sendall(packet)
-        sock.shutdown(socket.SHUT_WR)
+        # The authenticated agent speaks first: greeting + a fresh nonce. The
+        # old unauthenticated agent said nothing until it got a packet -- never
+        # hand it one; it runs until the console reboots.
+        sock.settimeout(3)
+        hello = b""
+        try:
+            while len(hello) < len(AGENT_GREETING) + 32:
+                chunk = sock.recv(len(AGENT_GREETING) + 32 - len(hello))
+                if not chunk:
+                    break
+                hello += chunk
+        except socket.timeout:
+            pass
+        if not hello.startswith(AGENT_GREETING) or len(hello) != len(AGENT_GREETING) + 32:
+            raise AgentRefused(
+                "an old, unauthenticated deploy agent is running on the PS4 (it accepts installs from "
+                "anyone on the LAN). Reboot the console to clear it, then deploy again.")
+        if secret is None:
+            raise AgentRefused(
+                f"a deploy agent is running but {SECRET_FILE.name} is missing (it was bootstrapped from "
+                "another checkout). Copy that file here, or reboot the console to start a fresh agent.")
+        sock.sendall(agent_request(secret, hello[len(AGENT_GREETING):], packet))
         sock.settimeout(status_timeout)
         chunks: list[bytes] = []
         while sum(len(chunk) for chunk in chunks) < 8192:
@@ -338,7 +433,12 @@ def send_agent_command(
             chunks.append(data)
         if not chunks:
             raise ConnectionError("resident agent closed without install status")
-        return b"".join(chunks).decode("utf-8", "replace").strip()
+        status = b"".join(chunks).decode("utf-8", "replace").strip()
+        if status.startswith("ERROR auth"):
+            raise AgentRefused(
+                f"the resident agent rejected {SECRET_FILE.name} (it was bootstrapped with another "
+                "secret). Reboot the console to start a fresh agent.")
+        return status
 
 
 def post_payload(ps4_ip: str, payload: bytes) -> tuple[bool, int | None, bytes]:
@@ -406,7 +506,21 @@ def main() -> int:
                     help="skip the pre-bootstrap app-close (not recommended)")
     ap.add_argument("--rearm-wait", type=int, default=180,
                     help="seconds to wait for a console-side GoldHEN rearm")
+    ap.add_argument("--stop-agent", action="store_true",
+                    help="tell the resident deploy agent to exit (frees :9192) and quit")
     args = ap.parse_args()
+
+    secret = load_secret()
+    if args.stop_agent:
+        try:
+            print(send_agent_command(args.ps4, args.agent_port, struct.pack("<I", 0), 2.0, 10, secret))
+            return 0
+        except AgentUnavailable:
+            print("no deploy agent is listening")
+            return 0
+        except (AgentRefused, ConnectionError, OSError) as exc:
+            print(f"could not stop the agent: {exc}", file=sys.stderr)
+            return 1
 
     host_ip = args.host or find_host_ip()
     ver = current_version()
@@ -436,18 +550,20 @@ def main() -> int:
     try:
         try:
             install_status = send_agent_command(
-                args.ps4, args.agent_port, packet, 0.5, args.ready_timeout
+                args.ps4, args.agent_port, packet, 0.5, args.ready_timeout, secret
             )
             print("agent: reused resident deployment service")
         except AgentUnavailable:
+            # Nothing resident: this bootstrap starts a fresh agent, so it gets
+            # a fresh secret (an old one may have leaked with an old checkout).
+            secret = new_secret()
+            payload = patch_payload(args.payload.read_bytes(), secret)
             if not args.no_close:
                 print("agent: not resident; closing the running app before bootstrap")
                 close_running_app(args.ps4)
             else:
                 print("agent: not resident; --no-close set, skipping app-close pre-flight")
-            posted = post_payload_when_ready(
-                args.ps4, args.payload.read_bytes(), args.rearm_wait
-            )
+            posted = post_payload_when_ready(args.ps4, payload, args.rearm_wait)
             if posted is None:
                 print("GoldHEN :9090 never came up; aborting without burning anything.", file=sys.stderr)
                 return 1
@@ -456,7 +572,7 @@ def main() -> int:
             if status is not None:
                 print(f"payload POST -> HTTP {status} {body[:120]!r}")
             install_status = send_agent_command(
-                args.ps4, args.agent_port, packet, 20.0, args.ready_timeout
+                args.ps4, args.agent_port, packet, 20.0, args.ready_timeout, secret
             )
             print("agent: resident deployment service bootstrapped")
 
@@ -486,6 +602,9 @@ def main() -> int:
         print(f"install ready: {install_status}")
         print("install request delivered and verified ready")
         return 0
+    except AgentRefused as exc:
+        print(f"deploy agent: {exc}", file=sys.stderr)
+        return 1
     except (AgentUnavailable, ConnectionError, TimeoutError, OSError) as exc:
         print(f"resident agent unavailable: {exc}", file=sys.stderr)
         print(

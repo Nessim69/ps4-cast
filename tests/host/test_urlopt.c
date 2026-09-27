@@ -35,6 +35,22 @@ int main(void) {
     urlopt_set_page_headers_enabled(1);
     CHECK(strstr(urlopt_headers(), "Referer: https://page.example/") != NULL);
 
+    // Cookie scope: kept for the origin host and its parent domain, dropped for
+    // an unrelated host (redirect target / segment CDN); other headers stay.
+    urlopt_apply("https://www.site.example/live.m3u8|Cookie=sid%3D42&User-Agent=UA1&Referer=https://www.site.example/", clean, sizeof clean);
+    CHECK(strstr(urlopt_headers_for("www.site.example"), "Cookie: sid=42") != NULL);
+    CHECK(strstr(urlopt_headers_for("cdn.site.example"), "Cookie: sid=42") != NULL);
+    CHECK(strstr(urlopt_headers_for("evil.example"), "Cookie:") == NULL);
+    CHECK(strstr(urlopt_headers_for("evil.example"), "User-Agent: UA1") != NULL);
+    CHECK(strstr(urlopt_headers_for("evil.example"), "Referer: https://www.site.example/") != NULL);
+    CHECK(strstr(urlopt_headers_for_url("https://evil.example:8443/seg1.ts"), "Cookie:") == NULL);
+    CHECK(strstr(urlopt_headers_for_url("https://user@cdn.site.example/seg1.ts"), "Cookie: sid=42") != NULL);
+    urlopt_set_page_headers_enabled(0);   // the clean-retry sets obey the same scope
+    CHECK(strstr(urlopt_headers_for("evil.example"), "Cookie:") == NULL);
+    CHECK(strstr(urlopt_headers_for("www.site.example"), "Cookie: sid=42") != NULL);
+    CHECK(strstr(urlopt_headers_for("www.site.example"), "Referer:") == NULL);
+    urlopt_set_page_headers_enabled(1);
+
     printf(failures ? "test_urlopt: %d FAILURES\n" : "test_urlopt: all ok\n", failures);
     return failures ? 1 : 0;
 }

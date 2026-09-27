@@ -15,6 +15,7 @@
 #include "vdec_hw.h"
 #include "trace.h"
 #include "openq.h"
+#include "tls.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -152,7 +153,7 @@ static char  g_status[160] = "idle";
 // Written only by the opener worker while it executes a request.
 static char  g_playSpec[OPENQ_SPEC_MAX];
 static char  g_errorCode[32];
-static char  g_errorMessage[192];
+static char  g_errorMessage[256];
 static char  g_sourceErrorDiag[480];
 
 static int64_t  g_pos = 0;         // byte cursor for AVIO
@@ -611,8 +612,22 @@ static int open_sw_video(const AVCodec *dec) {
 // thread could not be created): see "opener worker" below. `requestedHeadstart`
 // and `resumeSec` travel in the request instead of globals, so a stop or a newer
 // request can never hand them to the wrong stream.
+// A source that failed because its HTTPS certificate was rejected during this
+// open gets an error naming the host and cause (see tls.h), not the generic
+// "could not be reached". Returns 1 if it set the error.
+static int set_cert_error(unsigned vfGen0) {
+    char host[128]; int err = 0;
+    if (tls_verify_failure(host, sizeof(host), &err) == vfGen0) return 0;
+    char msg[256];
+    snprintf(msg, sizeof(msg), "HTTPS certificate for %.48s rejected: %s. If you trust this source, turn off "
+             "Settings > Verify HTTPS certificates.", host, tls_verify_reason(err));
+    player_set_error("certificate", msg);
+    return 1;
+}
+
 static int play_open(const char *url, int requestedHeadstart, double resumeSec) {
     g_playStage = "enter";
+    unsigned vfGen0 = tls_verify_failure(NULL, 0, NULL);
     uint64_t swt0 = sceKernelGetProcessTime();   // channel-switch stage timing (-> g_swDiag, shown in /status)
     char requested[2048];
     snprintf(requested, sizeof(requested), "%s", url ? url : "");
@@ -701,7 +716,7 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
                            : (g_isHls ? "The HLS source could not be opened. Check the link or server."
                                       : "The video source could not be reached. Check the link and try again."));
         player_teardown();
-        player_set_error("source", detail);
+        if (!set_cert_error(vfGen0)) player_set_error("source", detail);
         return -1;
     }
     if (open_cancelled()) { player_teardown(); return OPEN_RC_CANCELLED; }
@@ -766,7 +781,8 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
         // the reader's own failure detail into /status instead of failing blind.
         snprintf(g_sourceErrorDiag, sizeof(g_sourceErrorDiag), "%s",
                  g_isHls ? hls_debug() : "");
-        player_set_error("format", "This stream format could not be opened. Try software decode or another source.");
+        if (!set_cert_error(vfGen0))
+            player_set_error("format", "This stream format could not be opened. Try software decode or another source.");
         return -2;
     }
     g_playStage = "probe";

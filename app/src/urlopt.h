@@ -16,6 +16,11 @@ void urlopt_apply(const char *in, char *urlOut, int urlCap);
 
 // Extra header lines for the current stream ("" when none). Already CRLF-terminated.
 const char *urlopt_headers(void);
+// The same for a request to `host` (or to `url`'s host): the Cookie line is
+// left out unless the host is the one the options were given for or under its
+// parent domain, so a redirect or segment on an unrelated host never gets it.
+const char *urlopt_headers_for(const char *host);
+const char *urlopt_headers_for_url(const char *url);
 
 // Retry compatibility: temporarily omit Referer/Origin while retaining UA and
 // Cookie. A few CDNs reject an incorrect outer-page context but accept a clean

@@ -484,15 +484,54 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
   `scripts/dev-deploy.sh` and `scripts/redeploy.sh` reuse it for close, uninstall,
   install, and verified launch cycles; do not probe GoldHEN `:9090`, because its
   loader is one-shot and a connect-only probe consumes it.
+- Its source is in the repo: `payloads/ps4cast-dpi/agent.c` (built with
+  `make -C payloads/ps4cast-dpi`, `LLVM=/usr/bin` on Linux; `make install`
+  refreshes `scripts/dpi-payload.bin`). The earlier agent came from local,
+  uncommitted DirectPackageInstaller changes and accepted installs from anyone
+  on the LAN.
+- Every command is authenticated (HMAC-SHA256 challenge-response, protocol in
+  `payloads/ps4cast-dpi/agent_proto.h`). `scripts/push-goldhen-dpi.py` makes a
+  new 32-byte secret for each bootstrap, patches it into the payload, and keeps
+  it in the git-ignored `.ps4cast-agent-secret`; the agent refuses to run
+  unpatched. Deploying from another checkout needs that file, or a console
+  reboot to start a fresh agent. `push-goldhen-dpi.py --stop-agent` frees
+  `:9192`; the agent also leaves by itself after 8 h without a valid command.
+  If the script reports an old, unauthenticated agent, reboot the console once.
 - The first deploy after a console reboot bootstraps the resident agent through
   `:9090`. Every later deploy in that boot goes directly to `:9192`, with no
-  manual rearm. If the agent is deliberately replaced, shut it down cleanly so
-  its listener closes before loading the replacement.
-- The agent searches every documented BGFT subtype for the exact PS4 Cast
-  content ID before registering. This clears interrupted PS4 Cast tasks without
-  deleting unrelated downloads. It uses stable `sceAppInstUtilAppExists`
-  observations for readiness; `sceAppInstUtilGetInstallProgressInfo` crashes the
-  GoldHEN host process on this firmware and must not be restored.
+  manual rearm. To replace the agent, `--stop-agent` it first so its listener
+  closes before loading the replacement.
+- Each install removes the installed PS4 Cast title first
+  (`sceAppInstUtilAppUnInstall`, then waits for `AppExists` to drop). It uses
+  stable `sceAppInstUtilAppExists` observations for readiness;
+  `sceAppInstUtilGetInstallProgressInfo` crashes the GoldHEN host process on
+  this firmware and must not be restored. The lost local agent also searched
+  every BGFT subtype to clear interrupted PS4 Cast download tasks; that is not
+  reimplemented (the BGFT find/unregister signatures are unverified here), so a
+  stale task shows up as `ERROR bgft 0x80990086` with a hint to delete it from
+  Notifications > Downloads.
 - Chiaki development controls use the default map: Return=`Cross`,
   Backspace=`Circle`, arrows=`D-pad`, and Escape=`PS`. The helper
   `.devtools/ps4cast-send-key` posts those macOS keycodes to the exact Chiaki PID.
+
+## HTTPS certificate verification
+
+- BearSSL (`app/src/tls.c`) now verifies server certificates against
+  `app/src/ca_anchors.c`, generated from Mozilla's bundle (via certifi) by
+  `scripts/gen-trust-anchors.py`. Regenerate it about once a year, or when a
+  public CA is added or distrusted: `pip install cryptography certifi` then
+  `python3 scripts/gen-trust-anchors.py`. `/status` reports the bundle date as
+  `ca_date`.
+- LAN hosts (RFC 1918, link-local, loopback, single-label names and `.local`,
+  `.lan`, `.home`, `.internal`, `.home.arpa`) are not verified: home servers
+  rarely have public certificates. IPv4 literals on public addresses are
+  chain-checked without a name match.
+- The console clock is floored at the build date, so a reset clock can't make
+  every certificate look "not yet valid". An expired clock or certificate
+  surfaces as a player error naming the host and the reason.
+- Settings > "Verify HTTPS certificates" (persisted as `tlsverify=` in
+  /data/ps4cast_cfg.txt, `POST /tlsverify`) turns verification off for users
+  whose sources use self-signed certificates. The native SceHttp fallback
+  honours the same switch.
+- Stream cookies (`|Cookie=`) are only sent to the page's own host and its
+  parent domain, never to CDNs on unrelated hosts after a redirect.

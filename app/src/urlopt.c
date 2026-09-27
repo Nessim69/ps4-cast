@@ -1,11 +1,50 @@
 #include "urlopt.h"
+#include "netpolicy.h"
 #include <string.h>
 #include <stdio.h>
 
 static char g_hdrs[768];
 static char g_hdrsNoPage[768];
+// The same two sets without Cookie, for requests to a host outside the
+// cookie's scope (a redirect or segment on an unrelated host). Precomputed so
+// the fetch threads only ever read these buffers.
+static char g_hdrsNoCookie[768];
+static char g_hdrsNoPageNoCookie[768];
+static char g_origin[256];        // host of the URL the options were given for
 static char g_kind[16];
 static int g_pageHeadersEnabled = 1;
+
+// Host part of an http(s) URL (no port/userinfo), lower-cased as written.
+static void url_host(const char *url, char *out, int cap) {
+    out[0] = '\0';
+    if (!url || cap <= 0) return;
+    const char *p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    const char *at = NULL;
+    for (const char *q = p; *q && *q != '/' && *q != '?' && *q != '#'; q++) if (*q == '@') at = q;
+    if (at) p = at + 1;
+    int n = 0;
+    while (p[n] && p[n] != '/' && p[n] != ':' && p[n] != '?' && p[n] != '#') n++;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, (size_t)n);
+    out[n] = '\0';
+}
+
+// Copy header lines except Cookie.
+static void strip_cookie(const char *src, char *dst, size_t cap) {
+    size_t o = 0;
+    dst[0] = '\0';
+    for (const char *p = src; *p;) {
+        const char *eol = strstr(p, "\r\n");
+        size_t len = eol ? (size_t)(eol - p) + 2 : strlen(p);
+        if (strncmp(p, "Cookie:", 7) != 0 && o + len < cap) {
+            memcpy(dst + o, p, len);
+            o += len;
+            dst[o] = '\0';
+        }
+        p += len;
+    }
+}
 
 static int hex_value(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -59,6 +98,9 @@ static const char *canon_header(const char *k, int klen) {
 void urlopt_apply(const char *in, char *urlOut, int urlCap) {
     g_hdrs[0] = '\0';
     g_hdrsNoPage[0] = '\0';
+    g_hdrsNoCookie[0] = '\0';
+    g_hdrsNoPageNoCookie[0] = '\0';
+    g_origin[0] = '\0';
     g_kind[0] = '\0';
     g_pageHeadersEnabled = 1;
     if (!in || !urlOut || urlCap <= 0) return;
@@ -68,6 +110,7 @@ void urlopt_apply(const char *in, char *urlOut, int urlCap) {
     if (ulen >= urlCap) ulen = urlCap - 1;
     memcpy(urlOut, in, (size_t)ulen);
     urlOut[ulen] = '\0';
+    url_host(urlOut, g_origin, sizeof(g_origin));
     if (!bar) return;
 
     int used = 0, safeUsed = 0;
@@ -118,10 +161,26 @@ next_option:
             if (n > 0 && used + n < (int)sizeof(g_hdrs)) used += n;
         }
     }
+    strip_cookie(g_hdrs, g_hdrsNoCookie, sizeof(g_hdrsNoCookie));
+    strip_cookie(g_hdrsNoPage, g_hdrsNoPageNoCookie, sizeof(g_hdrsNoPageNoCookie));
 }
 
 const char *urlopt_headers(void) {
     return g_pageHeadersEnabled ? g_hdrs : g_hdrsNoPage;
+}
+
+const char *urlopt_headers_for(const char *host) {
+    // A Cookie given for one site must not follow a redirect (or a segment
+    // URL) to an unrelated host: that hands the session to whoever runs it.
+    int cookieOk = !g_origin[0] || netpol_cookie_host_ok(g_origin, host ? host : "");
+    if (g_pageHeadersEnabled) return cookieOk ? g_hdrs : g_hdrsNoCookie;
+    return cookieOk ? g_hdrsNoPage : g_hdrsNoPageNoCookie;
+}
+
+const char *urlopt_headers_for_url(const char *url) {
+    char host[256];
+    url_host(url, host, sizeof(host));
+    return urlopt_headers_for(host);
 }
 int urlopt_has_page_headers(void) {
     return strstr(g_hdrs, "Referer:") != NULL || strstr(g_hdrs, "Origin:") != NULL;

@@ -33,6 +33,7 @@ void aseg_resume_ch(int ch) { g_stubResumed = ch; }
 #include "../../app/src/urlopt.h"
 // urlopt_apply etc. come from the real module:
 #include "../../app/src/urlopt.c"
+#include "../../app/src/netpolicy.c"
 
 #include "../../app/src/resolve.c"
 

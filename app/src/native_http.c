@@ -1,4 +1,5 @@
 #include "native_http.h"
+#include "tls.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,9 +73,21 @@ static OrbisPthreadMutex g_initLock;   // load_api(): two first fetches must not
 static OrbisPthreadMutex g_reqLock;    // slot request/dropConn vs native_http_abort(); never held across I/O
 static int               g_locksUp;
 
-static int accept_certificate(int ssl, unsigned verify_error,
-                              void *const certs[], int cert_count, void *arg) {
-    (void)ssl; (void)verify_error; (void)certs; (void)cert_count; (void)arg;
+// SceSsl validates the server chain against the console's own root store and
+// reports the outcome here. This used to return 1 unconditionally, so the
+// fallback accepted ANY certificate -- and since a BearSSL verification
+// failure is exactly what sends a fetch here, it quietly undid that check.
+// Apply the same switch as tls.c: reject a failed verification unless the
+// user turned "Verify HTTPS certificates" off. (A negative return aborts the
+// handshake; the callback has no host, so LAN exemptions don't apply on this
+// path -- it only exists for public CDNs that reject BearSSL's fingerprint.)
+static int check_certificate(int ssl, unsigned verify_error,
+                             void *const certs[], int cert_count, void *arg) {
+    (void)ssl; (void)certs; (void)cert_count; (void)arg;
+    if (verify_error != 0 && tls_verify_enabled()) {
+        snprintf(g_debug, sizeof(g_debug), "native tls verify failed %#x", verify_error);
+        return -1;
+    }
     return 1;
 }
 
@@ -148,7 +161,7 @@ static int load_api(void) {
     if (g_http < 0) goto init_failed;
     g_template = pCreateTemplate(g_http, "PS4Cast/1.0", 2, 1);
     if (g_template < 0) goto init_failed;
-    pSetSslCallback(g_template, (void *)accept_certificate, NULL);
+    pSetSslCallback(g_template, (void *)check_certificate, NULL);
     g_state = 1;
     snprintf(g_debug, sizeof(g_debug), "native http ready");
     return 0;

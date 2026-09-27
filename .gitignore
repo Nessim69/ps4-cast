@@ -48,3 +48,4 @@ tests/host/*.dSYM
 # per-install pairing token, saved by scripts so they don't have to hit
 # GET /token (only answered during the TV-opened pairing window) every time
 .ps4cast-token
+.ps4cast-agent-secret

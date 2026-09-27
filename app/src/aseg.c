@@ -136,7 +136,9 @@ static void conn_close(AsegCh *c) {
 }
 
 // Stream channels only: what the player's request context says to send.
-static const char *opt_headers(AsegCh *c) { return c->stream ? urlopt_headers() : ""; }
+// Stream option headers for a request to `host` (Cookie only within the
+// origin's scope -- see urlopt_headers_for); the UI channel sends none.
+static const char *opt_headers(AsegCh *c, const char *host) { return c->stream ? urlopt_headers_for(host) : ""; }
 
 static void diag_clear(AsegCh *c) {
     c->d.lastStatus = -1; c->d.lastLine[0] = '\0';
@@ -403,7 +405,7 @@ static void native_pin(const char *host) {   // NULL = unpin
 // SceHttp retry on this channel's own native slot: aseg_abort() reaches it,
 // and the channel's header policy applies (UI: none).
 static int native_fetch(AsegCh *c, const char *url, uint8_t **outBuf, int *outLen, int *status) {
-    return native_http_fetch((int)(c - g_ch), url, opt_headers(c), outBuf, outLen, status,
+    return native_http_fetch((int)(c - g_ch), url, c->stream ? urlopt_headers_for_url(url) : "", outBuf, outLen, status,
                              c->budgetUs, c->truncate ? c->maxBytes : 0, &c->abort);
 }
 
@@ -428,7 +430,7 @@ static int do_request(AsegCh *c, int reuse, int *status, char *loc, int loccap,
     char req[1600];
     // ASEG_CH_UI is not part of the stream: never send the stream's Referer/
     // Cookie/UA to an unrelated list host -- the default User-Agent only.
-    const char *xh = opt_headers(c);
+    const char *xh = opt_headers(c, c->host);
     int n = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"

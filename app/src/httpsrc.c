@@ -349,7 +349,7 @@ static int request_from_ex(uint64_t pos, int *status, int64_t *total, char *loc,
     // Do not send Range on the initial byte-0 open. Some HTTPS CDNs accept the
     // 206 header then deliver zero body bytes on a first ranged request; a plain
     // GET is the most compatible start. Real seeks still send Range below.
-    const char *xh = urlopt_headers();
+    const char *xh = urlopt_headers_for(g_host);   // Cookie only within the origin's scope
     const char *ua = strstr(xh, "User-Agent:") ? "" : "User-Agent: PS4Cast/1.0\r\n";
     int n;
     if (pos == 0) {

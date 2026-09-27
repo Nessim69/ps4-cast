@@ -1,6 +1,7 @@
 #include "httpd.h"
 #include "httpd_channels.h"
 #include "aseg.h"
+#include "tls.h"
 #include "web_ui.h"
 #include "player.h"
 #include "goldhen.h"
@@ -260,11 +261,11 @@ static int token_exempt(const char *path) {
 static void cfg_save(void) {
     int fd = sceKernelOpen(CFG_PATH, 0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
     if (fd < 0) return;
-    char line[64];
+    char line[96];
     // avsync is user-tuned for their TV/soundbar; losing it on every relaunch
     // (while channels/recent/resume persisted) was an inconsistency.
-    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\npair=%d\n",
-                     notify_get_debug(), player_get_avsync(), g_cfgPair);
+    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\npair=%d\ntlsverify=%d\n",
+                     notify_get_debug(), player_get_avsync(), g_cfgPair, tls_verify_enabled());
     sceKernelWrite(fd, line, n);
     sceKernelClose(fd);
 }
@@ -282,6 +283,8 @@ static void cfg_load(void) {
     if (a) player_set_avsync(atoi(a + 7));
     const char *p = strstr(buf, "pair=");
     if (p) g_cfgPair = atoi(p + 5) ? 1 : 0;
+    const char *tv = strstr(buf, "tlsverify=");   // absent (older config) = on
+    if (tv) tls_set_verify(atoi(tv + 10) ? 1 : 0);
 }
 
 // ---- resume positions: remember where each VOD was stopped, resume on replay.
@@ -1692,6 +1695,8 @@ static void handle_client(OrbisNetId c) {
         // pipeline and SSDP-adjacent tooling poll it), so it must never leak
         // the secret that gates every mutation. Fetch the token itself from
         // GET /token instead (gated the same way, plus a TV-opened window).
+        JAPP(",\"tls_verify\":%d,\"ca_date\":", tls_verify_enabled());
+        json_str(json, cap, &o, tls_ca_bundle_date(), 16);
         JAPP(",\"hw_enabled\":%d,\"debug\":%d,\"pair\":%d,\"pair_window\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"chan_ver\":%d,\"lists_ver\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":",
              player_hw_enabled(), notify_get_debug(), g_cfgPair, httpd_pairing_window_left(),
              httpd_chan_count(), httpd_chan_current(), httpd_channels_version(), g_lists_ver,
@@ -1699,7 +1704,7 @@ static void handle_client(OrbisNetId c) {
         json_str(json, cap, &o, sys_diag_get(), 159);
         JAPP(",\"fps\":%d,\"avsync\":%d,\"error_code\":", sys_get_fps(), player_get_avsync());
         json_str(json, cap, &o, player_error_code(), 31);
-        JAPP(",\"error_message\":"); json_str(json, cap, &o, player_error_message(), 191);
+        JAPP(",\"error_message\":"); json_str(json, cap, &o, player_error_message(), 255);
         JAPP("}");
 #undef JAPP
         json[o] = '\0';
@@ -1745,6 +1750,16 @@ static void handle_client(OrbisNetId c) {
         notify_set_debug(on);
         cfg_save();
         send_response(c, "200 OK", "text/plain", on ? "debug on" : "debug off", on ? 8 : 9);
+        return;
+    }
+
+    // Settings toggle: validate HTTPS certificates (public hosts; LAN hosts are
+    // always exempt). POST /tlsverify body "0"/"1"; applies to new connections.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/tlsverify") == 0) {
+        int on = (body[0] != '0');
+        tls_set_verify(on);
+        cfg_save();
+        send_response(c, "200 OK", "text/plain", on ? "verify on" : "verify off", on ? 9 : 10);
         return;
     }
 

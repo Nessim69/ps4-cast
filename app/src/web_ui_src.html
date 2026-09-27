@@ -355,6 +355,10 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
   <div class="sw" id="swDbg" onclick="toggleDbg()"></div>
  </div>
  <div class="set">
+  <div class="txt"><div class="a">Verify HTTPS certificates</div><div class="b" id="tlsText">Check that HTTPS sources are who they claim to be. Local-network servers are always allowed. Turn off only for a source you trust whose certificate the PS4 rejects.</div></div>
+  <div class="sw" id="swTls" onclick="toggleTls()"></div>
+ </div>
+ <div class="set">
   <div class="txt"><div class="a">Pairing required</div><div class="b">Reject cast and settings commands without the token shown on the TV. DLNA stays available either way.</div></div>
   <div class="sw" id="swPair" onclick="togglePair()"></div>
  </div>
@@ -766,6 +770,10 @@ $('gear').onclick=openSheet;
 function setSw(id,on){$(id).classList.toggle('on',!!on)}
 async function toggleHw(){hw=hw?0:1;setSw('swHw',hw);await post('/hwdecode',''+hw);msg(hw?'Hardware decode on':'Software decode')}
 async function toggleDbg(){dbg=dbg?0:1;setSw('swDbg',dbg);await post('/debug',''+dbg);msg(dbg?'Debug toasts on':'Debug toasts off')}
+var tlsv=1;
+async function toggleTls(){
+ if(tlsv&&!confirm('Stop verifying HTTPS certificates?\n\nAnyone able to intercept your network traffic could then swap the video or read cookies sent with it. Only do this for a source you trust.'))return;
+ tlsv=tlsv?0:1;setSw('swTls',tlsv);await post('/tlsverify',''+tlsv);msg(tlsv?'Certificate checks on':'Certificate checks off')}
 async function exitApp(){if(confirm('Close PS4 Cast on the console?')){closeSheet();busy(false);msg('Closing app…');await post('/quit')}}
 
 /* seek visuals */
@@ -789,6 +797,7 @@ async function poll(){if(document.hidden||uploading)return;var j=await getj('/st
  if(j.status){msg(j.status);busy(/buffer|cast|connect|seek|open|load/i.test(j.status)&&!on)}
  if(j.hw_enabled!=null){hw=j.hw_enabled;setSw('swHw',hw)}
  if(j.debug!=null){dbg=j.debug;setSw('swDbg',dbg)}
+ if(j.tls_verify!=null){tlsv=j.tls_verify;setSw('swTls',tlsv)}
  if(j.pair!=null){pair=j.pair;setSw('swPair',pair)}
  if(!authLost&&document.getElementById('tokVal')&&document.getElementById('tokVal').textContent==='—')showToken()
  if(j.chan_cur!=null&&j.chan_cur!=chanCur){chanCur=j.chan_cur;if(plData.length)renderPane('pl')}

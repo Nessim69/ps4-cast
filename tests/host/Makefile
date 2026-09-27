@@ -6,15 +6,15 @@ CFLAGS = -Wall -Wextra -Wno-unused-parameter -g -O1 -std=gnu11
 
 SRC = ../../app/src
 
-TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token
+TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_agent_crypto
 
 all: $(TESTS)
 
 test_hls_parse: test_hls_parse.c $(SRC)/hls_parse.c
 	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_hls_parse.c $(SRC)/hls_parse.c
 
-test_urlopt: test_urlopt.c $(SRC)/urlopt.c
-	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_urlopt.c $(SRC)/urlopt.c
+test_urlopt: test_urlopt.c $(SRC)/urlopt.c $(SRC)/netpolicy.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_urlopt.c $(SRC)/urlopt.c $(SRC)/netpolicy.c
 
 # resolve.c's interesting half is static; include it directly.
 test_resolve: test_resolve.c
@@ -26,6 +26,15 @@ test_qr: test_qr.c $(SRC)/qr.c $(SRC)/qrcodegen.c
 # Opener worker's latest-wins request slot (app/src/openq.c).
 test_openq: test_openq.c $(SRC)/openq.c
 	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_openq.c $(SRC)/openq.c
+
+# Private-host detection, cookie scope, build-date parsing (app/src/netpolicy.c).
+test_netpolicy: test_netpolicy.c $(SRC)/netpolicy.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_netpolicy.c $(SRC)/netpolicy.c
+
+# Deploy agent's SHA-256/HMAC and wire parser (payloads/ps4cast-dpi).
+AGENT = ../../payloads/ps4cast-dpi
+test_agent_crypto: test_agent_crypto.c $(AGENT)/sha256.c $(AGENT)/agent_proto.c
+	$(CC) $(CFLAGS) -I$(AGENT) -o $@ test_agent_crypto.c $(AGENT)/sha256.c $(AGENT)/agent_proto.c
 
 # Pairing token alphabet/validator/derivation (app/src/pairing.c).
 test_token: test_token.c $(SRC)/pairing.c
