@@ -71,6 +71,12 @@ static char g_recent[MAX_RECENT][URL_MAX]; static int g_recentN = 0;
 static char g_queue[MAX_QUEUE][URL_MAX];   static int g_queueHead = 0, g_queueN = 0;
 static char g_fav[MAX_FAV][URL_MAX];       static int g_favN = 0;
 
+// Bumped (under g_mtx) whenever recents, favorites, the queue, resume
+// positions, or the uploaded file change, so /status can report it
+// (lists_ver) and the phone UI can skip re-polling those lists when nothing
+// moved instead of re-fetching them every tick.
+static int g_lists_ver = 0;
+
 // The channel list itself lives in httpd_channels.c.
 // The most recently cast URL (HUD title); declared here so the channel-store
 // helpers above the request handlers can update it.
@@ -85,6 +91,7 @@ static void recent_add(const char *url) {     // most-recent-first, deduped
         int top = existing >= 0 ? existing : (g_recentN < MAX_RECENT ? g_recentN++ : MAX_RECENT - 1);
         for (int i = top; i > 0; i--) strncpy(g_recent[i], g_recent[i-1], URL_MAX - 1);
         strncpy(g_recent[0], url, URL_MAX - 1); g_recent[0][URL_MAX-1] = '\0';
+        g_lists_ver++;
     }
     scePthreadMutexUnlock(&g_mtx);
 }
@@ -94,6 +101,7 @@ static void queue_push(const char *url) {
         strncpy(g_queue[(g_queueHead + g_queueN) % MAX_QUEUE], url, URL_MAX - 1);
         g_queue[(g_queueHead + g_queueN) % MAX_QUEUE][URL_MAX-1] = '\0';
         g_queueN++;
+        g_lists_ver++;
     }
     scePthreadMutexUnlock(&g_mtx);
 }
@@ -338,6 +346,7 @@ void httpd_resume_save(const char *url, int pos, int dur) {
         g_resPos[0] = pos; g_resDur[0] = dur;
     }
     resume_save_file();
+    g_lists_ver++;
     scePthreadMutexUnlock(&g_mtx);
 }
 // Saved resume position for a URL in seconds, or 0 if none.
@@ -363,6 +372,7 @@ static void fav_toggle(const char *url) {
     if (idx >= 0) { for (int i = idx; i < g_favN - 1; i++) strncpy(g_fav[i], g_fav[i+1], URL_MAX - 1); g_favN--; }
     else if (g_favN < MAX_FAV) { strncpy(g_fav[g_favN], url, URL_MAX - 1); g_fav[g_favN][URL_MAX-1]='\0'; g_favN++; }
     favs_save();
+    g_lists_ver++;
     scePthreadMutexUnlock(&g_mtx);
 }
 
@@ -774,6 +784,7 @@ static void set_pending_local_file(const char *displayName) {
     strncpy(g_last_push, displayName, sizeof(g_last_push) - 1);
     g_last_push[sizeof(g_last_push) - 1] = '\0';
     httpd_channels_tune(-1, NULL, 0);   // nothing tuned after a manual cast
+    g_lists_ver++;                      // the uploaded file (name/existence) changed
     scePthreadMutexUnlock(&g_mtx);
     g_avt_event_dirty = 1;
     player_interrupt();
@@ -1434,6 +1445,7 @@ static void handle_client(OrbisNetId c) {
         }
         if (activeLocal) g_stop_pending = 1;
         if (activeLocal || pendingLocal) g_last_push[0] = '\0';
+        g_lists_ver++;   // the uploaded file is going away
         scePthreadMutexUnlock(&g_mtx);
         if (activeLocal) player_interrupt();
         sceKernelUnlink(PLAYER_LOCAL_UPLOAD_PATH);
@@ -1477,9 +1489,13 @@ static void handle_client(OrbisNetId c) {
         json_str(json, cap, &o, g_last_push, 1023);
         JAPP(",\"diag\":"); json_str(json, cap, &o, dbg, 511);
         JAPP(",\"pad\":"); json_str(json, cap, &o, pad_diag_get(), 159);
-        JAPP(",\"hw_enabled\":%d,\"debug\":%d,\"pair\":%d,\"token\":\"%s\",\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":",
-             player_hw_enabled(), notify_get_debug(), g_cfgPair, g_token,
-             httpd_chan_count(), httpd_chan_current(),
+        // No "token" field here: /status is deliberately auth-exempt (the dev
+        // pipeline and SSDP-adjacent tooling poll it), so it must never leak
+        // the secret that gates every mutation. Fetch the token itself from
+        // GET /token instead (gated the same way, plus a TV-opened window).
+        JAPP(",\"hw_enabled\":%d,\"debug\":%d,\"pair\":%d,\"pair_window\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"chan_ver\":%d,\"lists_ver\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":",
+             player_hw_enabled(), notify_get_debug(), g_cfgPair, httpd_pairing_window_left(),
+             httpd_chan_count(), httpd_chan_current(), httpd_channels_version(), g_lists_ver,
              player_buffer_pct(), (unsigned long long)player_rx_total());
         json_str(json, cap, &o, sys_diag_get(), 159);
         JAPP(",\"fps\":%d,\"avsync\":%d,\"error_code\":", sys_get_fps(), player_get_avsync());
@@ -1923,6 +1939,7 @@ static void handle_client(OrbisNetId c) {
         if (!u[0]) g_resN = 0;
         else for (int i = 0; i < g_resN; i++) if (strcmp(g_resUrl[i], u) == 0) { res_remove(i); break; }
         resume_save_file();
+        g_lists_ver++;
         scePthreadMutexUnlock(&g_mtx);
         send_response(c, "200 OK", "text/plain", "ok", 2); return;
     }
@@ -1936,6 +1953,7 @@ static void handle_client(OrbisNetId c) {
             for (int k = i; k < g_recentN - 1; k++) strncpy(g_recent[k], g_recent[k+1], URL_MAX - 1);
             g_recentN--; break;
         }
+        g_lists_ver++;
         scePthreadMutexUnlock(&g_mtx);
         send_response(c, "200 OK", "text/plain", "ok", 2); return;
     }
