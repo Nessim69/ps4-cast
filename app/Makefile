@@ -25,7 +25,11 @@ LIBS        += -L$(FFMPEG)/lib --start-group \
                -lavformat -lavcodec -lswscale -lswresample -lavutil \
                --end-group -lm
 
-ASSETS      := $(shell find assets -type f 2>/dev/null)
+# app/assets is host-side test media: scripts/test-local-video.sh,
+# dlna-server.py and minidlna-ps4cast.conf serve it to the console over the
+# network. Nothing in the app opens /app0/assets, so none of it (~3 MB) is
+# packed into the PKG. List a file here if the app ever needs one on disk.
+ASSETS      :=
 LIBMODULES  := $(wildcard sce_module/*)
 
 # Conservative profile that is known to boot on this console. Privileged
