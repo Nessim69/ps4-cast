@@ -110,6 +110,8 @@ static int               g_sepAudioMode = 0;
 
 static uint8_t *g_scaled;          // BGRA scaled output, display-fit (software path)
 static int      g_scaledW, g_scaledH;
+static AVBufferRef *g_scaledBuf;   // owns g_scaled: sws_scale_frame needs a refcounted dst
+static AVFrame *g_swsIn, *g_swsOut; // reusable frame headers for sws_scale_frame
 static uint64_t g_scaledTag;       // names g_scaled's picture for gfx_video (0 = none)
 static uint64_t g_videoTagSeq;     // video tags are never reused
 static int      g_srcW, g_srcH;
@@ -399,8 +401,8 @@ void player_stop(void) {
     if (g_lastShown) av_frame_free(&g_lastShown);
     g_nvFrame = NULL;                    // it was g_lastShown
     av_buffer_pool_uninit(&g_nv12Pool);  // decode thread joined; buffers still referenced outlive it
-    if (g_scaled){ free(g_scaled); g_scaled = NULL; }
-    g_scaledTag = 0;
+    av_buffer_unref(&g_scaledBuf); g_scaled = NULL; g_scaledTag = 0;
+    av_frame_free(&g_swsIn); av_frame_free(&g_swsOut);
     if (g_isLocal) {
         if (g_localFd >= 0) sceKernelClose(g_localFd);
     } else if (g_isHls) {
@@ -1148,7 +1150,9 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
     if (scaledH > dh) { scaledH = dh; scaledW = (int)((int64_t)dh * sw / sh); }
     if (scaledW < 1) scaledW = 1; if (scaledH < 1) scaledH = 1;
 
-    enum AVPixelFormat srcFmt = g_useHw ? AV_PIX_FMT_NV12 : g_vdec->pix_fmt;
+    // The frame's own format, not the decoder's: after a HW->SW failover the
+    // queue still holds NV12 frames, which g_vdec->pix_fmt would misdescribe.
+    enum AVPixelFormat srcFmt = (enum AVPixelFormat)fr->format;
     // Bob-deinterlace: for an interlaced source (1080i broadcast, forced to
     // software decode) feed sws ONE field — half the lines via doubled strides —
     // and let it scale that field up to full height. Removes combing on motion;
@@ -1158,9 +1162,11 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
 
     g_scaledTag = 0;                   // g_scaled changes below: no surface shows it yet
     if (scaledW != g_scaledW || scaledH != g_scaledH || !g_scaled) {
-        free(g_scaled);
-        g_scaled = malloc((size_t)scaledW * scaledH * 4);
-        if (!g_scaled) return -1;
+        av_buffer_unref(&g_scaledBuf);
+        g_scaled = NULL;
+        g_scaledBuf = av_buffer_alloc((size_t)scaledW * scaledH * 4);
+        if (!g_scaledBuf) return -1;
+        g_scaled = g_scaledBuf->data;
         g_scaledW = scaledW; g_scaledH = scaledH;
         if (g_sws) { sws_freeContext(g_sws); g_sws = NULL; }
     }
@@ -1173,21 +1179,44 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
         // FAST_BILINEAR: the software present (HLS path) was dropping frames because
         // the single-threaded 720p->1080p upscale couldn't sustain 30fps. Fast
         // bilinear is materially cheaper at near-identical quality for upscales.
-        g_sws = sws_getContext(sw, srcH, srcFmt,
-                               scaledW, scaledH, AV_PIX_FMT_BGRA,
-                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
+        // Slice threads (FFmpeg 6.1 "threads" option): 3 workers plus this thread
+        // each scale a band of output rows, horizontally scaling only the source
+        // rows that band needs. Only sws_scale_frame uses them; legacy sws_scale
+        // runs slice_ctx[0] alone. 4 leaves the 6 usable cores to the decoder.
+        g_sws = sws_alloc_context();
         if (!g_sws) return -1;
+        if (av_opt_set_int(g_sws, "srcw", sw, 0) < 0 || av_opt_set_int(g_sws, "srch", srcH, 0) < 0 ||
+            av_opt_set_int(g_sws, "src_format", srcFmt, 0) < 0 ||
+            av_opt_set_int(g_sws, "dstw", scaledW, 0) < 0 || av_opt_set_int(g_sws, "dsth", scaledH, 0) < 0 ||
+            av_opt_set_int(g_sws, "dst_format", AV_PIX_FMT_BGRA, 0) < 0 ||
+            av_opt_set_int(g_sws, "sws_flags", SWS_FAST_BILINEAR, 0) < 0 ||
+            av_opt_set_int(g_sws, "threads", 4, 0) < 0 ||
+            sws_init_context(g_sws, NULL, NULL) < 0) {
+            sws_freeContext(g_sws); g_sws = NULL;
+            return -1;
+        }
         g_swsSrcW = sw; g_swsSrcH = srcH; g_swsSrcFmt = (int)srcFmt;
     }
-    uint8_t *dst[4] = { g_scaled, NULL, NULL, NULL };
-    int dstStride[4] = { g_scaledW * 4, 0, 0, 0 };
+    if (!g_swsIn && !(g_swsIn = av_frame_alloc())) return -1;
+    if (!g_swsOut && !(g_swsOut = av_frame_alloc())) return -1;
+    // Source: a new reference to the frame (no copy); the bob field is the same
+    // buffers read with doubled strides and half the height.
+    if (av_frame_ref(g_swsIn, fr) < 0) return -1;
     if (di) {
-        const uint8_t *src[4] = { fr->data[0], fr->data[1], fr->data[2], fr->data[3] };
-        int srcStr[4] = { fr->linesize[0] * 2, fr->linesize[1] * 2, fr->linesize[2] * 2, fr->linesize[3] * 2 };
-        sws_scale(g_sws, src, srcStr, 0, srcH, dst, dstStride);
-    } else {
-        sws_scale(g_sws, (const uint8_t * const *)fr->data, fr->linesize, 0, sh, dst, dstStride);
+        for (int i = 0; i < 4; i++) g_swsIn->linesize[i] *= 2;
+        g_swsIn->height = srcH;
     }
+    // Destination: g_scaled itself, so sws_scale_frame allocates nothing.
+    g_swsOut->buf[0] = av_buffer_ref(g_scaledBuf);
+    if (!g_swsOut->buf[0]) { av_frame_unref(g_swsIn); return -1; }
+    g_swsOut->data[0] = g_scaled;
+    g_swsOut->linesize[0] = g_scaledW * 4;
+    g_swsOut->width = g_scaledW; g_swsOut->height = g_scaledH;
+    g_swsOut->format = AV_PIX_FMT_BGRA;
+    int rc = sws_scale_frame(g_sws, g_swsOut, g_swsIn);
+    av_frame_unref(g_swsIn);
+    av_frame_unref(g_swsOut);
+    if (rc < 0) return -1;
     g_scaledTag = GFX_TAG_VIDEO | ++g_videoTagSeq;
     return 0;
 }
