@@ -10,6 +10,10 @@ function bytes(value) {
   return `${Math.round(value / 1024)} KB`;
 }
 
+const PAIRING_HINT = "Not paired yet. On the PS4, open Cast's home screen and press " +
+  "Square (opens a 2-minute pairing window), then press Test again -- or " +
+  "paste the TV's full address, including ?t=..., above.";
+
 function setNotice(message, kind = "") {
   notice.hidden = !message;
   notice.textContent = message || "";
@@ -87,8 +91,10 @@ $("test").addEventListener("click", async () => {
   setNotice(""); connection("Checking…");
   if (!await save()) { connection("Invalid address", "error"); return; }
   const result = await chrome.runtime.sendMessage({ type: "PING", receiver: receiver.value });
-  if (result?.ok) connection(`PS4 Cast ${result.version}${result.paired ? " · paired" : " · not paired"}`, "online");
-  else { connection("Offline", "error"); setNotice(result?.error || "Receiver did not answer", "error"); }
+  if (result?.ok) {
+    connection(`PS4 Cast ${result.version}${result.paired ? " · paired" : " · not paired"}`, "online");
+    if (!result.paired) setNotice(PAIRING_HINT);
+  } else { connection("Offline", "error"); setNotice(result?.error || "Receiver did not answer", "error"); }
 });
 receiver.addEventListener("change", save);
 receiver.addEventListener("keydown", (event) => { if (event.key === "Enter") $("test").click(); });

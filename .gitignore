@@ -42,5 +42,9 @@ tests/host/test_hls_parse
 tests/host/test_urlopt
 tests/host/test_resolve
 tests/host/test_qr
+tests/host/test_token
 tests/host/*.dSYM
 .impeccable.md
+# per-install pairing token, saved by scripts so they don't have to hit
+# GET /token (only answered during the TV-opened pairing window) every time
+.ps4cast-token

@@ -36,13 +36,19 @@ Things the autonomous loop can't decide or do alone. Revisit these together.
   `c15f06c3933e60be80be9e7b449696aec9e341bceaf7ec459fb8ea76922cce95` (15M).
 
 - **Pairing token**: the receiver now generates a per-install token (persisted
-  in /data, shown on the TV in the lobby URL and QR). Every state-changing HTTP
-  endpoint requires it (`?t=` or `X-PS4Cast-Token`); DLNA/UPnP and read-only
-  /status, /trace, /crashlog, /token stay open so SSDP clients and the dev
-  pipeline keep working. /status exposes the token so local tooling can
-  self-provision (scripts/ps4-api.sh). Web UI Settings gains a "Pairing
-  required" toggle; the Chrome extension accepts the full TV URL and sends the
-  token on cast handoff.
+  in /data, shown on the TV in the lobby URL and QR), derived from several
+  jittered TSC samples whitened through splitmix64 (pairing.c) rather than a
+  raw clock stir, and validated on load so a token from an older, buggier
+  generator can't silently lock the owner out. Every state-changing HTTP
+  endpoint requires it (`?t=` or `X-PS4Cast-Token`), now including `/upload`;
+  DLNA/UPnP and read-only /status, /trace, /crashlog stay open so SSDP clients
+  and the dev pipeline keep working. GET /token itself now requires the token
+  too, except during a short TV-opened pairing window (press Square on the
+  Cast home screen); /status no longer exposes the token (scripts resolve one
+  via `$PS4CAST_TOKEN`, a gitignored `.ps4cast-token` file, or GET /token --
+  see scripts/ps4-api.sh). Web UI Settings gains a "Pairing required" toggle;
+  the Chrome extension accepts the full TV URL and sends the token on cast
+  handoff, or fetches one itself during the pairing window.
 - **Fake-live seek**: live-FLAGGED playlists (movie CDNs that omit
   EXT-X-ENDLIST) were unseekable because hls_can_seek refused and the fallback
   av_seek_frame can never work on the concatenated stream. Seeks now reposition

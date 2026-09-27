@@ -110,10 +110,17 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
   }
 });
 
-// The receiver requires a pairing token on every mutating request. GET /token is
-// deliberately exempt from that check, so the extension can fetch it itself over
-// the LAN instead of making you read an 8-character code off the TV and retype it.
+// The receiver requires a pairing token on every mutating request, including
+// GET /token itself now -- except for a short window the TV opens (press
+// Square on PS4 Cast's Cast home screen), during which GET /token answers
+// without one. That's the only time fetchToken() below can succeed on a
+// receiver we don't already hold a token for; outside the window it 401s and
+// the caller has to fall back to a pasted TV URL (?t=...) or ask the user to
+// open the window.
 const TOKEN_RE = /^[A-Z2-9]{8}$/;
+const PAIRING_HINT = "On the PS4, open Cast's home screen and press Square " +
+  "(opens a 2-minute pairing window), then retry -- or paste the TV's full " +
+  "address, including ?t=..., into the receiver field.";
 
 async function fetchToken(receiver) {
   const controller = new AbortController();
@@ -175,7 +182,7 @@ async function castCandidate(candidate, frame) {
     if (!response.ok) {
       if (response.status === 404) throw new Error("Install the PS4 Cast build that includes extension support");
       if (response.status === 401 || response.status === 403)
-        throw new Error("PS4 Cast refused the pairing token. Open the app on the console and try again.");
+        throw new Error(`PS4 Cast refused the pairing token. ${PAIRING_HINT}`);
       throw new Error(`PS4 rejected the cast (${response.status})`);
     }
     return { ok: true, message: `Sent ${candidate.kind.toUpperCase()} from ${displayHost(candidate.url)}` };
