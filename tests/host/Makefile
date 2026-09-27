@@ -34,3 +34,9 @@ clean:
 	rm -f $(TESTS)
 
 .PHONY: all test clean
+
+# Opener worker's latest-wins request slot (app/src/openq.c): pure, links directly.
+TESTS += test_openq
+all: test_openq
+test_openq: test_openq.c $(SRC)/openq.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_openq.c $(SRC)/openq.c
