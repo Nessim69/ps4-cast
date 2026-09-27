@@ -483,7 +483,8 @@ function ps4CastDetector(base,returnToShortcut){
 }
 
 function helperCode(kind){
- var base=location.protocol+'//'+location.host+'/handoff#';
+ // /handoff is a UI page behind the pairing gate: carry the token, as the TV's QR does.
+ var base=location.protocol+'//'+location.host+'/handoff'+(TOKEN?'?t='+TOKEN:'')+'#';
  var src='('+ps4CastDetector.toString()+')('+JSON.stringify(base)+','+(kind==='iphone'?'true':'false')+');';
  src=src.replace(/\n\s*/g,'');
  return kind==='android'?'javascript:'+src:src;
