@@ -252,8 +252,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
     if (message.type === "SAVE_CONFIG") {
-      const { receiver, token } = parseReceiverInput(message.receiver);
+      const { receiver, token: pasted } = parseReceiverInput(message.receiver);
       if (!receiver) throw new Error("Use a private LAN address such as 192.168.1.4:8080");
+      // Keep the token this receiver is already paired with. The popup re-saves
+      // the plain host:port on every Test click, overlay toggle and address edit,
+      // and GET /token only answers during the TV's pairing window, so dropping
+      // it here unpaired the extension until Square was pressed again.
+      const saved = await receiverConfig();
+      const token = pasted || (saved.receiver === receiver ? saved.token : "");
       await chrome.storage.local.set({ receiver, token, overlay: message.overlay !== false });
       // Pair straight away so the first cast works: a pasted ?t= wins, otherwise
       // ask the receiver for its token.
@@ -270,7 +276,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const response = await fetch(`http://${receiver}/status`, { signal: controller.signal });
         if (!response.ok) throw new Error(`Receiver answered ${response.status}`);
         const status = await response.json();
-        const paired = Boolean(await ensureToken(receiver));
+        // A held token counts: outside the pairing window GET /token 401s even
+        // for a paired extension.
+        const saved = await receiverConfig();
+        const paired = Boolean(await ensureToken(receiver, saved.receiver === receiver ? saved.token : ""));
         sendResponse({ ok: true, version: status.ver || "online", paired });
       } finally { clearTimeout(timer); }
       return;
