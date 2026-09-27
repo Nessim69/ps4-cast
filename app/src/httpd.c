@@ -942,6 +942,53 @@ static int header_value(const char *req, const char *name, char *out, int cap) {
     return n > 0;
 }
 
+// Extract the UPnP action name a SOAP control request is invoking, from the
+// SOAPACTION header ("urn:...:AVTransport:1#Pause", quotes optional) or, if
+// that header is absent, from the first element inside <s:Body> (e.g.
+// "<u:Pause ...>" -> "Pause"). This replaces matching action names with
+// strstr() over the WHOLE request INCLUDING HEADERS, in program-order
+// priority: a control point whose User-Agent happened to contain "Player"
+// made "Play" match (and therefore win) for every action tested before it --
+// GetPositionInfo polls and even Pause were treated as Play. header_value is
+// already case-insensitive on the header name via ci_strstr.
+static int soap_action_name(const char *req, const char *body, char *out, int cap) {
+    char header[160];
+    if (header_value(req, "SOAPACTION:", header, sizeof(header))) {
+        const char *h = header;
+        int len = (int)strlen(h);
+        if (len >= 2 && h[0] == '"' && h[len - 1] == '"') { h++; len -= 2; }
+        const char *hash = (const char *)memchr(h, '#', (size_t)len);
+        if (hash) {
+            int n = (int)(h + len - (hash + 1));
+            if (n < 0) n = 0;
+            if (n >= cap) n = cap - 1;
+            memcpy(out, hash + 1, (size_t)n);
+            out[n] = '\0';
+            if (out[0]) return 1;
+        }
+    }
+    // No (usable) SOAPACTION header: fall back to the SOAP body's outermost
+    // element, "<prefix:ActionName ...>" or "<prefix:ActionName>". The prefix
+    // is whatever the client chose (usually "u", sometimes something else),
+    // so look for ":Body" rather than assuming "s:Body", then take the next
+    // "<...>" after it.
+    const char *b = ci_strstr(body, ":Body");
+    if (!b) return 0;
+    const char *lt = strchr(b + 1, '<');
+    if (!lt) return 0;
+    lt++;
+    const char *colon = strchr(lt, ':');
+    const char *nameStart = colon ? colon + 1 : lt;
+    int n = 0;
+    while (nameStart[n] && nameStart[n] != ' ' && nameStart[n] != '>' &&
+           nameStart[n] != '/' && nameStart[n] != '\t' && nameStart[n] != '\r' &&
+           nameStart[n] != '\n' && n < cap - 1) n++;
+    if (n <= 0) return 0;
+    memcpy(out, nameStart, (size_t)n);
+    out[n] = '\0';
+    return 1;
+}
+
 static int parse_callback(const char *value, char *host, int hostcap,
                           uint16_t *port, char *path, int pathcap) {
     const char *p = value;
@@ -1710,7 +1757,9 @@ static void handle_client(OrbisNetId c) {
     }
 
     if (strcmp(method, "POST") == 0 && strcmp(path, "/upnp/control/AVTransport") == 0) {
-        if (strstr(req, "SetAVTransportURI")) {
+        char action[64] = "";
+        soap_action_name(req, body, action, sizeof(action));
+        if (strcmp(action, "SetAVTransportURI") == 0) {
             char uri[1024];
             if (!extract_tag(body, "CurrentURI", uri, sizeof(uri)) || !uri[0]) {
                 send_soap_fault(c, 402, "Invalid Args");
@@ -1740,7 +1789,7 @@ static void handle_client(OrbisNetId c) {
             send_soap_ok(c, "SetAVTransportURI", "");
             return;
         }
-        if (strstr(req, "Play")) {
+        if (strcmp(action, "Play") == 0) {
             if (!g_dlna_uri[0]) {
                 send_soap_fault(c, 716, "Resource not found");
                 return;
@@ -1756,29 +1805,29 @@ static void handle_client(OrbisNetId c) {
             send_soap_ok(c, "Play", "");
             return;
         }
-        if (strstr(req, "Stop") || strstr(req, "Pause")) {
-            if (strstr(req, "Pause")) {
-                if (!player_started()) {
-                    send_soap_fault(c, 701, "Transition not available");
-                    return;
-                }
-                player_pause(1);
-                g_avt_event_dirty = 1;
-                trace_mark("dlna pause");
-                send_soap_ok(c, "Pause", "");
-            } else {
-                scePthreadMutexLock(&g_mtx);
-                g_stop_pending = 1;
-                scePthreadMutexUnlock(&g_mtx);
-                g_dlna_started = 0;
-                player_interrupt();
-                g_avt_event_dirty = 1;
-                trace_mark("dlna stop");
-                send_soap_ok(c, "Stop", "");
+        if (strcmp(action, "Pause") == 0) {
+            if (!player_started()) {
+                send_soap_fault(c, 701, "Transition not available");
+                return;
             }
+            player_pause(1);
+            g_avt_event_dirty = 1;
+            trace_mark("dlna pause");
+            send_soap_ok(c, "Pause", "");
             return;
         }
-        if (strstr(req, "Seek")) {
+        if (strcmp(action, "Stop") == 0) {
+            scePthreadMutexLock(&g_mtx);
+            g_stop_pending = 1;
+            scePthreadMutexUnlock(&g_mtx);
+            g_dlna_started = 0;
+            player_interrupt();
+            g_avt_event_dirty = 1;
+            trace_mark("dlna stop");
+            send_soap_ok(c, "Stop", "");
+            return;
+        }
+        if (strcmp(action, "Seek") == 0) {
             char unit[32], target[64];
             double seconds = 0, duration = 0;
             player_progress(NULL, &duration);
@@ -1805,7 +1854,7 @@ static void handle_client(OrbisNetId c) {
             send_soap_ok(c, "Seek", "");
             return;
         }
-        if (strstr(req, "GetTransportInfo")) {
+        if (strcmp(action, "GetTransportInfo") == 0) {
             const char *state = player_started() ? (player_is_paused() ? "PAUSED_PLAYBACK" : "PLAYING")
                                                  : "STOPPED";
             char inner[220];
@@ -1817,7 +1866,7 @@ static void handle_client(OrbisNetId c) {
                          inner);
             return;
         }
-        if (strstr(req, "GetPositionInfo")) {
+        if (strcmp(action, "GetPositionInfo") == 0) {
             double current = 0, duration = 0;
             char cur[32], dur[32];
             static char uri[6144], inner[6656];
@@ -1834,7 +1883,7 @@ static void handle_client(OrbisNetId c) {
             send_soap_ok(c, "GetPositionInfo", inner);
             return;
         }
-        if (strstr(req, "GetMediaInfo")) {
+        if (strcmp(action, "GetMediaInfo") == 0) {
             double duration = 0;
             char dur[32];
             static char uri[6144], inner[6656];
@@ -1851,47 +1900,58 @@ static void handle_client(OrbisNetId c) {
             send_soap_ok(c, "GetMediaInfo", inner);
             return;
         }
-        if (strstr(req, "GetCurrentTransportActions")) {
+        if (strcmp(action, "GetCurrentTransportActions") == 0) {
             send_soap_ok(c, "GetCurrentTransportActions",
                          player_can_seek() ? "<Actions>Play,Stop,Pause,Seek</Actions>"
                                            : "<Actions>Play,Stop,Pause</Actions>");
             return;
         }
+        send_soap_fault(c, 401, "Invalid Action");
+        return;
     }
 
     if (strcmp(method, "POST") == 0 && strcmp(path, "/upnp/control/RenderingControl") == 0) {
-        if (strstr(req, "GetVolume")) {
+        char action[64] = "";
+        soap_action_name(req, body, action, sizeof(action));
+        if (strcmp(action, "GetVolume") == 0) {
             const char *body_ok =
                 "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
                 "<s:Body><u:GetVolumeResponse xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">"
                 "<CurrentVolume>50</CurrentVolume></u:GetVolumeResponse></s:Body></s:Envelope>";
             send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", body_ok, (int)strlen(body_ok));
-        } else if (strstr(req, "GetMute")) {
+        } else if (strcmp(action, "GetMute") == 0) {
             const char *body_ok =
                 "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
                 "<s:Body><u:GetMuteResponse xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">"
                 "<CurrentMute>0</CurrentMute></u:GetMuteResponse></s:Body></s:Envelope>";
             send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", body_ok, (int)strlen(body_ok));
-        } else {
+        } else if (strcmp(action, "SetVolume") == 0 || strcmp(action, "SetMute") == 0) {
+            // Accepted as a silent no-op: volume/mute aren't modeled (the PS4
+            // controls its own output), but faulting a control point's normal
+            // startup handshake here would be worse than answering OK.
             const char *rc_ok = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body/></s:Envelope>";
             send_response(c, "200 OK", "text/xml; charset=\"utf-8\"",
                           rc_ok, (int)strlen(rc_ok));
+        } else {
+            send_soap_fault(c, 401, "Invalid Action");
         }
         return;
     }
 
     if (strcmp(method, "POST") == 0 && strcmp(path, "/upnp/control/ConnectionManager") == 0) {
+        char action[64] = "";
+        soap_action_name(req, body, action, sizeof(action));
         const char *resp;
-        if (strstr(req, "GetProtocolInfo")) {
+        if (strcmp(action, "GetProtocolInfo") == 0) {
             resp = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
                    "<s:Body><u:GetProtocolInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">"
                    "<Source></Source><Sink>http-get:*:video/mp4:*,http-get:*:video/x-matroska:*,http-get:*:video/*:*</Sink>"
                    "</u:GetProtocolInfoResponse></s:Body></s:Envelope>";
-        } else if (strstr(req, "GetCurrentConnectionIDs")) {
+        } else if (strcmp(action, "GetCurrentConnectionIDs") == 0) {
             resp = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
                    "<s:Body><u:GetCurrentConnectionIDsResponse xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">"
                    "<ConnectionIDs>0</ConnectionIDs></u:GetCurrentConnectionIDsResponse></s:Body></s:Envelope>";
-        } else if (strstr(req, "GetCurrentConnectionInfo")) {
+        } else if (strcmp(action, "GetCurrentConnectionInfo") == 0) {
             resp = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
                    "<s:Body><u:GetCurrentConnectionInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">"
                    "<RcsID>0</RcsID><AVTransportID>0</AVTransportID>"
@@ -1900,7 +1960,8 @@ static void handle_client(OrbisNetId c) {
                    "<Direction>Input</Direction><Status>OK</Status>"
                    "</u:GetCurrentConnectionInfoResponse></s:Body></s:Envelope>";
         } else {
-            resp = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body/></s:Envelope>";
+            send_soap_fault(c, 401, "Invalid Action");
+            return;
         }
         send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", resp, (int)strlen(resp));
         return;
