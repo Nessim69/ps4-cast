@@ -14,6 +14,7 @@
 #include "notify.h"
 #include "vdec_hw.h"
 #include "trace.h"
+#include "openq.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -49,7 +50,8 @@ static int               g_vstream = -1;
 // flow through the SAME frame queue / sync / scale path as software frames.
 static int               g_useHw = 0;
 static int               g_interlaced = 0;   // source is interlaced -> bob-deinterlace
-// Which stage of player_play is executing, for the watchdog's crash log. Four
+// Which stage of play_open (opener worker) is executing, for the watchdog's
+// HANG/OPENHANG crash log. Four
 // speculative fixes failed to stop a "HANG watchdog stale=36s" while zapping past
 // dead channels because the blocking call was never identified — this makes the
 // crash name it instead of us inferring it from the symptom.
@@ -135,7 +137,12 @@ static int   g_started = 0;        // intent: from play() until stop/EOF
 static int   g_active  = 0;        // currently decoding
 static int   g_gotFrame = 0;
 static char  g_status[160] = "idle";
-static char  g_playUrl[2048];
+// The spec the current pipeline was opened from: the requested string WITH its
+// |Referer=..&User-Agent=..&Cookie=..&Type=hls options (or the page-resolved
+// spec). Every reopen replays THIS -- replaying the option-stripped URL lost the
+// headers (403) and the Type=hls hint (extension-less HLS opened as a file).
+// Written only by the opener worker while it executes a request.
+static char  g_playSpec[OPENQ_SPEC_MAX];
 static char  g_errorCode[32];
 static char  g_errorMessage[192];
 static char  g_sourceErrorDiag[480];
@@ -250,19 +257,61 @@ static void *decode_thread_main(void *arg);
 static int   setup_separate_audio(void);
 static void *audio_thread_main(void *arg);
 
+// ---- opener worker: state shared with the AVIO callbacks -------------------
+// Stop+open used to run on the render thread: DNS, TLS, page scraping, playlist
+// fetches and a 4 MB demux probe froze the TV for up to the watchdog's 35s
+// grace, with Circle and newer casts ignored until it finished. Every stop and
+// open now runs on ONE opener worker thread (see "opener worker" below play_open).
+// Invariants:
+//   * Only the main thread queues requests (casts, zaps, queue advance,
+//     reconnect, Circle/stop, and render_threaded's fMP4/live restart).
+//   * From the moment a request is queued until the worker publishes its
+//     result, g_opBusy is 1 and the main thread touches NO pipeline global:
+//     player_render returns 0 (the held frame / Connecting screen stays up) and
+//     the progress/seek/pause/stats getters report "nothing playing yet".
+//     g_opBusy only drops back to 0 under g_opMtx after the worker's last write,
+//     so a main-thread reader that sees 0 also sees the finished pipeline.
+//   * Latest wins: a newer request replaces a queued one and cancels the one
+//     executing (network aborts + open_cancelled() checkpoints), so a zap burst
+//     opens only the last channel and a cast is never lost behind a slow open.
+static volatile int      g_opBusy = 0;         // request queued or executing (release/acquire)
+static volatile unsigned g_opLatest = 0;       // seq of the newest request
+static volatile int      g_opLatestKind = 0;   // OPENQ_PLAY / OPENQ_STOP of the newest request
+static volatile unsigned g_opRunSeq = 0;       // seq the worker is executing (0 = none)
+#define OPEN_RC_CANCELLED (-9)
+
+// True on the opener while the request it executes has been superseded. Each
+// blocking open stage re-checks this: the network aborts alone are not enough,
+// because httpsrc_open()/hls_open() clear a raised abort as they (re)start.
+static int open_cancelled(void) {
+    unsigned run = g_opRunSeq;
+    return run != 0 && run != g_opLatest;
+}
+// Brackets each blocking open stage with the network aborts that can cut it
+// short when a newer request supersedes it (see "opener worker" below).
+#define OP_ABORT_HTTPSRC 1
+#define OP_ABORT_ASEG    2
+static void op_abort_window(int mask);
+
 // ---- custom AVIO: uploaded file, plain HTTP(S), or HLS ---------------------
-extern void watchdog_kick(void);       // main.c: pet the freeze watchdog from the main-thread probe
+extern void watchdog_kick(void);       // main.c: pet the main heartbeat / the opener's progress beat
 extern void watchdog_set_busy(int on);
-extern const char *watchdog_note(const char *w); // main.c: longer watchdog grace during a slow channel switch
+extern const char *watchdog_note(const char *w); // main.c: name the blocking call for a HANG line
+extern void watchdog_open_job(int on); // main.c: opener worker entering/leaving a request (OPENHANG beat)
 
 static int avio_read_cb(void *o, uint8_t *buf, int size) {
     (void)o;
-    // During player_play's synchronous demux probe (runs on the main thread,
-    // g_started==0), a slow channel switch can read for many seconds. Pet the
-    // freeze watchdog on each read so a progressing switch isn't killed as a
-    // freeze. Not kicked during playback (g_started==1) so a real main-loop
-    // freeze is still caught.
-    if (!g_started) watchdog_kick();
+    // g_started==0 means this read is play_open's demux probe on the opener
+    // worker. A slow channel switch can read for many seconds: each read pets
+    // the OPENER's progress beat (watchdog_kick routes it by thread), so a
+    // progressing probe isn't killed as a hung open. Not kicked during playback
+    // (g_started==1, decode thread), where it would mean nothing.
+    // A superseded probe fails its NEXT read instead of downloading the rest
+    // of a 4 MB/4 s window for a stream nobody wants any more.
+    if (!g_started) {
+        watchdog_kick();
+        if (open_cancelled()) return AVERROR_EXIT;
+    }
     int n;
     if (g_isLocal) {
         // libkernel declares pread as size_t even though failures use negative
@@ -293,6 +342,7 @@ static int avio_mem_read_cb(void *o, uint8_t *buf, int size) {
 // Second AVIO: the separate HLS audio rendition (its own segment byte stream).
 static int avio_aread_cb(void *o, uint8_t *buf, int size) {
     (void)o;
+    if (!g_started && open_cancelled()) return AVERROR_EXIT;   // setup_separate_audio's probe, superseded
     int n = hls_audio_read(buf, (uint32_t)size);
     if (n <= 0) return AVERROR_EOF;
     return n;
@@ -326,7 +376,11 @@ static void player_set_error(const char *code, const char *message) {
 }
 int player_init(void) { return 0; } // nothing global to set up for ffmpeg
 
-void player_stop(void) {
+// Tear the whole pipeline down. Runs ONLY where nothing else can touch it: on
+// the opener worker (every stop/open request), or synchronously on the main
+// thread when no worker exists / at shutdown. The public player_stop() queues.
+static void player_teardown(void) {
+    op_abort_window(0);   // teardown raises its own aborts; none may race its closes from main
     uint64_t st0 = sceKernelGetProcessTime(), stDec = st0, stFetch = st0;
 #if PLAYER_DECODE_THREAD
     if (g_threaded) {
@@ -407,6 +461,12 @@ void player_stop(void) {
     g_pos = 0; g_startProc = 0; g_scaledW = g_scaledH = 0;
     g_paused = 0; g_wasPaused = 0; g_seekPending = 0; g_seekRequestedAt = 0;
     g_curSec = 0; g_durSec = 0;
+    // A restart the old decode thread asked for (fMP4 seek / quality switch /
+    // live reset) dies with it. Left set, a cast arriving right after an fMP4
+    // scrub was seeked to the OLD target and then reopened again by the stale
+    // flag. Cleared only here, after the decode thread is joined, so nothing can
+    // re-raise them; a legitimate restart carries its target in its request.
+    g_liveRestartPending = 0; g_hlsResumeSec = -1.0;
     snprintf(g_status, sizeof(g_status), "stopped");
 }
 
@@ -432,37 +492,53 @@ static int open_sw_video(const AVCodec *dec) {
     return 0;
 }
 
-int player_play(const char *url) {
-    // A cast request can ask for a small startup cushion. Capture it before
-    // player_stop() resets the active playback state.
-    int requestedHeadstart = g_nextStartupHeadstart;
-    g_nextStartupHeadstart = 0;
+// Stop whatever plays and open `url` (a spec: "url|Referer=..&Type=hls").
+// Runs ONLY on the opener worker (or synchronously on the main thread when that
+// thread could not be created): see "opener worker" below. `requestedHeadstart`
+// and `resumeSec` travel in the request instead of globals, so a stop or a newer
+// request can never hand them to the wrong stream.
+static int play_open(const char *url, int requestedHeadstart, double resumeSec) {
     g_playStage = "enter";
-    watchdog_set_busy(1);   // teardown + open + probe can run many seconds (esp. off a 1080i SW channel); don't let the freeze watchdog kill the switch
     uint64_t swt0 = sceKernelGetProcessTime();   // channel-switch stage timing (-> g_swDiag, shown in /status)
     char requested[2048];
     snprintf(requested, sizeof(requested), "%s", url ? url : "");
-    char startUrl[2048];
-    urlopt_apply(requested, startUrl, sizeof(startUrl));   // "url|Referer=..&User-Agent=.." -> clean url + headers
-    int forceHls = strcmp(urlopt_kind(), "hls") == 0;
-    // A page URL (what you get from a site whose player shows a blob:) is not
-    // playable. Fetch it and dig the manifest out, then adopt the Referer the CDN
-    // will demand. Sites that build the URL in JS still need the DevTools route.
-    if (!forceHls && resolve_is_page(startUrl)) {
-        g_playStage = "resolve";
-        char resolved[2048];
-        if (resolve_page(startUrl, resolved, sizeof(resolved)))
-            urlopt_apply(resolved, startUrl, sizeof(startUrl));
-        else
-            urlopt_apply(requested, startUrl, sizeof(startUrl));
-    }
+    // Tear the old stream down FIRST (it used to follow the page resolve). Every
+    // fetch owner is joined by then, which is the only safe point to clear aseg's
+    // sticky abort for the resolve below -- a superseded open or a plain Stop of
+    // an HLS stream leaves it raised, and the page fetch then failed instantly
+    // (rc=-9) and the unresolved page URL was opened as media. It also stops
+    // urlopt_apply() swapping the request headers under a still-running stream.
     g_playStage = "stop";
-    player_stop();
+    player_teardown();
     player_clear_error();
     hls_set_seg_stop_flag(&g_segFetchStop);   // so hls_next_segment's retry loop bails instantly on the next teardown (no more ~30s player_stop)
     uint64_t swtStop = sceKernelGetProcessTime();
-    strncpy(g_playUrl, startUrl, sizeof(g_playUrl) - 1);
-    g_playUrl[sizeof(g_playUrl) - 1] = '\0';
+    if (open_cancelled()) return OPEN_RC_CANCELLED;   // a newer request owns what comes next
+    snprintf(g_status, sizeof(g_status), "connecting");
+    char startUrl[2048];
+    urlopt_apply(requested, startUrl, sizeof(startUrl));   // "url|Referer=..&User-Agent=.." -> clean url + headers
+    int forceHls = strcmp(urlopt_kind(), "hls") == 0;
+    const char *spec = requested;   // what a reopen must replay (see g_playSpec)
+    // A page URL (what you get from a site whose player shows a blob:) is not
+    // playable. Fetch it and dig the manifest out, then adopt the Referer the CDN
+    // will demand. Sites that build the URL in JS still need the DevTools route.
+    char resolved[2048];
+    if (!forceHls && resolve_is_page(startUrl)) {
+        g_playStage = "resolve";
+        snprintf(g_status, sizeof(g_status), "resolving page");
+        aseg_resume();
+        op_abort_window(OP_ABORT_ASEG);
+        int found = resolve_page(startUrl, resolved, sizeof(resolved));
+        op_abort_window(0);
+        if (open_cancelled()) return OPEN_RC_CANCELLED;   // an aborted fetch is no verdict on the page
+        if (found) {
+            urlopt_apply(resolved, startUrl, sizeof(startUrl));
+            spec = resolved;   // reopen the manifest, not the page (no second scrape)
+        } else {
+            urlopt_apply(requested, startUrl, sizeof(startUrl));
+        }
+    }
+    snprintf(g_playSpec, sizeof(g_playSpec), "%s", spec);
     g_pkts = g_frames = g_drops = g_queueDrops = g_lateDrops = g_reorderDrops = 0;
     g_presentUsTotal = g_presentUsMax = g_presentCalls = 0;
     g_decodeUsTotal = g_decodeUsMax = g_decodeCalls = 0;
@@ -496,7 +572,9 @@ int player_play(const char *url) {
         }
     } else {
         if (g_isHls) hls_set_decode_cap(g_hwEnabled ? 1080 : 720);
+        op_abort_window(g_isHls ? OP_ABORT_ASEG : OP_ABORT_HTTPSRC);   // playlist fetches / connect+headers
         orc = g_isHls ? hls_open(startUrl) : httpsrc_open(startUrl);
+        op_abort_window(0);   // closed BEFORE the open_cancelled() check below
     }
     watchdog_note("-");
     uint64_t swtOpen = sceKernelGetProcessTime();
@@ -508,30 +586,30 @@ int player_play(const char *url) {
                  g_isLocal ? "The uploaded file is no longer available. Upload it again."
                            : (g_isHls ? "The HLS source could not be opened. Check the link or server."
                                       : "The video source could not be reached. Check the link and try again."));
-        player_stop();
+        player_teardown();
         player_set_error("source", detail);
         return -1;
     }
+    if (open_cancelled()) { player_teardown(); return OPEN_RC_CANCELLED; }
     g_pos = 0;
     // Re-apply a target carried across an fMP4 scrub's reopen. Must run BEFORE
     // the demuxer opens so it reads init + the target segment, not the file start.
-    if (g_isHls && g_hlsResumeSec >= 0) {
+    if (g_isHls && resumeSec >= 0) {
         double actual = 0;
-        int src = hls_seek_clamped(g_hlsResumeSec, &actual);
-        trace_mark("seek hls resume target=%.3f rc=%d actual=%.3f", g_hlsResumeSec, src, actual);
-        g_hlsResumeSec = -1.0;
+        int src = hls_seek_clamped(resumeSec, &actual);
+        trace_mark("seek hls resume target=%.3f rc=%d actual=%.3f", resumeSec, src, actual);
     }
 
     uint8_t *aviobuf = av_malloc(AVIO_BUFSZ);
     if (!aviobuf) {
-        player_stop();
+        player_teardown();
         player_set_error("memory", "Not enough memory to open this video. Stop playback and try again.");
         return -1;
     }
     g_avio = avio_alloc_context(aviobuf, AVIO_BUFSZ, 0, NULL, avio_read_cb, NULL, avio_seek_cb);
     if (!g_avio) {
         av_free(aviobuf);
-        player_stop();
+        player_teardown();
         player_set_error("memory", "Not enough memory to prepare this video. Stop playback and try again.");
         return -1;
     }
@@ -549,8 +627,9 @@ int player_play(const char *url) {
     // above warns about: a 6Mbps 1080p stream fits only ~1.3s in 1MB, so the audio
     // PID fell outside the window and playback ran with NO AUDIO (as=-1, audio
     // device never opened). 4MB/4s finds the audio PID on these streams while
-    // keeping switches quick. Probe reads pet the watchdog, so a longer probe
-    // cannot trip the freeze detector.
+    // keeping switches quick. Probe reads pet the opener's progress beat (and the
+    // render loop no longer waits on the probe at all), so a longer probe cannot
+    // trip a hang detector.
     // 4MB/4s. Measured: shrinking this to 2MB/2.5s did NOT speed up launch
     // (probe 2165ms -> 2315ms) because the probe is bound by DOWNLOADING ~2s of
     // stream, not by these ceilings — so the smaller value bought nothing and only
@@ -560,9 +639,15 @@ int player_play(const char *url) {
     g_fmt->max_analyze_duration = 4 * (int64_t)AV_TIME_BASE;
 
     g_playStage = "demux-open";
+    // A superseded probe stalled in httpsrc_read (it waits up to 30s for data)
+    // is released at once; the next AVIO read then fails with AVERROR_EXIT.
+    // Plain HTTP only: HLS reads cycle httpsrc_close()/open per segment, where
+    // an abort from main could hit the mutex being destroyed -- HLS just ends
+    // at its next AVIO read instead. Error paths: player_teardown() closes it.
+    op_abort_window((!g_isLocal && !g_isHls) ? OP_ABORT_HTTPSRC : 0);
     int rc = avformat_open_input(&g_fmt, "stream", NULL, NULL);
     if (rc < 0) {
-        player_stop();
+        player_teardown();
         // For HLS the demuxer starves only when segment delivery fails; carry
         // the reader's own failure detail into /status instead of failing blind.
         snprintf(g_sourceErrorDiag, sizeof(g_sourceErrorDiag), "%s",
@@ -572,10 +657,13 @@ int player_play(const char *url) {
     }
     g_playStage = "probe";
     if (avformat_find_stream_info(g_fmt, NULL) < 0) {
-        player_stop();
+        player_teardown();
         player_set_error("stream-info", "The source opened, but its audio and video tracks could not be read.");
         return -3;
     }
+    op_abort_window(0);
+    // A cancelled probe read can still "succeed" on a partial window: re-check.
+    if (open_cancelled()) { player_teardown(); return OPEN_RC_CANCELLED; }
     {
         uint64_t swtInfo = sceKernelGetProcessTime();
         snprintf(g_swDiag, sizeof(g_swDiag), "sw stop=%llu open=%llu info=%llu ms",
@@ -587,7 +675,7 @@ int player_play(const char *url) {
     const AVCodec *dec = NULL;
     g_vstream = av_find_best_stream(g_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
     if (g_vstream < 0 || !dec) {
-        player_stop();
+        player_teardown();
         player_set_error("no-video", "No playable video track was found in this source.");
         return -4;
     }
@@ -724,7 +812,7 @@ int player_play(const char *url) {
 
     if (!g_useHw) {
         if (open_sw_video(dec) != 0) {
-            player_stop();
+            player_teardown();
             player_set_error("decoder", "The video codec is not supported by the available decoders.");
             return -5;
         }
@@ -753,6 +841,9 @@ int player_play(const char *url) {
     g_rebuffering = (g_isHls || g_startupHeadstart) ? 1 : 0;
     g_emptyCnt = 0; g_rebufHits = 0; g_rebufTotal = 0;
 
+    // Last cheap exit before threads start (the separate-audio probe above can
+    // take seconds); a newer request would only have to tear all of this down.
+    if (open_cancelled()) { player_teardown(); return OPEN_RC_CANCELLED; }
     g_started = 1; g_active = 1; g_gotFrame = 0;
     if (g_rebuffering) audio_pause(1);  // fill video and decoded audio before first presentation
     g_playStage = "started";
@@ -829,18 +920,225 @@ int player_play(const char *url) {
     return 0;
 }
 
-int player_is_active(void) { return g_active; }
-int player_started(void)   { return g_started; }
-int player_is_live(void)   { return g_isHls && hls_is_live(); }   // true live (not VOD)
+// ---- opener worker ---------------------------------------------------------
+// One thread executes every stop/open request (openq.c holds the latest-wins
+// rules); see the invariants at "opener worker: state" above. Beyond those:
+//   * Superseding raises the network aborts built to be raised from another
+//     thread -- httpsrc_abort(), aseg_abort() -- WHILE holding g_opMtx: the
+//     worker can take the next request only under that mutex, so an abort meant
+//     for the old open can never land on the new one. Both are re-armed before
+//     reuse (httpsrc_open/close clear theirs; hls_open and play_open's resolve
+//     call aseg_resume() once the fetch owners are joined). Never
+//     hls_audio_abort(): it joins the audio prefetch thread that
+//     hls_open/hls_close may be starting or joining on the worker right then.
+//   * Each abort is raised only inside the stage window the worker opened for
+//     it (op_abort_window, under g_opMtx), never during a teardown: there it
+//     adds nothing (teardown aborts its own sources) and could race the
+//     worker's httpsrc_close() destroying the mutex httpsrc_abort() signals.
+//     aseg's abort is STICKY, so its window is only the page resolve and
+//     hls_open, where it makes the open fail fast. Raised during the demux
+//     probe it made a live channel WORSE: every hls_read retry then failed
+//     instantly with rc=-9 and spun its 300ms loop for the whole 20s stall
+//     budget, instead of letting the in-flight segment finish (~1-2s) and the
+//     next AVIO read cancel. The worker closes a window under g_opMtx BEFORE it
+//     re-checks open_cancelled(), so a late abort is always paired with that
+//     bail-out and never leaks into a stage it was not meant for.
+//   * A hung open (unabortable ~8s DNS, a native SceHttp call) only delays the
+//     worker: the render loop keeps presenting, Circle/new casts queue behind
+//     it and the newest runs as soon as the call returns. The worker's own
+//     progress beat (watchdog_open_job/watchdog_kick) replaces the old 35s
+//     "busy" grace: only an open with NO progress for 35s fail-closes (OPENHANG).
+//   * If the thread cannot be created, requests run synchronously on the main
+//     thread exactly as before (busy grace + main-thread kicks).
+static Openq             g_oq;             // guarded by g_opMtx
+static OrbisPthreadMutex g_opMtx;
+static OrbisPthreadCond  g_opCond;
+static OrbisPthread      g_opThread;
+static int               g_opState = 0;    // 0 not started, 1 worker up, -1 synchronous fallback
+static volatile int      g_opQuit = 0, g_opExited = 0;
+static OpenqReq          g_opJob;          // the executing request (worker, or main in fallback)
+static int               g_opAbortMask = 0;    // guarded by g_opMtx: OP_ABORT_* that may cut the stage short
+
+static void op_lock(void)   { if (g_opState > 0) scePthreadMutexLock(&g_opMtx); }
+static void op_unlock(void) { if (g_opState > 0) scePthreadMutexUnlock(&g_opMtx); }
+static void op_abort_window(int mask) { op_lock(); g_opAbortMask = mask; op_unlock(); }
+// Caller holds g_opMtx and has just superseded the executing request.
+static void op_abort_running(void) {
+    trace_mark("open supersede run=%u by=%u mask=%d", (unsigned)g_opRunSeq,
+               (unsigned)g_oq.lastSeq, g_opAbortMask);
+    if (g_opAbortMask & OP_ABORT_HTTPSRC) httpsrc_abort();
+    if (g_opAbortMask & OP_ABORT_ASEG)    aseg_abort();
+}
+// Mirror the queue state for lock-free readers. Caller holds g_opMtx. RELEASE:
+// a reader that sees busy==0 also sees every pipeline write made before it.
+static void op_publish(void) {
+    g_opLatest = g_oq.lastSeq;
+    g_opLatestKind = g_oq.lastKind;
+    __atomic_store_n(&g_opBusy, openq_busy(&g_oq), __ATOMIC_RELEASE);
+}
+
+int player_opening(void) { return __atomic_load_n(&g_opBusy, __ATOMIC_ACQUIRE); }
+
+static int open_job_run(const OpenqReq *r) {
+    if (open_cancelled()) return OPEN_RC_CANCELLED;   // superseded before it began
+    if (r->kind == OPENQ_STOP) {
+        g_playStage = "stop";
+        player_teardown();
+        g_playStage = "idle";
+        return 0;
+    }
+    return play_open(r->spec, r->headstart, r->resumeSec);
+}
+
+// A superseded open must not leave its failure on /status (the web UI would
+// flash "could not be opened" for a stream the user already replaced).
+static void open_job_done(const OpenqReq *r, int rc) {
+    if (rc != 0 && openq_superseded(&g_oq, r->seq)) {
+        player_clear_error();
+        snprintf(g_status, sizeof(g_status), "cancelled");
+    }
+    openq_finish(&g_oq, r->seq, rc);
+    g_opRunSeq = 0;
+    op_publish();
+}
+
+static void *opener_main(void *arg) {
+    (void)arg;
+    trace_mark("thread + opener self=%p", (void *)scePthreadSelf());
+    scePthreadMutexLock(&g_opMtx);
+    while (!g_opQuit) {
+        if (!openq_take(&g_oq, &g_opJob)) { scePthreadCondWait(&g_opCond, &g_opMtx); continue; }
+        g_opRunSeq = g_opJob.seq;
+        op_publish();
+        scePthreadMutexUnlock(&g_opMtx);
+        watchdog_open_job(1);
+        int rc = open_job_run(&g_opJob);
+        watchdog_open_job(0);
+        scePthreadMutexLock(&g_opMtx);
+        open_job_done(&g_opJob, rc);
+    }
+    g_opExited = 1;
+    scePthreadMutexUnlock(&g_opMtx);
+    return NULL;
+}
+
+// Main thread, first request: bring the worker up, or settle on the
+// synchronous fallback for good.
+static int opener_start(void) {
+    if (g_opState) return g_opState > 0;
+    g_opState = -1;
+    openq_init(&g_oq);
+    if (scePthreadMutexInit(&g_opMtx, NULL, "ps4cast_open_m") != 0) return 0;
+    if (scePthreadCondInit(&g_opCond, NULL, "ps4cast_open_c") != 0) {
+        scePthreadMutexDestroy(&g_opMtx);
+        return 0;
+    }
+    // Same roomy stack as the decode thread: this runs FFmpeg's probe (which
+    // decodes frames), the page scraper and BearSSL handshakes that used to have
+    // the main thread's stack.
+    OrbisPthreadAttr attr; OrbisPthreadAttr *pattr = NULL;
+    if (scePthreadAttrInit(&attr) == 0) {
+        scePthreadAttrSetstacksize(&attr, 8 * 1024 * 1024);
+        pattr = &attr;
+    }
+    int rc = scePthreadCreate(&g_opThread, pattr, opener_main, NULL, "ps4cast_open");
+    if (pattr) scePthreadAttrDestroy(&attr);
+    if (rc != 0) {
+        scePthreadCondDestroy(&g_opCond);
+        scePthreadMutexDestroy(&g_opMtx);
+        return 0;
+    }
+    g_opState = 1;
+    return 1;
+}
+
+// Main thread only. Queue a request (latest wins) and cancel the one executing.
+static void open_submit(int kind, const char *spec, int headstart, double resumeSec) {
+    opener_start();
+    op_lock();
+    int cancel = 0;
+    openq_submit(&g_oq, kind, spec, headstart, resumeSec, &cancel);
+    op_publish();
+    if (cancel) op_abort_running();
+    if (g_opState > 0) scePthreadCondSignal(&g_opCond);
+    op_unlock();
+    if (g_opState > 0) return;
+    // No worker: the pre-async behaviour. Blocking the main thread again, so
+    // restore the long watchdog grace it always had for a switch.
+    watchdog_set_busy(1);
+    if (openq_take(&g_oq, &g_opJob)) {
+        g_opRunSeq = g_opJob.seq;
+        op_publish();
+        int rc = open_job_run(&g_opJob);
+        open_job_done(&g_opJob, rc);
+    }
+}
+
+void player_play_async(const char *spec) {
+    // A cast request can ask for a small startup cushion; it belongs to THIS
+    // request, so capture it now rather than when the worker gets to it.
+    int headstart = g_nextStartupHeadstart;
+    g_nextStartupHeadstart = 0;
+    open_submit(OPENQ_PLAY, spec, headstart, -1.0);
+}
+
+void player_stop(void) {
+    if (g_opState == 0) { player_teardown(); return; }   // nothing ever opened off-thread
+    open_submit(OPENQ_STOP, "", 0, -1.0);
+}
+
+int player_poll_open(int *rc) {
+    op_lock();
+    int got = g_opState ? openq_poll(&g_oq, rc) : 0;
+    op_unlock();
+    return got;
+}
+
+// Only meaningful on the main thread while !player_opening() (the worker writes
+// it inside a request); every caller in main.c reads it from that state.
+const char *player_current_spec(void) { return g_playSpec; }
+
+// App exit (main thread, render loop finished): cancel whatever runs, let the
+// worker leave, then tear down here. Bounded: a worker wedged in an unabortable
+// call is abandoned (returns -1) -- touching its pipeline would race it, and
+// LoadExec reaps the process either way.
+int player_shutdown(void) {
+    watchdog_set_busy(1);
+    if (g_opState > 0) {
+        op_lock();
+        int cancel = 0;
+        openq_submit(&g_oq, OPENQ_STOP, "", 0, -1.0, &cancel);   // supersedes the running job
+        op_publish();
+        if (cancel) op_abort_running();
+        g_opQuit = 1;
+        scePthreadCondSignal(&g_opCond);
+        op_unlock();
+        for (int i = 0; i < 1000 && !g_opExited; i++) sceKernelUsleep(10 * 1000);   // <= 10s
+        if (!g_opExited) return -1;
+        scePthreadJoin(g_opThread, NULL);
+        g_opState = -1;   // any later call runs synchronously on this thread
+    }
+    player_teardown();
+    return 0;
+}
+
+// While a request is queued/executing the pipeline belongs to the worker: the
+// getters below answer "starting / nothing to show yet" without touching it.
+int player_is_active(void) { return player_opening() ? g_opLatestKind == OPENQ_PLAY : g_active; }
+int player_started(void)   { return player_opening() ? g_opLatestKind == OPENQ_PLAY : g_started; }
+int player_is_live(void)   { return !player_opening() && g_isHls && hls_is_live(); }   // true live (not VOD)
 int player_is_local(void)  { return g_isLocal; }
 
 void player_pause(int paused) {
+    // Nothing to pause mid-open, and a pause landing after the worker's teardown
+    // would start the NEW stream paused behind a Connecting screen.
+    if (player_opening()) return;
     g_paused = paused ? 1 : 0;
     audio_pause(g_paused || g_rebuffering);
 }
-int  player_is_paused(void)   { return g_paused; }
+int  player_is_paused(void)   { return !player_opening() && g_paused; }
 int  player_can_seek(void)    {
-    return g_started && g_durSec > 0 &&
+    return !player_opening() && g_started && g_durSec > 0 &&
            (!g_isHls || hls_can_seek() || hls_can_seek_clamped());
 }
 void player_set_startup_headstart(int on) { g_nextStartupHeadstart = on ? 1 : 0; }
@@ -869,6 +1167,10 @@ static int seek_debounce_elapsed(void) {
 // Unblock a stuck network read (called from the http thread on Stop / new cast)
 // so an underrun stall never traps the app.
 void player_interrupt(void) {
+    // Mid-request the worker owns these sources: its teardown raises its own
+    // aborts and a superseding request raises the ones an open needs. Racing it
+    // here (hls_audio_abort joins a thread hls_close may be joining) only hurts.
+    if (player_opening()) return;
     if (!g_started && !g_active) return;
     if (!g_isLocal) httpsrc_abort();
     hls_audio_abort();
@@ -877,7 +1179,7 @@ void player_interrupt(void) {
 // True when we've started playing but no fresh frame is available — i.e. the
 // decoder/network can't keep up. Drives the on-screen "Buffering" indicator.
 int player_buffering(void) {
-    if (!g_started || g_paused) return 0;
+    if (player_opening() || !g_started || g_paused) return 0;
     if (g_threaded) return g_rebuffering;
     return 0;   // single-thread path blocks instead of reporting
 }
@@ -885,6 +1187,9 @@ int player_buffer_pct(void) {
     // On the decode-thread path (HLS seg-demux / live) the real read-ahead is the
     // decoded-frame queue, not the prefetch ring (which is idle there) — so report
     // that, otherwise live channels always showed buffer 0%.
+    // Mid-request hls_buffer_pct() would lock a prefetch mutex the worker may be
+    // destroying (hls_close); there is no buffer to report yet anyway.
+    if (player_opening()) return 0;
     if (g_threaded) { int p = g_fqCount * 100 / FQ_SLOTS; return p > 100 ? 100 : p; }
     return g_isLocal ? 100 : (g_isHls ? hls_buffer_pct() : httpsrc_fill_pct());
 }
@@ -896,8 +1201,9 @@ int  player_get_avsync(void) { return g_avSyncMs; }
 uint64_t player_rx_total(void) { return g_isLocal ? 0 : (g_isHls ? hls_rx_total() : httpsrc_rx_total()); }
 
 void player_progress(double *cur, double *dur) {
-    if (cur) *cur = g_curSec;
-    if (dur) *dur = g_durSec;
+    int opening = player_opening();   // no timeline until the new stream is up
+    if (cur) *cur = opening ? 0 : g_curSec;
+    if (dur) *dur = opening ? 0 : g_durSec;
 }
 
 // Drop all queued frames (after a seek, or on stop). Safe to call when the
@@ -1033,6 +1339,7 @@ static void apply_hls_reset(void) {
 
 void player_stats(PlayerStats *s) {
     memset(s, 0, sizeof(*s));
+    if (player_opening()) { snprintf(s->codec, sizeof(s->codec), "opening"); return; }
     s->hw = g_useHw;
     s->hls = g_isHls;
     s->segDemux = g_hlsSegDemux;
@@ -1050,6 +1357,10 @@ void player_debug(char *out, int len) {
     double ahead = (!g_isLocal && g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 0;
     uint64_t flipAvg = 0, flipMax = 0, flipWaitAvg = 0, flipWaitMax = 0;
     gfx_present_stats(&flipAvg, &flipMax, &flipWaitAvg, &flipWaitMax);
+    // Mid-request the worker is closing/opening the sources, and hls_debug() /
+    // httpsrc_debug() lock mutexes it may be destroying: name its stage instead.
+    char opening[48] = "";
+    if (player_opening()) snprintf(opening, sizeof(opening), "opening at %s", (const char *)g_playStage);
     snprintf(out, len,
              "ff%s%s%s %dx%d | fr=%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%llu/%llu dc=%llu/%llu qw=%llu/%llu flip=%llu/%llu(w%llu/%llu)us ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
              g_useHw ? "/HW" : "", g_isHls ? (g_hlsSegDemux ? "/hls-seg" : "/hls") : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
@@ -1068,6 +1379,7 @@ void player_debug(char *out, int len) {
              g_sepAudioMode ? g_aastream : g_astream, g_sepAudioMode ? "/sep" : "",
              (g_sepAudioMode && g_sepAudioEof) ? "/eof" : "",
              audio_debug(),
+             opening[0] ? opening :
              (!g_active && g_errorCode[0] && g_sourceErrorDiag[0]) ? g_sourceErrorDiag :
                  (g_isLocal ? "local file" : (g_isHls ? hls_debug() : httpsrc_debug())),
              g_swDiag, g_stopDiag);
@@ -2198,11 +2510,16 @@ static void *decode_segment_thread_main(void *arg) {
 
 static int render_threaded(Gfx *g) {
     if (g_liveRestartPending) {
-        char url[sizeof(g_playUrl)];
-        strncpy(url, g_playUrl, sizeof(url) - 1);
-        url[sizeof(url) - 1] = '\0';
+        // fMP4 scrub / quality switch / live reset: rebuild through the opener
+        // worker like any other request, so it is cancellable and a cast that
+        // arrives meanwhile simply wins. Replay the ORIGINAL spec: its
+        // |Referer/User-Agent/Cookie options are what the CDN checks and Type=hls
+        // is what marks an extension-less URL as HLS. The target rides in the
+        // request; teardown clears g_hlsResumeSec so no other stream inherits it.
+        double resume = g_hlsResumeSec;
         g_liveRestartPending = 0;
-        if (url[0]) player_play(url);
+        g_hlsResumeSec = -1.0;
+        if (g_playSpec[0]) open_submit(OPENQ_PLAY, g_playSpec, 0, resume);
         return 0;
     }
 
@@ -2324,6 +2641,10 @@ static int render_threaded(Gfx *g) {
 // Decode the next video frame, pace it to its PTS, and blit. Returns 1 if a
 // frame was drawn this call.
 int player_render(Gfx *g) {
+    // A queued/executing request owns every pipeline global (queue, decoder,
+    // present pool, g_lastShown). Draw nothing: main.c holds the last image or
+    // shows Connecting, and keeps animating and taking input meanwhile.
+    if (player_opening()) return 0;
     if (!g_started || !g_fmt) return 0;
     if (g_threaded) return render_threaded(g);
     // Hardware decode requires the (big-stack) decode thread; there is no inline
