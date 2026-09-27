@@ -1326,9 +1326,22 @@ int main(void) {
         if (!reconnecting && player_started() && !player_is_active()) {
             healthySince = 0;
             if (httpd_take_next(url, sizeof(url))) {
-                player_play_async(url);
+                // A queued item is a CAST like any other: same origin / guide /
+                // tuned-channel reset and the same signed-in-user gate as /cast.
+                // Advancing out of an IPTV channel used to keep its origin, so the
+                // next queued video got the channel guide and zap controls.
+                playbackOrigin = PLAYBACK_CAST;
+                homeMode = HOME_CAST;
+                guideOpen = 0;
+                httpd_chan_set_current(-1);
                 everDrew = 0; reconnecting = 0; reconnects = 0;
-                hudUntil = sceKernelGetProcessTime() + 6000000ULL;
+                if (!userOk) {
+                    notify("Sign in a PS4 user to cast");   // playing under ANONYMOUS crashes SceShellUI
+                    player_stop();
+                } else {
+                    player_play_async(url);
+                    hudUntil = sceKernelGetProcessTime() + 6000000ULL;
+                }
             } else if (liveSource && player_current_spec()[0]) {
                 snprintf(reconnectSpec, sizeof(reconnectSpec), "%s", player_current_spec());
                 reconnecting = 1; reconnects = 0; reconnectAt = now + 800000ULL;
