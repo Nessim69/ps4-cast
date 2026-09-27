@@ -34,3 +34,17 @@ clean:
 	rm -f $(TESTS)
 
 .PHONY: all test clean
+
+# Appended (not folded into the TESTS=/all: lines above) to keep this an
+# additive change: pairing.c's token alphabet/validator/derivation,
+# host-tested without needing PS4 headers (the entropy-gathering half stays
+# in httpd.c). `all: test_token` is a second prerequisite rule for the same
+# target -- GNU make unions them with the original `all: $(TESTS)` rather than
+# replacing it -- because `all`'s prerequisite list was already fixed to the
+# OLD $(TESTS) by the time make parsed that first rule; only recipes
+# (`clean`'s `rm -f $(TESTS)`) re-expand $(TESTS) late enough to see this line.
+TESTS += test_token
+all: test_token
+
+test_token: test_token.c $(SRC)/pairing.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_token.c $(SRC)/pairing.c

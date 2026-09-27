@@ -43,4 +43,10 @@ int  httpd_resume_get(const char *url);
 const char *httpd_token(void);
 int  httpd_pairing_required(void);
 
+// A short window (seconds) during which GET /token answers without the
+// caller already holding the token -- opened by the TV's Square button (main.c)
+// so a not-yet-paired phone/extension can bootstrap pairing at all.
+void httpd_pairing_window_open(int seconds);
+int  httpd_pairing_window_left(void);   // seconds left, 0 = closed
+
 #endif

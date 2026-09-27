@@ -8,6 +8,7 @@
 #include "sys_diag.h"
 #include "trace.h"
 #include "notify.h"
+#include "pairing.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -135,25 +136,69 @@ static void token_load_or_create(void) {
         char buf[16] = {0};
         int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
         sceKernelClose(fd);
-        if (n == 8) { memcpy(g_token, buf, 8); g_token[8] = '\0'; return; }
+        // Validate, don't just trust the file: a token minted by the old
+        // `cs[t & 31]` generator could hold a NUL byte or otherwise be
+        // garbled (see pairing.c), which silently disabled pairing or locked
+        // the owner out with no way back in -- both /token/regen and
+        // /pairing need the very token that was broken. Regenerating on
+        // anything invalid self-heals consoles that already hit that bug.
+        if (n == 8 && pairing_token_valid(buf)) { memcpy(g_token, buf, 8); g_token[8] = '\0'; return; }
     }
     token_generate();
 }
 
-// Mint a fresh token and persist it. Shared by first run and POST /token/regen.
-// 8 unambiguous chars (no O/0/I/1) from a high-resolution clock stir; the PS4 has
-// no /dev/urandom in homebrew, and this only needs to be unique per install.
+// Mint a fresh token and persist it. Shared by first run, an invalid stored
+// token (see token_load_or_create), and POST /token/regen.
+// 8 unambiguous chars (no O/0/I/1, see pairing.c) mixed from several jittered
+// TSC samples, process time, and an ASLR'd address, whitened through
+// splitmix64. The PS4 has no /dev/urandom in homebrew; this only needs to be
+// unpredictable enough that one console's token doesn't help guess another's,
+// not cryptographically secure (this token is a LAN convenience, not a
+// security boundary -- see token_ok's comment).
 static void token_generate(void) {
-    static const char cs[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
-    uint64_t t = sceKernelGetProcessTime() ^ (uint64_t)(uintptr_t)&g_token;
-    for (int i = 0; i < 8; i++) { g_token[i] = cs[t & 31]; t ^= t >> 7; t *= 0x9E3779B97F4A7C15ULL; t >>= 9; }
-    g_token[8] = '\0';
+    uint64_t state = sceKernelGetProcessTime() ^ (uint64_t)(uintptr_t)&g_token
+                                                ^ (uint64_t)(uintptr_t)&state;
+    for (int i = 0; i < 8; i++) {
+        state ^= sceKernelReadTsc();
+        uint64_t mixed = pairing_splitmix64(&state);
+        // Jitter before the next TSC sample (length itself drawn from this
+        // sample) so back-to-back reads can't land close enough to correlate.
+        for (volatile int j = 0, spin = (int)(mixed & 0x3F); j < spin; j++) {}
+    }
+    uint64_t seed = pairing_splitmix64(&state);
+    pairing_token_from_seed(seed, g_token);
     int fd = sceKernelOpen(TOKEN_PATH, 0x0201 | 0x0400, 0666);
     if (fd >= 0) { sceKernelWrite(fd, g_token, 8); sceKernelClose(fd); }
 }
 
 const char *httpd_token(void) { return g_token; }
 int httpd_pairing_required(void) { return g_cfgPair; }
+
+// A brief, TV-opened window during which GET /token is served without
+// already holding the token -- otherwise pairing is a chicken-and-egg
+// problem (a not-yet-paired phone or the Chrome extension has no way to
+// prove it holds a token it needs to fetch in the first place). Opened by
+// pressing Square on the Cast home screen (wired up in main.c); it closes on
+// its own, so nothing needs to close it early.
+static uint64_t g_pair_window_until = 0;   // sceKernelGetProcessTime() ticks (us); 0 = closed
+
+void httpd_pairing_window_open(int seconds) {
+    scePthreadMutexLock(&g_mtx);
+    g_pair_window_until = sceKernelGetProcessTime() + (uint64_t)(seconds > 0 ? seconds : 0) * 1000000ULL;
+    scePthreadMutexUnlock(&g_mtx);
+}
+
+// Seconds left in the open pairing window, 0 if closed. Reported in /status
+// (pair_window) so the web UI / extension can show it.
+int httpd_pairing_window_left(void) {
+    scePthreadMutexLock(&g_mtx);
+    uint64_t until = g_pair_window_until;
+    scePthreadMutexUnlock(&g_mtx);
+    uint64_t now = sceKernelGetProcessTime();
+    if (until <= now) return 0;
+    uint64_t left_s = (until - now + 999999ULL) / 1000000ULL;   // round up to whole seconds
+    return left_s > (uint64_t)INT32_MAX ? INT32_MAX : (int)left_s;
+}
 
 // 1 if this request may proceed. token comes from ?t= on the path or the
 // X-PS4Cast-Token header. Constant-shape compare; this is a LAN convenience,
@@ -185,10 +230,13 @@ static int token_ok(const char *path, const char *headers) {
 
 // Paths that must work without a token: UPnP/DLNA machinery (SSDP-discovered,
 // tokenless by protocol) and read-only diagnostics the dev pipeline polls.
+// GET /token is deliberately NOT here: it hands out the secret itself, so it
+// goes through the normal gate below like any other endpoint, with a
+// time-boxed exception (the pairing window) handled at the call site.
 static int token_exempt(const char *path) {
     static const char *const exempt[] = {
         "/description.xml", "/AVTransport.xml", "/RenderingControl.xml",
-        "/ConnectionManager.xml", "/status", "/trace", "/crashlog", "/token", 0
+        "/ConnectionManager.xml", "/status", "/trace", "/crashlog", 0
     };
     for (int i = 0; exempt[i]; i++) {
         int l = (int)strlen(exempt[i]);
@@ -818,11 +866,16 @@ static void send_all(OrbisNetId c, const char *buf, int len) {
 static void send_response(OrbisNetId c, const char *status, const char *ctype,
                           const char *body, int bodylen) {
     char hdr[256];
+    // No Access-Control-Allow-Origin: the only browser-side caller is the
+    // Chrome extension's background service worker (host_permissions, not
+    // fetch-from-a-page CORS); content.js/popup.js/overlay.js never fetch the
+    // receiver directly. A wildcard here would let ANY page a phone happens
+    // to have open read the pairing token and every /status/diagnostic field
+    // via plain JS fetch(), which is exactly what the token exists to stop.
     int h = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n\r\n",
         status, ctype, bodylen);
     send_all(c, hdr, h);
