@@ -461,6 +461,12 @@ static void player_teardown(void) {
     g_pos = 0; g_startProc = 0; g_scaledW = g_scaledH = 0;
     g_paused = 0; g_wasPaused = 0; g_seekPending = 0; g_seekRequestedAt = 0;
     g_curSec = 0; g_durSec = 0;
+    // A restart the old decode thread asked for (fMP4 seek / quality switch /
+    // live reset) dies with it. Left set, a cast arriving right after an fMP4
+    // scrub was seeked to the OLD target and then reopened again by the stale
+    // flag. Cleared only here, after the decode thread is joined, so nothing can
+    // re-raise them; a legitimate restart carries its target in its request.
+    g_liveRestartPending = 0; g_hlsResumeSec = -1.0;
     snprintf(g_status, sizeof(g_status), "stopped");
 }
 
@@ -2509,7 +2515,7 @@ static int render_threaded(Gfx *g) {
         // arrives meanwhile simply wins. Replay the ORIGINAL spec: its
         // |Referer/User-Agent/Cookie options are what the CDN checks and Type=hls
         // is what marks an extension-less URL as HLS. The target rides in the
-        // request instead of a global that play_open consumed after its stop.
+        // request; teardown clears g_hlsResumeSec so no other stream inherits it.
         double resume = g_hlsResumeSec;
         g_liveRestartPending = 0;
         g_hlsResumeSec = -1.0;
