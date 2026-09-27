@@ -1,5 +1,4 @@
 #include "native_http.h"
-#include "urlopt.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,10 +52,25 @@ static fn_abort          pAbortRequest;
 
 static int g_state; // 0 untried, 1 ready, -1 unavailable
 static int g_netPool = -1, g_ssl = -1, g_http = -1;
-static int g_template = -1, g_connection = -1;
-static volatile int g_request = -1;
-static char g_authority[320];
+static int g_template = -1;
 static char g_debug[192] = "native http idle";
+
+// One slot per aseg channel. A single shared connection/request let one
+// channel's fetch delete the connection another channel was reading from, and
+// native_http_abort() (Stop/zap) abort whichever request happened to be in
+// flight -- including the web UI's playlist import. connection/authority are
+// touched only by the slot's owner; request is published under g_reqLock so
+// an aborter never hits a deleted (or reused) request id.
+typedef struct {
+    int          connection;
+    char         authority[320];
+    volatile int request;
+    volatile int dropConn;      // aborted: the owner resets the connection before reuse
+} NhttpSlot;
+static NhttpSlot         g_slots[NHTTP_SLOTS];
+static OrbisPthreadMutex g_initLock;   // load_api(): two first fetches must not both init SceSsl/SceHttp
+static OrbisPthreadMutex g_reqLock;    // slot request/dropConn vs native_http_abort(); never held across I/O
+static int               g_locksUp;
 
 static int accept_certificate(int ssl, unsigned verify_error,
                               void *const certs[], int cert_count, void *arg) {
@@ -162,14 +176,29 @@ static int authority_of(const char *url, char *out, int cap) {
     return 0;
 }
 
-static void reset_connection(void) {
-    if (g_connection >= 0 && pDeleteConnection) pDeleteConnection(g_connection);
-    g_connection = -1;
-    g_authority[0] = '\0';
+static void reset_connection(NhttpSlot *s) {
+    if (s->connection >= 0 && pDeleteConnection) pDeleteConnection(s->connection);
+    s->connection = -1;
+    s->authority[0] = '\0';
 }
 
-static void add_option_header(int req, const char *name) {
-    const char *headers = urlopt_headers();
+// Unpublish before deleting, so native_http_abort() never sees a dead id.
+static void end_request(NhttpSlot *s, int req) {
+    scePthreadMutexLock(&g_reqLock);
+    s->request = -1;
+    scePthreadMutexUnlock(&g_reqLock);
+    pDeleteRequest(req);
+}
+
+void native_http_init(void) {
+    if (g_locksUp) return;
+    for (int i = 0; i < NHTTP_SLOTS; i++) { g_slots[i].connection = -1; g_slots[i].request = -1; }
+    scePthreadMutexInit(&g_initLock, NULL, "ps4cast_nhttp_i");
+    scePthreadMutexInit(&g_reqLock, NULL, "ps4cast_nhttp_r");
+    g_locksUp = 1;
+}
+
+static void add_option_header(int req, const char *headers, const char *name) {
     size_t name_len = strlen(name);
     for (const char *p = headers; p && *p;) {
         const char *end = strstr(p, "\r\n");
@@ -190,31 +219,51 @@ static void add_option_header(int req, const char *name) {
     }
 }
 
-int native_http_fetch(const char *url, uint8_t **body, int *len,
-                      int *status, uint64_t timeout_us) {
+int native_http_fetch(int slot, const char *url, const char *headers,
+                      uint8_t **body, int *len, int *status, uint64_t timeout_us,
+                      int max_bytes, const volatile int *abort_flag) {
+    uint64_t t0 = sceKernelGetProcessTime();
     if (!body || !len || !status || !url) return -1;
     *body = NULL; *len = 0; *status = 0;
-    if (load_api() != 0) return -2;
+    if (!g_locksUp || slot < 0 || slot >= NHTTP_SLOTS) return -1;
+    NhttpSlot *s = &g_slots[slot];
+    if (!headers) headers = "";
+    scePthreadMutexLock(&g_initLock);
+    int api = load_api();
+    scePthreadMutexUnlock(&g_initLock);
+    if (api != 0) return -2;
 
     char authority[320];
     if (authority_of(url, authority, sizeof(authority)) != 0) return -3;
-    if (g_connection < 0 || strcmp(authority, g_authority) != 0) {
-        reset_connection();
-        g_connection = pCreateConnection(g_template, url, 1);
-        if (g_connection < 0) {
-            snprintf(g_debug, sizeof(g_debug), "native conn rc=%#x", g_connection);
+    // Connection pick + request creation are local (no network I/O) and run
+    // under g_reqLock: either the aborter sees the published request and
+    // aborts it, or this sees the caller's abort flag and never starts.
+    scePthreadMutexLock(&g_reqLock);
+    if (abort_flag && *abort_flag) {
+        scePthreadMutexUnlock(&g_reqLock);
+        return -11;
+    }
+    if (s->dropConn || s->connection < 0 || strcmp(authority, s->authority) != 0) {
+        reset_connection(s);
+        s->dropConn = 0;
+        s->connection = pCreateConnection(g_template, url, 1);
+        if (s->connection < 0) {
+            snprintf(g_debug, sizeof(g_debug), "native conn rc=%#x", s->connection);
+            scePthreadMutexUnlock(&g_reqLock);
             return -4;
         }
-        snprintf(g_authority, sizeof(g_authority), "%s", authority);
+        snprintf(s->authority, sizeof(s->authority), "%s", authority);
     }
 
-    int req = pCreateRequest(g_connection, 0, url, 0);
+    int req = pCreateRequest(s->connection, 0, url, 0);
     if (req < 0) {
         snprintf(g_debug, sizeof(g_debug), "native request rc=%#x", req);
-        reset_connection();
+        reset_connection(s);
+        scePthreadMutexUnlock(&g_reqLock);
         return -5;
     }
-    g_request = req;
+    s->request = req;
+    scePthreadMutexUnlock(&g_reqLock);
 
     uint32_t timeout = timeout_us > UINT32_MAX ? UINT32_MAX : (uint32_t)timeout_us;
     if (timeout < 1000) timeout = 1000;
@@ -224,41 +273,48 @@ int native_http_fetch(const char *url, uint8_t **body, int *len,
     pSetRecvTimeout(req, timeout);
     pSetAutoRedirect(req, 1);
     pAddHeader(req, "Accept", "*/*", 1);
-    add_option_header(req, "Referer");
-    add_option_header(req, "Origin");
-    add_option_header(req, "User-Agent");
-    add_option_header(req, "Cookie");
+    add_option_header(req, headers, "Referer");
+    add_option_header(req, headers, "Origin");
+    add_option_header(req, headers, "User-Agent");
+    add_option_header(req, headers, "Cookie");
 
     int rc = pSendRequest(req, NULL, 0);
     if (rc < 0 || pGetStatus(req, status) < 0) {
         snprintf(g_debug, sizeof(g_debug), "native send rc=%#x", rc);
-        g_request = -1;
-        pDeleteRequest(req);
-        reset_connection();
+        end_request(s, req);
+        reset_connection(s);
         return -6;
     }
 
     int length_type = 0;
     size_t declared = 0;
     pGetLength(req, &length_type, &declared);
-    if (declared > NHTTP_CAP) {
+    // Probe (max_bytes > 0, resolve.c): keep only the head, and stop once
+    // timeout_us has passed in total. SceHttp's timeouts are per operation,
+    // so an endless stream that keeps delivering would otherwise hold the
+    // caller -- the main thread, which nothing here pets the watchdog for.
+    size_t limit = (max_bytes > 0 && max_bytes < NHTTP_CAP) ? (size_t)max_bytes : 0;
+    int cut = 0;
+    if (declared > NHTTP_CAP && !limit) {
         snprintf(g_debug, sizeof(g_debug), "native too large status=%d bytes=%lu",
                  *status, (unsigned long)declared);
-        g_request = -1;
-        pDeleteRequest(req);
+        end_request(s, req);
         return -7;
     }
 
     size_t cap = declared > 0 ? declared : 256 * 1024;
+    if (limit && cap > limit) cap = limit;
     if (cap < 4096) cap = 4096;
     uint8_t *buf = malloc(cap);
     if (!buf) {
-        g_request = -1;
-        pDeleteRequest(req);
+        end_request(s, req);
         return -8;
     }
     size_t used = 0;
     for (;;) {
+        if (limit && (used >= limit || sceKernelGetProcessTime() - t0 > timeout_us)) {
+            rc = 0; cut = 1; break;
+        }
         if (used == cap) {
             size_t next = cap < NHTTP_CAP / 2 ? cap * 2 : NHTTP_CAP;
             if (next <= cap) { rc = -9; break; }
@@ -268,6 +324,7 @@ int native_http_fetch(const char *url, uint8_t **body, int *len,
         }
         uint32_t want = (uint32_t)(cap - used);
         if (want > 64 * 1024) want = 64 * 1024;
+        if (limit && want > limit - used) want = (uint32_t)(limit - used);
         int got = pReadData(req, buf + used, want);
         if (got == 0) { rc = 0; break; }
         if (got < 0) { rc = got; break; }
@@ -275,13 +332,13 @@ int native_http_fetch(const char *url, uint8_t **body, int *len,
         if (used > NHTTP_CAP) { rc = -9; break; }
     }
 
-    g_request = -1;
-    pDeleteRequest(req);
+    end_request(s, req);
+    if (cut) reset_connection(s);    // rest of the body unread: never reuse
     if (rc != 0 || used == 0) {
         snprintf(g_debug, sizeof(g_debug), "native read rc=%#x status=%d bytes=%lu",
                  rc, *status, (unsigned long)used);
         free(buf);
-        reset_connection();
+        reset_connection(s);
         return -10;
     }
     snprintf(g_debug, sizeof(g_debug), "native status=%d bytes=%lu", *status,
@@ -291,10 +348,16 @@ int native_http_fetch(const char *url, uint8_t **body, int *len,
     return 0;
 }
 
-void native_http_abort(void) {
-    int req = g_request;
-    if (req >= 0 && pAbortRequest) pAbortRequest(req);
-    reset_connection();
+// Runs on the aborting thread while the owner may be inside SceHttp calls, so
+// it must not delete the owner's connection (that raced the owner's reads):
+// abort the request and let the owner drop the connection before reuse.
+void native_http_abort(int slot) {
+    if (!g_locksUp || slot < 0 || slot >= NHTTP_SLOTS) return;
+    NhttpSlot *s = &g_slots[slot];
+    scePthreadMutexLock(&g_reqLock);
+    s->dropConn = 1;
+    if (s->request >= 0 && pAbortRequest) pAbortRequest(s->request);
+    scePthreadMutexUnlock(&g_reqLock);
 }
 
 const char *native_http_debug(void) { return g_debug; }

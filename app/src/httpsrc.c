@@ -1,6 +1,7 @@
 #include "httpsrc.h"
 #include "urlopt.h"
 #include "tls.h"
+#include "hls_parse.h"
 
 extern void watchdog_kick(void);
 extern const char *watchdog_note(const char *w);   // see aseg.c: bounded slow I/O must not look like a freeze
@@ -406,6 +407,7 @@ static int request_from_ex(uint64_t pos, int *status, int64_t *total, char *loc,
             l += 9; while (*l == ' ' || *l == '\t') l++;
             const char *eol = strstr(l, "\r\n");
             int ln = eol ? (int)(eol - l) : (int)strlen(l);
+            while (ln > 0 && (l[ln - 1] == ' ' || l[ln - 1] == '\t')) ln--;
             if (ln >= loccap) ln = loccap - 1;
             memcpy(loc, l, ln); loc[ln] = '\0';
         }
@@ -613,7 +615,12 @@ int httpsrc_open(const char *url) {
         if (rrc != 0) return -3;
 
         if (status >= 300 && status < 400 && loc[0]) {
-            strncpy(cur, loc, sizeof(cur) - 1); cur[sizeof(cur) - 1] = '\0';
+            // Location may be relative ("/path", "other.mp4", "?x=1"), which
+            // parse_url rejects as "bad url": resolve it against the URL that
+            // answered (RFC 7231 7.1.2) instead of copying it verbatim.
+            char next[sizeof(cur)];
+            hlspl_resolve_ref(cur, loc, next, sizeof(next));
+            memcpy(cur, next, sizeof(cur));
             continue; // follow redirect
         }
         if (status != 200 && status != 206) {

@@ -1,32 +1,72 @@
-// aseg.h — minimal blocking HTTP(S) "fetch a whole small resource" used for the
-// HLS *audio* rendition (playlist + audio-only segments). It runs on its own
-// socket, independent of the video read-ahead reader (httpsrc), so the two HLS
-// streams (video + separate audio) don't contend for one connection.
+// aseg.h — minimal blocking HTTP(S) "fetch a whole resource into RAM" client
+// for HLS playlists and segments, page scraping (resolve.c) and the phone's
+// IPTV import. It runs on its own sockets, independent of the video read-ahead
+// reader (httpsrc).
+//
+// Fetches run on CHANNELS. Each channel has its own lock, socket/TLS,
+// keep-alive host, time budget and diagnostics, so the stream's fetches no
+// longer queue behind each other on one socket or evict each other's
+// keep-alive connection. Fetches on the SAME channel are serialized.
 #ifndef PS4CAST_ASEG_H
 #define PS4CAST_ASEG_H
 
 #include <stdint.h>
 
-// Create the fetch lock. MUST be called once from main() before any thread
+enum {
+    ASEG_CH_VIDEO = 0,   // video segments: prefetch thread, segment fetch / decode thread
+    ASEG_CH_AUDIO,       // separate audio rendition segments
+    ASEG_CH_PLAYLIST,    // stream-owned: hls_open master/variant/audio playlists,
+                         // live refresh, resolve_page
+    ASEG_CH_UI,          // web UI (IPTV/M3U import): never aborted, no stream headers
+    ASEG_CH_COUNT
+};
+
+// Create the channel locks. MUST be called once from main() before any thread
 // fetches -- a lazy init inside aseg_fetch races and can wedge the lock forever.
 void aseg_init(void);
 
-// Download an entire (small) resource into a malloc'd buffer. Caller frees *buf.
-// http + https (BearSSL), follows up to a few redirects. Returns 0, else < 0.
+// Download an entire resource into a malloc'd buffer. Caller frees *buf.
+// http + https (BearSSL, SceHttp fallback), follows up to a few redirects.
+// Returns 0, else < 0.
+int aseg_fetch_ch(int ch, const char *url, uint8_t **buf, int *len);
+// ASEG_CH_UI: sends only a default User-Agent (never the stream's urlopt
+// headers), ignores aseg_abort/aseg_resume, 15s budget, 16 MB cap.
+int aseg_fetch_ui(const char *url, uint8_t **buf, int *len);
+// Legacy entry point: ASEG_CH_PLAYLIST.
 int aseg_fetch(const char *url, uint8_t **buf, int *len);
 
-// Abort a fetch in progress (Stop / new cast) so the audio thread can't wedge.
+// Per-call options, for probing a URL that may or may not be a web page
+// (resolve.c). A zeroed AsegOpts behaves exactly like aseg_fetch_ch().
+typedef struct {
+    int       maxBytes;     // >0: keep at most this many body bytes (then drop the connection)
+    uint64_t  budgetUs;     // >0: whole-fetch budget instead of the channel's
+    // Called with the final 2xx response's Content-Type ("" if absent) before
+    // any body is read; nonzero stops there and the fetch returns ASEG_STOPPED
+    // with no body. (Not consulted on the SceHttp fallback, which cannot see
+    // headers; maxBytes and budgetUs still bound it.)
+    int     (*stopAfterHeaders)(const char *contentType);
+    char      contentType[96];   // out: Content-Type of the final response
+} AsegOpts;
+#define ASEG_STOPPED 1
+int aseg_fetch_opts(int ch, const char *url, uint8_t **buf, int *len, AsegOpts *o);
+
+// Abort fetches in progress (Stop / new cast / teardown) on the three stream
+// channels (VIDEO, AUDIO, PLAYLIST). Sticky until aseg_resume().
 void aseg_abort(void);
-// Clear a stale abort before starting a new stream (see aseg.c).
+// Clear a stale abort on the stream channels before starting a new stream (see aseg.c).
 void aseg_resume(void);
-// Tighten the per-fetch time budget around small PLAYLIST fetches (1) and restore
-// the generous SEGMENT budget (0). A single budget for both either starves slow
-// segments (continuous rebuffering) or lets a dead host block a channel switch.
+// Clear ONE stream channel's stale abort (resolve_page: see resolve.c).
+void aseg_resume_ch(int ch);
+// Tighten ASEG_CH_PLAYLIST's per-fetch time budget around small PLAYLIST
+// fetches (1) and restore the generous SEGMENT budget (0). A single budget for
+// both either starves slow segments (continuous rebuffering) or lets a dead
+// host block a channel switch. VIDEO/AUDIO always use the segment budget.
 void aseg_set_playlist_budget(int on);
 // Reset stale HTTP failure telemetry when a new HLS source starts.
 void aseg_clear_error(void);
 
-// Last HTTP status seen (0 = status line unparseable) and its first bytes.
+// Diagnostics of the last failing fetch on any stream channel (UI excluded):
+// last HTTP status seen (0 = status line unparseable) and its first bytes.
 int aseg_last_status(void);
 const char *aseg_last_line(void);
 int aseg_bad_reuse(void);   // 1 if the failing request went out on a REUSED keep-alive socket

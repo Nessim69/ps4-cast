@@ -2,7 +2,7 @@
 #   make test        build + run everything
 #   make clean
 CC ?= cc
-CFLAGS = -Wall -Wextra -Wno-unused-parameter -g -O1 -std=c11
+CFLAGS = -Wall -Wextra -Wno-unused-parameter -g -O1 -std=gnu11
 
 SRC = ../../app/src
 

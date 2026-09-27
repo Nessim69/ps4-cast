@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 void hlspl_init(HlsPlaylist *pl) { memset(pl, 0, sizeof(*pl)); pl->targetDurMs = 3000; }
 
@@ -38,38 +39,93 @@ void hlspl_prefer_plain_s3(char *url, int cap) {
     }
 }
 
-// Resolve a playlist reference against its playlist URL. Handles absolute,
-// scheme-relative, absolute-path and relative-to-directory references, and
-// stops the base at '?' so query strings never leak into resolved paths.
-void hlspl_resolve_url(const char *base, const char *ref, char *out, int cap) {
-    const char *host_end = NULL;
-    if (strncmp(base, "http://", 7) == 0)       host_end = strchr(base + 7, '/');
-    else if (strncmp(base, "https://", 8) == 0) host_end = strchr(base + 8, '/');
+// Append [s, s+n) at out[*o], truncating at cap; out stays NUL-terminated.
+static void put(char *out, int cap, int *o, const char *s, int n) {
+    if (n > cap - 1 - *o) n = cap - 1 - *o;
+    if (n > 0) { memcpy(out + *o, s, (size_t)n); *o += n; }
+    out[*o] = '\0';
+}
 
-    if (strncmp(ref, "http://", 7) == 0 || strncmp(ref, "https://", 8) == 0) {
-        snprintf(out, (size_t)cap, "%s", ref);
-        hlspl_prefer_plain_s3(out, cap);
+// RFC 3986 5.2.4 remove_dot_segments, in place on a path of n bytes that
+// starts with '/'. Returns the new length. ".." never climbs above the root.
+static int remove_dot_segments(char *p, int n) {
+    int r = 0, w = 0;                               // w <= r always: in-place is safe
+    while (r < n) {
+        int s = r + 1, e = s;                       // p[r] is a '/'
+        while (e < n && p[e] != '/') e++;
+        int len = e - s, last = (e == n);
+        if (len == 1 && p[s] == '.') {
+            if (last) p[w++] = '/';
+        } else if (len == 2 && p[s] == '.' && p[s + 1] == '.') {
+            while (w > 0 && p[w - 1] != '/') w--;
+            if (w > 0) w--;
+            if (last) p[w++] = '/';
+        } else {
+            memmove(p + w, p + r, (size_t)(1 + len));
+            w += 1 + len;
+        }
+        r = e;
+    }
+    if (w == 0) p[w++] = '/';
+    return w;
+}
+
+// RFC 3986 5.2 reference resolution against an http(s) base: absolute,
+// scheme-relative, absolute-path, relative-path ("./", "../" merged with the
+// base directory) and query-only references. HTTP redirects need this too:
+// Location may be relative (RFC 7231 7.1.2), and both HTTP clients only take
+// absolute URLs. The fragment is dropped -- it is never sent to a server, and
+// a '#' left in a request path 404s on strict origins. The base's own query
+// never leaks into a resolved path.
+void hlspl_resolve_ref(const char *base, const char *ref, char *out, int cap) {
+    if (!out || cap <= 0) return;
+    out[0] = '\0';
+    if (!base) base = "";
+    if (!ref) ref = "";
+    int rlen = (int)strcspn(ref, "#");
+    int rpath = (int)strcspn(ref, "?#");          // ref path ends at its query
+    if (strncasecmp(ref, "http://", 7) == 0 || strncasecmp(ref, "https://", 8) == 0) {
+        snprintf(out, (size_t)cap, "%.*s", rlen, ref);
+        for (int i = 0; i < 5 && out[i] && out[i] != ':'; i++)
+            if (out[i] >= 'A' && out[i] <= 'Z') out[i] += 32;   // parse_url wants lowercase
         return;
     }
+    const char *sch = strstr(base, "://");
+    if (!sch) { snprintf(out, (size_t)cap, "%.*s", rlen, ref); return; }   // no usable base
     if (ref[0] == '/' && ref[1] == '/') {          // scheme-relative
-        const char *colon = strchr(base, ':');
-        snprintf(out, (size_t)cap, "%.*s:%s", colon ? (int)(colon - base) : 5, base, ref);
-        hlspl_prefer_plain_s3(out, cap);
+        snprintf(out, (size_t)cap, "%.*s:%.*s", (int)(sch - base), base, rlen, ref);
         return;
     }
-    if (ref[0] == '/') {
-        int hostlen = host_end ? (int)(host_end - base) : (int)strlen(base);
-        snprintf(out, (size_t)cap, "%.*s%s", hostlen, base, ref);
-        hlspl_prefer_plain_s3(out, cap);
+    const char *auth = sch + 3;
+    const char *bend = base + strcspn(base, "#");
+    const char *authEnd = auth + strcspn(auth, "/?#");
+    const char *bpathEnd = authEnd + strcspn(authEnd, "?#");
+    int o = 0;
+    put(out, cap, &o, base, (int)(authEnd - base));
+    int pathStart = o;
+    if (rlen == 0 || ref[0] == '?') {              // same path; new (or kept) query
+        if (bpathEnd > authEnd) put(out, cap, &o, authEnd, (int)(bpathEnd - authEnd));
+        else put(out, cap, &o, "/", 1);
+        if (rlen == 0) put(out, cap, &o, bpathEnd, (int)(bend - bpathEnd));
+        else put(out, cap, &o, ref, rlen);
         return;
     }
-    const char *last = host_end;
-    for (const char *s = host_end; s && *s; s++) {
-        if (*s == '/') last = s;
-        if (*s == '?') break;
+    if (ref[0] != '/') {                           // merge with the base directory
+        const char *slash = NULL;
+        for (const char *s = authEnd; s < bpathEnd; s++) if (*s == '/') slash = s;
+        if (slash) put(out, cap, &o, authEnd, (int)(slash + 1 - authEnd));
+        else put(out, cap, &o, "/", 1);
     }
-    int dirlen = last ? (int)(last - base + 1) : (int)strlen(base);
-    snprintf(out, (size_t)cap, "%.*s%s", dirlen, base, ref);
+    put(out, cap, &o, ref, rpath);
+    if (o > pathStart) o = pathStart + remove_dot_segments(out + pathStart, o - pathStart);
+    out[o] = '\0';
+    put(out, cap, &o, ref + rpath, rlen - rpath);
+}
+
+// Resolve a playlist reference against its playlist URL (see hlspl_resolve_ref),
+// then apply the plain-HTTP S3 rewrite to the result.
+void hlspl_resolve_url(const char *base, const char *ref, char *out, int cap) {
+    hlspl_resolve_ref(base, ref, out, cap);
     hlspl_prefer_plain_s3(out, cap);
 }
 

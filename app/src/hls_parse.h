@@ -33,6 +33,10 @@ void hlspl_init(HlsPlaylist *pl);                       // zero, no allocation
 void hlspl_free(HlsPlaylist *pl);                       // release segment strings
 
 void hlspl_prefer_plain_s3(char *url, int cap);
+// RFC 3986 reference resolution (absolute, "//host", "/path", "rel", "../",
+// "?query"); drops the fragment. Also used for relative HTTP Location headers.
+void hlspl_resolve_ref(const char *base, const char *ref, char *out, int cap);
+// hlspl_resolve_ref + the plain-HTTP S3 rewrite, for playlist URIs.
 void hlspl_resolve_url(const char *base, const char *ref, char *out, int cap);
 int  hlspl_codec_from_str(const char *codecs);          // CODECS="avc1.x,mp4a.y"
 

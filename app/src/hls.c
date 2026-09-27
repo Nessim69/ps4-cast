@@ -376,7 +376,7 @@ static void *prefetch_main(void *arg) {
 
         uint8_t *buf = NULL; int len = 0;
         uint64_t t0 = sceKernelGetProcessTime();
-        int rc = aseg_fetch(url, &buf, &len);
+        int rc = aseg_fetch_ch(ASEG_CH_VIDEO, url, &buf, &len);
         int ms = (int)((sceKernelGetProcessTime() - t0) / 1000);
         short_url(url, g_vLastUrl, sizeof(g_vLastUrl));
         g_vLastRc = rc; g_vLastMs = ms; g_vLastBytes = len;
@@ -638,7 +638,7 @@ static void *apref_main(void *arg) {
 
         uint8_t *buf = NULL; int len = 0;
         uint64_t t0 = sceKernelGetProcessTime();
-        int rc = aseg_fetch(url, &buf, &len);
+        int rc = aseg_fetch_ch(ASEG_CH_AUDIO, url, &buf, &len);
         int ms = (int)((sceKernelGetProcessTime() - t0) / 1000);
         short_url(url, g_aLastUrl, sizeof(g_aLastUrl));
         g_aLastRc = rc; g_aLastMs = ms; g_aLastBytes = len;
@@ -692,7 +692,7 @@ static int open_mem_segment(const char *u, int seg) {
     trace_mark("hls mem_fetch2 begin seg=%d idx=%d/%d url=%s", seg, g_segIdx, g_segCount, g_vLastUrl);
     uint64_t t0 = sceKernelGetProcessTime();
 
-    int rc = aseg_fetch(u, &buf, &len);
+    int rc = aseg_fetch_ch(ASEG_CH_VIDEO, u, &buf, &len);
     trace_mark("hls mem_fetch2 fetched seg=%d rc=%d len=%d", seg, rc, len);
 
     int ms = (int)((sceKernelGetProcessTime() - t0) / 1000);
@@ -775,7 +775,7 @@ static char *fetch_all(const char *url, int *outlen) {
     char fetchUrl[2048];
     snprintf(fetchUrl, sizeof(fetchUrl), "%s", url);
     hlspl_prefer_plain_s3(fetchUrl, sizeof(fetchUrl));
-    int frc = aseg_fetch(fetchUrl, &raw, &len);
+    int frc = aseg_fetch_ch(ASEG_CH_PLAYLIST, fetchUrl, &raw, &len);
     g_lastFetchRc = frc; g_lastFetchLen = len;
     if (frc != 0 || !raw || len <= 0 || len >= PLAYLIST_CAP) {
         if (raw) free(raw);
@@ -1346,7 +1346,7 @@ static int ensure_audio_buf(void) {
 
     uint8_t *buf = NULL; int len = 0;
     uint64_t t0 = sceKernelGetProcessTime();
-    int rc = aseg_fetch(u, &buf, &len);
+    int rc = aseg_fetch_ch(ASEG_CH_AUDIO, u, &buf, &len);
     int ms = (int)((sceKernelGetProcessTime() - t0) / 1000);
     short_url(u, g_aLastUrl, sizeof(g_aLastUrl));
     g_aLastRc = rc; g_aLastMs = ms; g_aLastBytes = len;

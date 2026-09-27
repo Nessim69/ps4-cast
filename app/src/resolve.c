@@ -2,10 +2,15 @@
 #include "aseg.h"
 #include "urlopt.h"
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 static char g_dbg[128] = "";
+
+// A real page is small; anything bigger is scanned from its head only.
+#define RESOLVE_PAGE_CAP       (2 * 1024 * 1024)
+#define RESOLVE_PAGE_BUDGET_US (8ULL * 1000 * 1000)
 const char *resolve_debug(void) { return g_dbg; }
 
 // Extensions we can hand straight to the player -- no point fetching the page.
@@ -21,12 +26,39 @@ static const char *path_end(const char *url) {
 
 int resolve_is_page(const char *url) {
     if (!url || strncmp(url, "http", 4) != 0) return 0;
+    // A cast that declares its kind (Type=file / Type=hls) is media on the
+    // sender's word: never download it as a page. player_ff.c calls this right
+    // after urlopt_apply(requested) -- before resolve_page's own urlopt_apply
+    // resets it -- so urlopt_kind() is still the request's.
+    const char *kind = urlopt_kind();
+    if (strcasecmp(kind, "file") == 0 || strcasecmp(kind, "hls") == 0) return 0;
     const char *end = path_end(url);
     for (int i = 0; MEDIA_EXT[i]; i++) {
         size_t l = strlen(MEDIA_EXT[i]);
         if ((size_t)(end - url) >= l && strncasecmp(end - l, MEDIA_EXT[i], l) == 0) return 0;
     }
     return 1;   // no media extension -> treat as a page worth scraping
+}
+
+// Content types the player opens directly. A URL answering with one is not a
+// page, whatever its path looks like: DLNA servers, Xtream-style IPTV links
+// (/live/user/pass/123, an endless MPEG-TS stream) and signed CDN URLs all
+// lack a media extension. Compared case-insensitively, parameters ignored.
+static int is_media_type(const char *ct) {
+    static const char *prefix[] = { "video/", "audio/", 0 };   // incl. video/mp2t, audio/(x-)mpegurl
+    static const char *exact[] = { "application/vnd.apple.mpegurl", "application/x-mpegurl",
+                                   "application/dash+xml", "application/octet-stream",
+                                   "binary/octet-stream", 0 };
+    if (!ct) return 0;
+    while (*ct == ' ' || *ct == '\t') ct++;
+    size_t n = strcspn(ct, "; \t");
+    for (int i = 0; prefix[i]; i++) {
+        size_t l = strlen(prefix[i]);
+        if (n > l && strncasecmp(ct, prefix[i], l) == 0) return 1;
+    }
+    for (int i = 0; exact[i]; i++)
+        if (n == strlen(exact[i]) && strncasecmp(ct, exact[i], n) == 0) return 1;
+    return 0;
 }
 
 // Copy url origin ("https://host") into out.
@@ -138,9 +170,28 @@ int resolve_page(const char *pageUrl, char *out, int cap) {
     char clean[1400];
     urlopt_apply(withHdrs, clean, sizeof(clean));
 
+    // Probe, don't download. This used to read the whole body (up to 16 MB, on
+    // the 25s segment budget) before playback could even start, and a URL with
+    // no media extension is often not a page at all (see is_media_type): stop
+    // at the headers when the server says media, and bound a real page.
+    AsegOpts o;
+    memset(&o, 0, sizeof(o));
+    o.maxBytes = RESOLVE_PAGE_CAP;
+    o.budgetUs = RESOLVE_PAGE_BUDGET_US;
+    o.stopAfterHeaders = is_media_type;
+    // This runs BEFORE player_stop(), so a previous Stop's sticky abort is still
+    // up and would fail the probe at once (rc=-9). Clear PLAYLIST's only: its
+    // teardowns are all driven from this same main thread, never concurrently
+    // with this call, whereas VIDEO/AUDIO can be mid-teardown on the decode
+    // thread (an ABR switch's prefetch_stop).
+    aseg_resume_ch(ASEG_CH_PLAYLIST);
     uint8_t *body = NULL; int len = 0;
-    aseg_set_playlist_budget(0);            // a page is bigger than a playlist
-    int rc = aseg_fetch(clean, &body, &len);
+    int rc = aseg_fetch_opts(ASEG_CH_PLAYLIST, clean, &body, &len, &o);
+    if (rc == ASEG_STOPPED) {
+        // Not a page: the caller plays the original URL unchanged.
+        snprintf(g_dbg, sizeof(g_dbg), "resolve: not a page (%.64s)", o.contentType);
+        return 0;
+    }
     if (rc != 0 || !body || len <= 0) {
         snprintf(g_dbg, sizeof(g_dbg), "resolve: fetch failed rc=%d", rc);
         if (body) free(body);
