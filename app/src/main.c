@@ -895,6 +895,7 @@ int main(void) {
         gfx_present(&g, frameID++);
     }
 #else
+    player_init();    // before httpd: the pipeline guard + aseg cancel check must exist before any caller thread
     int net_ok = (net_init() == 0);
     char ip[32] = "0.0.0.0";
     if (net_ok && net_get_ip(ip, sizeof(ip)) != 0)
@@ -1413,6 +1414,7 @@ int main(void) {
         // darken pass after pass. Draw nothing: gfx then keeps the on-screen
         // surface up, exactly the still frame the blocking open used to show.
         int frozen = player_opening() && everDrew;
+        int drewVideo = 0;                // this frame repainted the video picture
 
         if (player_started()) {
             // Only poke the system "video playing" notifier with a VALID user —
@@ -1420,6 +1422,7 @@ int main(void) {
             // VideoPlayingChecker into its Invalid-User-Id crash.
             if (userOk) sceSystemServiceTickVideoPlayback();
             int drew = player_render(&g);   // always pump frames while started
+            drewVideo = drew;
             if (drew) {
                 everDrew = 1;
                 unsigned shown = player_present_generation();
@@ -1492,6 +1495,13 @@ int main(void) {
         // Auto-reconnect banner for a dropped live stream.
         if (reconnecting) {
             int pw = 580, ph = 160, px = (g.width - pw) / 2, py = (g.height - ph) / 2;
+            // Over a picture repainted this frame (the EOF hold before the first
+            // attempt) the translucent banner is fine. Without one -- between
+            // attempts, or while one opens -- a banner lands on whichever scanout
+            // surface comes next, each holding an older frame: the picture
+            // cycled through the last 2-3 frames and the panel darkened pass
+            // after pass. Give that state a solid backdrop of its own instead.
+            if (!drewVideo) gfx_vgrad(&g, 0, 0, g.width, g.height, BG_TOP, BG_BOT);
             panel(&g, px, py, pw, ph, 22, INK, 225);
             char b[80]; snprintf(b, sizeof(b), "Reconnecting...  (%d)", reconnects);
             ctext(&g, py + 44, b, 4, TXT, 0);

@@ -291,10 +291,47 @@ static volatile unsigned g_opRunSeq = 0;       // seq the worker is executing (0
 // True on the opener while the request it executes has been superseded. Each
 // blocking open stage re-checks this: the network aborts alone are not enough,
 // because httpsrc_open()/hls_open() clear a raised abort as they (re)start.
+// aseg's resumes consult it too (aseg_set_cancel_check) so they re-raise such
+// an abort instead of erasing it; from any other thread it is 0 unless a
+// superseded open is executing, when failing that open's fetches is right.
 static int open_cancelled(void) {
     unsigned run = g_opRunSeq;
     return run != 0 && run != g_opLatest;
 }
+
+// ---- pipeline guard ------------------------------------------------------------
+// The opener holds g_pipeMtx for each whole request (teardown + open). Callers
+// on OTHER threads -- the HTTP server, the upload worker -- that reach into the
+// pipeline's sources (aborting them, locking their mutexes for diagnostics) or
+// arm a seek/pause the decode thread will act on take it with a TRYLOCK and
+// treat "busy" exactly like player_opening(). That closes the gap between
+// checking player_opening() and acting on it: a request queued in between let
+// the worker tear down under the caller -- destroying the mutexes
+// hls_audio_abort()/hls_debug() lock, or leaving a seek/pause armed for the NEW
+// stream. Never a blocking lock there: the HTTP thread must not stall behind a
+// multi-second open. The MAIN thread instead waits for it: main is the only
+// submitter, so the worker is idle whenever main sees !player_opening() and the
+// only possible holder is one of those brief calls -- and a Cross/scrub from the
+// pad must not be dropped just because /status was being served. Recursive, so
+// main re-entering while it runs a request itself (synchronous fallback,
+// shutdown) cannot self-deadlock. Created by player_init() before any thread.
+static OrbisPthreadMutex g_pipeMtx;
+static int               g_pipeUp = 0;
+static OrbisPthread      g_pipeMainTh;
+static int  pipe_enter(void) {
+    if (!g_pipeUp) return 1;
+    if (scePthreadSelf() == g_pipeMainTh) {
+        // Never wait on an open: the worker holds the guard only while a request
+        // is busy (it releases it before busy drops), so this skip is the only
+        // case where main could otherwise block on it.
+        if (__atomic_load_n(&g_opBusy, __ATOMIC_ACQUIRE)) return 0;
+        scePthreadMutexLock(&g_pipeMtx);
+        return 1;
+    }
+    return scePthreadMutexTrylock(&g_pipeMtx) == 0;
+}
+static void pipe_leave(void) { if (g_pipeUp) scePthreadMutexUnlock(&g_pipeMtx); }
+static void pipe_lock(void)  { if (g_pipeUp) scePthreadMutexLock(&g_pipeMtx); }
 // Brackets each blocking open stage with the network aborts that can cut it
 // short when a newer request supersedes it (see "opener worker" below).
 #define OP_ABORT_HTTPSRC 1
@@ -382,7 +419,21 @@ static void player_set_error(const char *code, const char *message) {
     snprintf(g_errorMessage, sizeof(g_errorMessage), "%s", message ? message : "Playback failed.");
     snprintf(g_status, sizeof(g_status), "%s", g_errorMessage);
 }
-int player_init(void) { return 0; } // nothing global to set up for ffmpeg
+// Main thread, once, before the HTTP server or any player thread exists.
+int player_init(void) {
+    if (!g_pipeUp) {
+        OrbisPthreadMutexattr ma; OrbisPthreadMutexattr *pma = NULL;
+        if (scePthreadMutexattrInit(&ma) == 0) {
+            if (scePthreadMutexattrSettype(&ma, 2 /* recursive */) == 0) pma = &ma;
+            else scePthreadMutexattrDestroy(&ma);
+        }
+        g_pipeMainTh = scePthreadSelf();
+        if (scePthreadMutexInit(&g_pipeMtx, pma, "ps4cast_pipe") == 0) g_pipeUp = 1;
+        if (pma) scePthreadMutexattrDestroy(&ma);
+    }
+    aseg_set_cancel_check(open_cancelled);
+    return 0;
+}
 
 // Tear the whole pipeline down. Runs ONLY where nothing else can touch it: on
 // the opener worker (every stop/open request), or synchronously on the main
@@ -1075,7 +1126,9 @@ static void *opener_main(void *arg) {
         op_publish();
         scePthreadMutexUnlock(&g_opMtx);
         watchdog_open_job(1);
+        pipe_lock();      // waits out a brief guarded call from another thread
         int rc = open_job_run(&g_opJob);
+        pipe_leave();
         watchdog_open_job(0);
         scePthreadMutexLock(&g_opMtx);
         open_job_done(&g_opJob, rc);
@@ -1132,7 +1185,9 @@ static void open_submit(int kind, const char *spec, int headstart, double resume
     if (openq_take(&g_oq, &g_opJob)) {
         g_opRunSeq = g_opJob.seq;
         op_publish();
+        pipe_lock();
         int rc = open_job_run(&g_opJob);
+        pipe_leave();
         open_job_done(&g_opJob, rc);
     }
 }
@@ -1146,7 +1201,7 @@ void player_play_async(const char *spec) {
 }
 
 void player_stop(void) {
-    if (g_opState == 0) { player_teardown(); return; }   // nothing ever opened off-thread
+    if (g_opState == 0) { pipe_lock(); player_teardown(); pipe_leave(); return; }   // nothing ever opened off-thread
     open_submit(OPENQ_STOP, "", 0, -1.0);
 }
 
@@ -1181,7 +1236,9 @@ int player_shutdown(void) {
         scePthreadJoin(g_opThread, NULL);
         g_opState = -1;   // any later call runs synchronously on this thread
     }
+    pipe_lock();
     player_teardown();
+    pipe_leave();
     return 0;
 }
 
@@ -1194,10 +1251,14 @@ int player_is_local(void)  { return g_isLocal; }
 
 void player_pause(int paused) {
     // Nothing to pause mid-open, and a pause landing after the worker's teardown
-    // would start the NEW stream paused behind a Connecting screen.
-    if (player_opening()) return;
-    g_paused = paused ? 1 : 0;
-    audio_pause(g_paused || g_rebuffering);
+    // would start the NEW stream paused behind a Connecting screen (guarded: see
+    // "pipeline guard").
+    if (!pipe_enter()) return;
+    if (!player_opening()) {
+        g_paused = paused ? 1 : 0;
+        audio_pause(g_paused || g_rebuffering);
+    }
+    pipe_leave();
 }
 int  player_is_paused(void)   { return !player_opening() && g_paused; }
 int  player_can_seek(void)    {
@@ -1215,12 +1276,17 @@ void player_seek_relative(double delta) {
 }
 
 void player_seek(double seconds) {
-    if (!player_can_seek()) return;
-    if (seconds < 0) seconds = 0;
-    if (g_durSec > 0 && seconds > g_durSec) seconds = g_durSec;
-    g_seekTo = seconds;
-    g_seekRequestedAt = sceKernelGetProcessTime();
-    g_seekPending = 1;
+    // Guarded: a seek armed after the worker's teardown reset g_seekPending would
+    // be applied to the NEXT stream (see "pipeline guard").
+    if (!pipe_enter()) return;
+    if (player_can_seek()) {
+        if (seconds < 0) seconds = 0;
+        if (g_durSec > 0 && seconds > g_durSec) seconds = g_durSec;
+        g_seekTo = seconds;
+        g_seekRequestedAt = sceKernelGetProcessTime();
+        g_seekPending = 1;
+    }
+    pipe_leave();
 }
 
 static int seek_debounce_elapsed(void) {
@@ -1233,10 +1299,14 @@ void player_interrupt(void) {
     // Mid-request the worker owns these sources: its teardown raises its own
     // aborts and a superseding request raises the ones an open needs. Racing it
     // here (hls_audio_abort joins a thread hls_close may be joining) only hurts.
-    if (player_opening()) return;
-    if (!g_started && !g_active) return;
-    if (!g_isLocal) httpsrc_abort();
-    hls_audio_abort();
+    // The guard also serializes the HTTP thread and the upload worker, which
+    // both call this and must not run hls_audio_abort() concurrently either.
+    if (!pipe_enter()) return;
+    if (!player_opening() && (g_started || g_active)) {
+        if (!g_isLocal) httpsrc_abort();
+        hls_audio_abort();
+    }
+    pipe_leave();
 }
 
 // True when we've started playing but no fresh frame is available — i.e. the
@@ -1252,9 +1322,14 @@ int player_buffer_pct(void) {
     // that, otherwise live channels always showed buffer 0%.
     // Mid-request hls_buffer_pct() would lock a prefetch mutex the worker may be
     // destroying (hls_close); there is no buffer to report yet anyway.
-    if (player_opening()) return 0;
-    if (g_threaded) { int p = g_fqCount * 100 / FQ_SLOTS; return p > 100 ? 100 : p; }
-    return g_isLocal ? 100 : (g_isHls ? hls_buffer_pct() : httpsrc_fill_pct());
+    if (!pipe_enter()) return 0;
+    int pct = 0;
+    if (!player_opening()) {
+        if (g_threaded) { pct = g_fqCount * 100 / FQ_SLOTS; if (pct > 100) pct = 100; }
+        else pct = g_isLocal ? 100 : (g_isHls ? hls_buffer_pct() : httpsrc_fill_pct());
+    }
+    pipe_leave();
+    return pct;
 }
 // Total bytes pulled from the network on the ACTIVE source (HLS or direct HTTP),
 // so the on-screen network-speed stat works on every stream type.
@@ -1417,13 +1492,15 @@ void player_stats(PlayerStats *s) {
 }
 
 void player_debug(char *out, int len) {
-    double ahead = (!g_isLocal && g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 0;
+    // Mid-request the worker is closing/opening the sources, and hls_debug() /
+    // httpsrc_debug() lock mutexes it may be destroying: name its stage instead
+    // (guarded: see "pipeline guard").
+    int held = pipe_enter();
+    char opening[48] = "";
+    if (!held || player_opening()) snprintf(opening, sizeof(opening), "opening at %s", (const char *)g_playStage);
+    double ahead = (!opening[0] && !g_isLocal && g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 0;
     uint64_t flipAvg = 0, flipMax = 0, flipWaitAvg = 0, flipWaitMax = 0;
     gfx_present_stats(&flipAvg, &flipMax, &flipWaitAvg, &flipWaitMax);
-    // Mid-request the worker is closing/opening the sources, and hls_debug() /
-    // httpsrc_debug() lock mutexes it may be destroying: name its stage instead.
-    char opening[48] = "";
-    if (player_opening()) snprintf(opening, sizeof(opening), "opening at %s", (const char *)g_playStage);
     uint64_t fbReused = 0, fbReshown = 0;   // presents that needed no drawing (see gfx.h)
     gfx_reuse_stats(&fbReused, &fbReshown);
     snprintf(out, len,
@@ -1449,6 +1526,7 @@ void player_debug(char *out, int len) {
              (!g_active && g_errorCode[0] && g_sourceErrorDiag[0]) ? g_sourceErrorDiag :
                  (g_isLocal ? "local file" : (g_isHls ? hls_debug() : httpsrc_debug())),
              g_swDiag, g_stopDiag);
+    if (held) pipe_leave();
 }
 
 // Convert+scale a decoded frame into g_scaled (BGRA), fitting the display with
