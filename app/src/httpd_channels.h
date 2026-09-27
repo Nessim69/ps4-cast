@@ -11,6 +11,11 @@
 void httpd_channels_init(void);
 void httpd_channels_save(void);   // persist current list (also used by DLNA paths)
 
+// Bumped on every change to the channel store (playlist load, init-time
+// restore, add/edit/del, favourites, current/tuned channel), so /status can
+// hand the phone a "chan_ver" and it only re-fetches /channels when it moves.
+int httpd_channels_version(void);
+
 // Endpoint router for GET /channels and POST /channel/{add,edit,del,fav}.
 // Returns 1 if the request was handled. send_response is httpd.c's writer.
 typedef void (*HttpdSendFn)(OrbisNetId c, const char *status, const char *ctype,

@@ -15,10 +15,23 @@
 // truncated them (the parse loop just stopped), losing most of the list.
 #define MAX_CHAN      2000
 
+// Worst-case serialized bytes for one channel's JSON: json_str can double a
+// field's length escaping '"' and '\', plus its wrapping quotes; the rest is
+// slack for keys, braces, the index/favourite fields and the separating
+// comma. Used to size exact-fit response buffers so a started entry can
+// never be cut short.
+#define CHAN_JSON_ENTRY_MAX   (2*CHAN_NAME_MAX + 2*CHAN_GRP_MAX + 2*1000 + 48)
+// Same, for chans_to_json()'s smaller {n,g,u} entries (no index/favourite).
+#define CHAN_JSON_PL_ENTRY_MAX (2*90 + 2*44 + 2*1000 + 24)
+
 static char g_chanName[MAX_CHAN][CHAN_NAME_MAX];
 static char g_chanGroup[MAX_CHAN][CHAN_GRP_MAX];
 static char g_chanUrl[MAX_CHAN][URL_MAX];
 static unsigned char g_chanFav[MAX_CHAN];
+// Bumped (under g_mtx) on every change the phone/browser needs to notice:
+// playlist load, init-time restore, add/edit/del, favourites, and the
+// tuned/current channel (it drives the LIVE marker in the channel list).
+static int g_chanVer = 0;
 static char g_filtLetter = 0;      // 0 = no letter filter
 static int  g_filtFav = 0;         // 1 = favourites only
 static int  g_filt[MAX_CHAN];
@@ -31,6 +44,13 @@ static OrbisPthreadMutex g_mtx;
 static void (*g_pushCb)(const char *url) = NULL;
 
 void httpd_channels_set_push_cb(void (*cb)(const char *url)) { g_pushCb = cb; }
+
+int httpd_channels_version(void) {
+    scePthreadMutexLock(&g_mtx);
+    int v = g_chanVer;
+    scePthreadMutexUnlock(&g_mtx);
+    return v;
+}
 
 #define CHAN_PATH "/data/ps4cast_channels.txt"
 
@@ -98,6 +118,7 @@ static void chan_load_file(void) {
         g_chanFav[g_chanN] = (unsigned char)fav;
         g_chanN++;
     }
+    g_chanVer++;   // restored from /data at init (single-threaded, no lock yet)
 }
 static void chan_add(const char *name, const char *group, const char *url) {
     if (g_chanN >= MAX_CHAN) return;
@@ -126,6 +147,7 @@ static void playlist_store(const char *text, const char *srcUrl) {
         strstr(text, "#EXT-X-MEDIA-SEQUENCE") || strstr(text, "#EXT-X-PLAYLIST-TYPE")) {
         char nm[CHAN_NAME_MAX]; name_from_url(srcUrl, nm, sizeof(nm));
         chan_add(nm, "", srcUrl);
+        g_chanVer++;
         return;
     }
     char pend[256]; pend[0] = '\0';
@@ -168,13 +190,14 @@ static void playlist_store(const char *text, const char *srcUrl) {
         if (!nl) break;
         p = nl + 1;
     }
+    g_chanVer++;
 }
 
 // Serialize the channel store to JSON [{"n":..,"u":..},..] (caller holds g_mtx).
 static int chans_to_json(char *out, int cap) {
     int o = 0;
     out[o++] = '[';
-    for (int i = 0; i < g_chanN && o < cap - 2400; i++) {
+    for (int i = 0; i < g_chanN && o < cap - CHAN_JSON_PL_ENTRY_MAX; i++) {
         if (i) out[o++] = ',';
         out[o++] = '{';
         o += snprintf(out + o, cap - o, "\"n\":"); json_str(out, cap, &o, g_chanName[i], 90);
@@ -219,6 +242,7 @@ void httpd_chan_toggle_fav(int i) {
     scePthreadMutexLock(&g_mtx);
     g_chanFav[i] = g_chanFav[i] ? 0 : 1;
     filter_rebuild();
+    g_chanVer++;
     scePthreadMutexUnlock(&g_mtx);
     httpd_channels_save();
 }
@@ -317,6 +341,7 @@ void httpd_chan_set_current(int i) {
     scePthreadMutexLock(&g_mtx);
     if (i >= -1 && i < g_chanN) {
         g_chanCur = i;
+        g_chanVer++;   // moves the LIVE marker in the phone's channel list
         if (i >= 0 && g_pushCb) g_pushCb(g_chanUrl[i]);
     }
     scePthreadMutexUnlock(&g_mtx);
@@ -328,22 +353,34 @@ int httpd_channels_handle(OrbisNetId c, const char *method, const char *path,
     // GET /channels -> [{i,n,g,u,f},...] so the phone/browser can manage the
     // list, which is far easier than editing it with a gamepad.
     if (strcmp(method, "GET") == 0 && strcmp(path, "/channels") == 0) {
-        static char j[96 * 1024];
         scePthreadMutexLock(&g_mtx);
+        // Exact-fit buffer for the worst case (every field maxed out and
+        // fully escaped): a fixed-size buffer silently truncated large
+        // playlists to whatever fraction fit, so allocate for all of them.
+        int cap = 2 + g_chanN * CHAN_JSON_ENTRY_MAX + 8;
+        char *j = malloc((size_t)cap);
+        if (!j) {
+            scePthreadMutexUnlock(&g_mtx);
+            const char *m = "out of memory";
+            send_response(c, "503 Service Unavailable", "text/plain", m, (int)strlen(m));
+            return 1;
+        }
         int o = 0; j[o++] = '[';
-        for (int i = 0; i < g_chanN && o < (int)sizeof(j) - 1600; i++) {
+        for (int i = 0; i < g_chanN; i++) {
             if (i) j[o++] = ',';
-            o += snprintf(j + o, sizeof(j) - o, "{\"i\":%d,\"n\":", i);
-            json_str(j, sizeof(j), &o, g_chanName[i], CHAN_NAME_MAX);
-            o += snprintf(j + o, sizeof(j) - o, ",\"g\":");
-            json_str(j, sizeof(j), &o, g_chanGroup[i], CHAN_GRP_MAX);
-            o += snprintf(j + o, sizeof(j) - o, ",\"u\":");
-            json_str(j, sizeof(j), &o, g_chanUrl[i], 1000);
-            o += snprintf(j + o, sizeof(j) - o, ",\"f\":%d}", g_chanFav[i] ? 1 : 0);
+            o += snprintf(j + o, cap - o, "{\"i\":%d,\"n\":", i);
+            json_str(j, cap, &o, g_chanName[i], CHAN_NAME_MAX);
+            o += snprintf(j + o, cap - o, ",\"g\":");
+            json_str(j, cap, &o, g_chanGroup[i], CHAN_GRP_MAX);
+            o += snprintf(j + o, cap - o, ",\"u\":");
+            json_str(j, cap, &o, g_chanUrl[i], 1000);
+            o += snprintf(j + o, cap - o, ",\"f\":%d}", g_chanFav[i] ? 1 : 0);
         }
         j[o++] = ']';
         scePthreadMutexUnlock(&g_mtx);
-        send_response(c, "200 OK", "application/json", j, o); return 1;
+        send_response(c, "200 OK", "application/json", j, o);
+        free(j);
+        return 1;
     }
     // POST /channel/add   body: name\tgroup\turl
     if (strcmp(method, "POST") == 0 && strcmp(path, "/channel/add") == 0) {
@@ -355,6 +392,7 @@ int httpd_channels_handle(OrbisNetId c, const char *method, const char *path,
         *t1 = 0; *t2 = 0;
         scePthreadMutexLock(&g_mtx);
         chan_add(b, t1 + 1, t2 + 1);
+        g_chanVer++;
         scePthreadMutexUnlock(&g_mtx);
         httpd_channels_save();
         send_response(c, "200 OK", "text/plain", "ok", 2); return 1;
@@ -374,6 +412,7 @@ int httpd_channels_handle(OrbisNetId c, const char *method, const char *path,
                 strncpy(g_chanName[idx], t1 + 1, CHAN_NAME_MAX - 1); g_chanName[idx][CHAN_NAME_MAX-1] = 0;
                 strncpy(g_chanGroup[idx], t2 + 1, CHAN_GRP_MAX - 1); g_chanGroup[idx][CHAN_GRP_MAX-1] = 0;
                 strncpy(g_chanUrl[idx], t3 + 1, URL_MAX - 1);        g_chanUrl[idx][URL_MAX-1] = 0;
+                g_chanVer++;
             }
             filter_rebuild();
             scePthreadMutexUnlock(&g_mtx);
@@ -386,7 +425,7 @@ int httpd_channels_handle(OrbisNetId c, const char *method, const char *path,
     // POST /channel/del   body: index   (empty body = clear the whole list)
     if (strcmp(method, "POST") == 0 && strcmp(path, "/channel/del") == 0) {
         scePthreadMutexLock(&g_mtx);
-        if (!body[0] || body[0] == '\n') { g_chanN = 0; g_chanCur = -1; }
+        if (!body[0] || body[0] == '\n') { g_chanN = 0; g_chanCur = -1; g_chanVer++; }
         else {
             int idx = atoi(body);
             if (idx >= 0 && idx < g_chanN) {
@@ -399,6 +438,7 @@ int httpd_channels_handle(OrbisNetId c, const char *method, const char *path,
                 g_chanN--;
                 if (g_chanCur == idx) g_chanCur = -1;
                 else if (g_chanCur > idx) g_chanCur--;
+                g_chanVer++;
             }
         }
         filter_rebuild();
@@ -429,6 +469,7 @@ int httpd_channels_tune(int i, char *urlOut, int urlCap) {
     int ok = i >= 0 && i < g_chanN;
     if (ok) {
         g_chanCur = i;
+        g_chanVer++;   // moves the LIVE marker in the phone's channel list
         strncpy(urlOut, g_chanUrl[i], (size_t)urlCap - 1); urlOut[urlCap - 1] = '\0';
         if (g_pushCb) g_pushCb(g_chanUrl[i]);
     }
