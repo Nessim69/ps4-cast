@@ -592,8 +592,14 @@ int httpsrc_open(const char *url) {
         // 35s channel-switch grace -> "HANG stale=35-36s stage=source-open" while
         // zapping. aseg's equivalent loop already kicks per hop; this one did not.
         watchdog_kick();
+        // httpsrc_close() above cleared any earlier abort, so one seen here was
+        // raised for THIS open (a newer cast superseding it). Bail between the
+        // steps that don't notice it themselves -- DNS can't be interrupted, and
+        // an abort landing while no socket exists is otherwise lost.
+        if (g_abort) { snprintf(g_dbg, sizeof(g_dbg), "aborted"); conn_close(); return HTTPSRC_ABORTED; }
         if (parse_url(cur) != 0) { snprintf(g_dbg, sizeof(g_dbg), "bad url"); return -1; }
         if (resolve_host() != 0) { snprintf(g_dbg, sizeof(g_dbg), "resolve failed (%s)", g_host); return -2; }
+        if (g_abort) { snprintf(g_dbg, sizeof(g_dbg), "aborted"); conn_close(); return HTTPSRC_ABORTED; }
 
         // Keep-alive: reuse a stashed same-host connection (skip the handshake);
         // close it if it's for a different host.
@@ -612,7 +618,7 @@ int httpsrc_open(const char *url) {
             conn_close();
             rrc = request_from_ex(0, &status, &total, loc, sizeof(loc), 0);
         }
-        if (rrc != 0) return -3;
+        if (rrc != 0) return g_abort ? HTTPSRC_ABORTED : -3;   // an aborted socket, not a dead origin
 
         if (status >= 300 && status < 400 && loc[0]) {
             // Location may be relative ("/path", "other.mp4", "?x=1"), which
@@ -634,6 +640,9 @@ int httpsrc_open(const char *url) {
         opened = 1;
     }
     if (!opened) { snprintf(g_dbg, sizeof(g_dbg), "too many redirects"); return -5; }
+    // Keep an abort raised during the open instead of clearing it here (which
+    // silently let a superseded open run on): fail now, before any thread starts.
+    if (g_abort) { snprintf(g_dbg, sizeof(g_dbg), "aborted"); conn_close(); return HTTPSRC_ABORTED; }
 
     // Spin up the read-ahead thread (connection is positioned at byte 0).
     g_ring = malloc(RING_CAP);
@@ -641,7 +650,6 @@ int httpsrc_open(const char *url) {
     g_ringHead = g_ringFill = 0;
     g_cacheStart = g_servePos = g_rawPos = 0;
     g_stop = g_eof = g_seekReq = 0;
-    g_abort = 0;
     g_waits = g_stalls = g_reconnects = g_seeks = 0;
     g_lastWaitMs = 0;
     scePthreadMutexInit(&g_mtx, NULL, "ps4cast_rd_mtx");

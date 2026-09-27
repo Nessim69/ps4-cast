@@ -9,7 +9,10 @@
 #include <stdint.h>
 
 // Parse + probe the URL (learns total size via a ranged probe). Returns 0 on
-// success, negative on failure. Safe to call again to re-open a new URL.
+// success, negative on failure (HTTPSRC_ABORTED when httpsrc_abort() cut it
+// short, which says nothing about the origin). Safe to call again to re-open a
+// new URL.
+#define HTTPSRC_ABORTED (-9)
 int      httpsrc_open(const char *url);
 
 // Positional read: fetch `len` bytes starting at byte `pos`. Returns the number

@@ -315,26 +315,46 @@ static int conn_write(AsegCh *c, const uint8_t *buf, int len) {
     return 0;
 }
 
+static void abort_ch(int i) {
+    AsegCh *c = &g_ch[i];
+    c->abort = 1;
+    c->abortGen++;      // after abort=1: a fetch that reads the new gen also sees abort
+    // An aborted socket must never be reused. aseg keeps connections alive across
+    // channel switches, and a burst fires many aborts, so the NEXT tune could pick
+    // up a socket that had sceNetSocketAbort() called on it -- where SO_RCVTIMEO
+    // is not reliably honored and recv can block indefinitely. That matches the
+    // failure exactly: only after a burst, only on the first tune. (kaAlive alone
+    // could be re-set by a fetch finishing just after this; kaGen cannot.)
+    c->kaAlive = 0;
+    int s = c->sock;
+    if (s >= 0) sceNetSocketAbort(s, 0);
+    native_http_abort(i);
+}
+
 void aseg_abort(void) {
     // The three STREAM channels only. ASEG_CH_UI (the phone's IPTV import) is
     // not owned by playback: a Stop or zap must not kill it, and it never
     // needs aseg_resume().
-    for (int i = 0; i < ASEG_CH_COUNT; i++) {
-        AsegCh *c = &g_ch[i];
-        if (!c->stream) continue;
-        c->abort = 1;
-        c->abortGen++;      // after abort=1: a fetch that reads the new gen also sees abort
-        // An aborted socket must never be reused. aseg keeps connections alive across
-        // channel switches, and a burst fires many aborts, so the NEXT tune could pick
-        // up a socket that had sceNetSocketAbort() called on it -- where SO_RCVTIMEO
-        // is not reliably honored and recv can block indefinitely. That matches the
-        // failure exactly: only after a burst, only on the first tune. (kaAlive alone
-        // could be re-set by a fetch finishing just after this; kaGen cannot.)
-        c->kaAlive = 0;
-        int s = c->sock;
-        if (s >= 0) sceNetSocketAbort(s, 0);
-        native_http_abort(i);
-    }
+    for (int i = 0; i < ASEG_CH_COUNT; i++) if (g_ch[i].stream) abort_ch(i);
+}
+
+// The player's "is the open in progress already superseded?" predicate (see
+// aseg_set_cancel_check in aseg.h).
+static int (*g_cancelCheck)(void) = NULL;
+void aseg_set_cancel_check(int (*fn)(void)) { g_cancelCheck = fn; }
+
+// A resume must never erase an abort raised to supersede the open in progress.
+// The opener raises aseg_abort() for a newer request while the superseded open
+// can still be inside hls_open()/resolve_page(), whose own resume points (after
+// hls_close, before the page fetch) then wiped it: the doomed open ran its full
+// playlist/page budget (8-18s) before the newest zap could start. Re-check
+// after clearing and re-raise. The fence orders the clear before the check;
+// the opener publishes the newer request before it aborts, so an abort this
+// clear overwrote is always paired with a check that sees that request.
+static void resume_ch(int i) {
+    g_ch[i].abort = 0;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (g_cancelCheck && g_cancelCheck()) abort_ch(i);
 }
 
 // Clear a STALE abort at the start of a new stream. player_stop() raises the abort
@@ -349,11 +369,11 @@ void aseg_abort(void) {
 // entirely, because aseg_abort() is also raised from live-playback paths.
 // (Clears all three stream channels together, exactly as aseg_abort raises them.)
 void aseg_resume(void) {
-    for (int i = 0; i < ASEG_CH_COUNT; i++) if (g_ch[i].stream) g_ch[i].abort = 0;
+    for (int i = 0; i < ASEG_CH_COUNT; i++) if (g_ch[i].stream) resume_ch(i);
 }
 
 void aseg_resume_ch(int ch) {
-    if (ch >= 0 && ch < ASEG_CH_COUNT && g_ch[ch].stream) g_ch[ch].abort = 0;
+    if (ch >= 0 && ch < ASEG_CH_COUNT && g_ch[ch].stream) resume_ch(ch);
 }
 
 void aseg_clear_error(void) {

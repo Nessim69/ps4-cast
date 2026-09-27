@@ -179,11 +179,11 @@ int resolve_page(const char *pageUrl, char *out, int cap) {
     o.maxBytes = RESOLVE_PAGE_CAP;
     o.budgetUs = RESOLVE_PAGE_BUDGET_US;
     o.stopAfterHeaders = is_media_type;
-    // This runs BEFORE player_stop(), so a previous Stop's sticky abort is still
-    // up and would fail the probe at once (rc=-9). Clear PLAYLIST's only: its
-    // teardowns are all driven from this same main thread, never concurrently
-    // with this call, whereas VIDEO/AUDIO can be mid-teardown on the decode
-    // thread (an ABR switch's prefetch_stop).
+    // The opener tears the old stream down before resolving, and that teardown
+    // leaves PLAYLIST's sticky abort up; clear it or the probe fails at once
+    // (rc=-9). PLAYLIST only: the other channels are not ours to touch here.
+    // A resume cannot erase an abort that superseded THIS open: it re-raises
+    // it (aseg_set_cancel_check), so a newer zap still cuts the probe short.
     aseg_resume_ch(ASEG_CH_PLAYLIST);
     uint8_t *body = NULL; int len = 0;
     int rc = aseg_fetch_opts(ASEG_CH_PLAYLIST, clean, &body, &len, &o);

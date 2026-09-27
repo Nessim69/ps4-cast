@@ -1118,6 +1118,9 @@ static int ensure_segment(void) {
             g_segPos = 0;
             return 0;
         }
+        // Stop/cast interrupted the open: nothing is wrong with the origin, so
+        // neither fall back to aseg nor pin it for the rest of the stream.
+        if (orc == HTTPSRC_ABORTED) return -1;
         // Surface WHY the ranged reader refused this origin — previously this
         // failed silently and surfaced only as a generic FFmpeg "format" error.
         snprintf(g_segFail, sizeof(g_segFail), "%s", httpsrc_debug());

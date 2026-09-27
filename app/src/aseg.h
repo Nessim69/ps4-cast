@@ -57,6 +57,10 @@ void aseg_abort(void);
 void aseg_resume(void);
 // Clear ONE stream channel's stale abort (resolve_page: see resolve.c).
 void aseg_resume_ch(int ch);
+// Predicate the resumes consult after clearing: nonzero while the stream open
+// in progress has been superseded, in which case the abort is re-raised
+// instead of cleared. Registered once by the player before any thread starts.
+void aseg_set_cancel_check(int (*fn)(void));
 // Tighten ASEG_CH_PLAYLIST's per-fetch time budget around small PLAYLIST
 // fetches (1) and restore the generous SEGMENT budget (0). A single budget for
 // both either starves slow segments (continuous rebuffering) or lets a dead
