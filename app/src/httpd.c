@@ -456,7 +456,13 @@ static void chan_tuned_push_cb(const char *url) {
 }
 static void chan_save_file(void) { httpd_channels_save(); }
 
-static const char DEVICE_XML[] =
+// %s = ssdp_uuid(): the per-install UUID, shared with SSDP's USN so a control
+// point's description.xml fetch and its SSDP discovery agree on one identity
+// (every earlier build hard-coded the SAME uuid here, so two consoles on one
+// LAN advertised identical UDNs). Formatted into a request-time buffer by the
+// /description.xml handler below, not served as a plain byte blob like the
+// other static *_XML tables.
+static const char DEVICE_XML_FMT[] =
 "<?xml version=\"1.0\"?>"
 "<root xmlns=\"urn:schemas-upnp-org:device-1-0\" xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">"
 "<specVersion><major>1</major><minor>0</minor></specVersion>"
@@ -470,7 +476,7 @@ static const char DEVICE_XML[] =
 "<modelNumber>1</modelNumber>"
 "<serialNumber>PCST00001</serialNumber>"
 "<dlna:X_DLNADOC>DMR-1.50</dlna:X_DLNADOC>"
-"<UDN>uuid:7b2f63a8-2530-4e47-9f3a-0000000c5701</UDN>"
+"<UDN>%s</UDN>"
 "<presentationURL>/</presentationURL>"
 "<serviceList>"
 "<service>"
@@ -1390,7 +1396,11 @@ static void handle_client(OrbisNetId c) {
     }
 
     if (strcmp(method, "GET") == 0 && strcmp(path, "/description.xml") == 0) {
-        send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", DEVICE_XML, (int)sizeof(DEVICE_XML) - 1);
+        static char deviceXml[sizeof(DEVICE_XML_FMT) + 64];
+        int dn = snprintf(deviceXml, sizeof(deviceXml), DEVICE_XML_FMT, ssdp_uuid());
+        if (dn < 0) dn = 0;
+        if (dn >= (int)sizeof(deviceXml)) dn = (int)sizeof(deviceXml) - 1;
+        send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", deviceXml, dn);
         return;
     }
 
