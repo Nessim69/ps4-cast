@@ -401,6 +401,16 @@ static void draw_qr_card(Gfx *g, const char *url, int cx, int top, int module) {
         for (int xx = 0; xx < QR_SIZE; xx++)
             if (qr.m[yy][xx]) gfx_rect(g, qx + xx * module, qy + yy * module, module, module, INK);
 }
+// The phone-controls URL, exactly as it must be typed or scanned. ONE formatter
+// for every screen that prints it: the Live TV empty state had its own copy
+// without ?t=, and typing it got 401 whenever pairing was on.
+static void control_url(char *out, int cap, const char *ip) {
+    if (httpd_pairing_required() && httpd_token()[0])
+        snprintf(out, cap, "http://%s:%d/?t=%s", ip, PORT, httpd_token());
+    else
+        snprintf(out, cap, "http://%s:%d", ip, PORT);
+}
+
 static void draw_lobby(Gfx *g, const char *ip, int net_ok) {
     gfx_vgrad(g, 0, 0, g->width, g->height, BG_TOP, BG_BOT);
     int W = g->width;
@@ -422,10 +432,7 @@ static void draw_lobby(Gfx *g, const char *ip, int net_ok) {
 
     if (net_ok) {
         char url[80];
-        if (httpd_pairing_required() && httpd_token()[0])
-            snprintf(url, sizeof(url), "http://%s:%d/?t=%s", ip, PORT, httpd_token());
-        else
-            snprintf(url, sizeof(url), "http://%s:%d", ip, PORT);
+        control_url(url, sizeof(url), ip);
         draw_qr_card(g, url, W / 2, 300, 9);
         int below = 300 + ((QR_SIZE + 6) * 9 + 60) + 34;
         ctext(g, below, "Scan to open phone controls", 3, MUT, 0);
@@ -702,7 +709,7 @@ static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
         ctext(g, 474, "No IPTV playlist loaded", 5, TXT, 0);
         ctext(g, 544, "Open the web controls and add an M3U playlist", 3, MUT, 0);
         if (net_ok) {
-            char url[80]; snprintf(url, sizeof(url), "http://%s:%d", ip, PORT);
+            char url[80]; control_url(url, sizeof(url), ip);
             ctext(g, 602, url, 3, ACC_LT, 0);
         }
         ctext(g, H - 52, "L1 / R1  switch mode        Triangle  exit", 2, MUT, 0);
