@@ -444,8 +444,19 @@ int httpd_take_next(char *out, int len) {
         strncpy(out, g_queue[g_queueHead], len - 1); out[len-1] = '\0';
         g_queueHead = (g_queueHead + 1) % MAX_QUEUE; g_queueN--;
         got = 1;
+        // Auto-advance should look like any other cast (see
+        // set_pending_player_named below): update the HUD title/resume key
+        // and clear any tuned channel -- a queued URL isn't necessarily one.
+        // httpd_channels_tune uses its own module-local mutex, so calling it
+        // while g_mtx is held here is safe (same precedent as
+        // set_pending_local_file).
+        strncpy(g_last_push, out, sizeof(g_last_push) - 1);
+        g_last_push[sizeof(g_last_push) - 1] = '\0';
+        httpd_channels_tune(-1, NULL, 0);
+        g_lists_ver++;
     }
     scePthreadMutexUnlock(&g_mtx);
+    if (got) recent_add(out);   // takes g_mtx itself; must run unlocked
     return got;
 }
 
