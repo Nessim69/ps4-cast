@@ -1,5 +1,6 @@
 #include "httpd.h"
 #include "httpd_channels.h"
+#include "aseg.h"
 #include "web_ui.h"
 #include "player.h"
 #include "goldhen.h"
@@ -8,6 +9,7 @@
 #include "sys_diag.h"
 #include "trace.h"
 #include "notify.h"
+#include "pairing.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -70,6 +72,12 @@ static char g_recent[MAX_RECENT][URL_MAX]; static int g_recentN = 0;
 static char g_queue[MAX_QUEUE][URL_MAX];   static int g_queueHead = 0, g_queueN = 0;
 static char g_fav[MAX_FAV][URL_MAX];       static int g_favN = 0;
 
+// Bumped (under g_mtx) whenever recents, favorites, the queue, resume
+// positions, or the uploaded file change, so /status can report it
+// (lists_ver) and the phone UI can skip re-polling those lists when nothing
+// moved instead of re-fetching them every tick.
+static int g_lists_ver = 0;
+
 // The channel list itself lives in httpd_channels.c.
 // The most recently cast URL (HUD title); declared here so the channel-store
 // helpers above the request handlers can update it.
@@ -84,6 +92,7 @@ static void recent_add(const char *url) {     // most-recent-first, deduped
         int top = existing >= 0 ? existing : (g_recentN < MAX_RECENT ? g_recentN++ : MAX_RECENT - 1);
         for (int i = top; i > 0; i--) strncpy(g_recent[i], g_recent[i-1], URL_MAX - 1);
         strncpy(g_recent[0], url, URL_MAX - 1); g_recent[0][URL_MAX-1] = '\0';
+        g_lists_ver++;
     }
     scePthreadMutexUnlock(&g_mtx);
 }
@@ -93,6 +102,7 @@ static void queue_push(const char *url) {
         strncpy(g_queue[(g_queueHead + g_queueN) % MAX_QUEUE], url, URL_MAX - 1);
         g_queue[(g_queueHead + g_queueN) % MAX_QUEUE][URL_MAX-1] = '\0';
         g_queueN++;
+        g_lists_ver++;
     }
     scePthreadMutexUnlock(&g_mtx);
 }
@@ -135,25 +145,69 @@ static void token_load_or_create(void) {
         char buf[16] = {0};
         int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
         sceKernelClose(fd);
-        if (n == 8) { memcpy(g_token, buf, 8); g_token[8] = '\0'; return; }
+        // Validate, don't just trust the file: a token minted by the old
+        // `cs[t & 31]` generator could hold a NUL byte or otherwise be
+        // garbled (see pairing.c), which silently disabled pairing or locked
+        // the owner out with no way back in -- both /token/regen and
+        // /pairing need the very token that was broken. Regenerating on
+        // anything invalid self-heals consoles that already hit that bug.
+        if (n == 8 && pairing_token_valid(buf)) { memcpy(g_token, buf, 8); g_token[8] = '\0'; return; }
     }
     token_generate();
 }
 
-// Mint a fresh token and persist it. Shared by first run and POST /token/regen.
-// 8 unambiguous chars (no O/0/I/1) from a high-resolution clock stir; the PS4 has
-// no /dev/urandom in homebrew, and this only needs to be unique per install.
+// Mint a fresh token and persist it. Shared by first run, an invalid stored
+// token (see token_load_or_create), and POST /token/regen.
+// 8 unambiguous chars (no O/0/I/1, see pairing.c) mixed from several jittered
+// TSC samples, process time, and an ASLR'd address, whitened through
+// splitmix64. The PS4 has no /dev/urandom in homebrew; this only needs to be
+// unpredictable enough that one console's token doesn't help guess another's,
+// not cryptographically secure (this token is a LAN convenience, not a
+// security boundary -- see token_ok's comment).
 static void token_generate(void) {
-    static const char cs[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
-    uint64_t t = sceKernelGetProcessTime() ^ (uint64_t)(uintptr_t)&g_token;
-    for (int i = 0; i < 8; i++) { g_token[i] = cs[t & 31]; t ^= t >> 7; t *= 0x9E3779B97F4A7C15ULL; t >>= 9; }
-    g_token[8] = '\0';
+    uint64_t state = sceKernelGetProcessTime() ^ (uint64_t)(uintptr_t)&g_token
+                                                ^ (uint64_t)(uintptr_t)&state;
+    for (int i = 0; i < 8; i++) {
+        state ^= sceKernelReadTsc();
+        uint64_t mixed = pairing_splitmix64(&state);
+        // Jitter before the next TSC sample (length itself drawn from this
+        // sample) so back-to-back reads can't land close enough to correlate.
+        for (volatile int j = 0, spin = (int)(mixed & 0x3F); j < spin; j++) {}
+    }
+    uint64_t seed = pairing_splitmix64(&state);
+    pairing_token_from_seed(seed, g_token);
     int fd = sceKernelOpen(TOKEN_PATH, 0x0201 | 0x0400, 0666);
     if (fd >= 0) { sceKernelWrite(fd, g_token, 8); sceKernelClose(fd); }
 }
 
 const char *httpd_token(void) { return g_token; }
 int httpd_pairing_required(void) { return g_cfgPair; }
+
+// A brief, TV-opened window during which GET /token is served without
+// already holding the token -- otherwise pairing is a chicken-and-egg
+// problem (a not-yet-paired phone or the Chrome extension has no way to
+// prove it holds a token it needs to fetch in the first place). Opened by
+// pressing Square on the Cast home screen (wired up in main.c); it closes on
+// its own, so nothing needs to close it early.
+static uint64_t g_pair_window_until = 0;   // sceKernelGetProcessTime() ticks (us); 0 = closed
+
+void httpd_pairing_window_open(int seconds) {
+    scePthreadMutexLock(&g_mtx);
+    g_pair_window_until = sceKernelGetProcessTime() + (uint64_t)(seconds > 0 ? seconds : 0) * 1000000ULL;
+    scePthreadMutexUnlock(&g_mtx);
+}
+
+// Seconds left in the open pairing window, 0 if closed. Reported in /status
+// (pair_window) so the web UI / extension can show it.
+int httpd_pairing_window_left(void) {
+    scePthreadMutexLock(&g_mtx);
+    uint64_t until = g_pair_window_until;
+    scePthreadMutexUnlock(&g_mtx);
+    uint64_t now = sceKernelGetProcessTime();
+    if (until <= now) return 0;
+    uint64_t left_s = (until - now + 999999ULL) / 1000000ULL;   // round up to whole seconds
+    return left_s > (uint64_t)INT32_MAX ? INT32_MAX : (int)left_s;
+}
 
 // 1 if this request may proceed. token comes from ?t= on the path or the
 // X-PS4Cast-Token header. Constant-shape compare; this is a LAN convenience,
@@ -185,10 +239,13 @@ static int token_ok(const char *path, const char *headers) {
 
 // Paths that must work without a token: UPnP/DLNA machinery (SSDP-discovered,
 // tokenless by protocol) and read-only diagnostics the dev pipeline polls.
+// GET /token is deliberately NOT here: it hands out the secret itself, so it
+// goes through the normal gate below like any other endpoint, with a
+// time-boxed exception (the pairing window) handled at the call site.
 static int token_exempt(const char *path) {
     static const char *const exempt[] = {
         "/description.xml", "/AVTransport.xml", "/RenderingControl.xml",
-        "/ConnectionManager.xml", "/status", "/trace", "/crashlog", "/token", 0
+        "/ConnectionManager.xml", "/status", "/trace", "/crashlog", 0
     };
     for (int i = 0; exempt[i]; i++) {
         int l = (int)strlen(exempt[i]);
@@ -290,6 +347,7 @@ void httpd_resume_save(const char *url, int pos, int dur) {
         g_resPos[0] = pos; g_resDur[0] = dur;
     }
     resume_save_file();
+    g_lists_ver++;
     scePthreadMutexUnlock(&g_mtx);
 }
 // Saved resume position for a URL in seconds, or 0 if none.
@@ -315,6 +373,7 @@ static void fav_toggle(const char *url) {
     if (idx >= 0) { for (int i = idx; i < g_favN - 1; i++) strncpy(g_fav[i], g_fav[i+1], URL_MAX - 1); g_favN--; }
     else if (g_favN < MAX_FAV) { strncpy(g_fav[g_favN], url, URL_MAX - 1); g_fav[g_favN][URL_MAX-1]='\0'; g_favN++; }
     favs_save();
+    g_lists_ver++;
     scePthreadMutexUnlock(&g_mtx);
 }
 
@@ -342,8 +401,10 @@ static int json_list(char *out, int cap, char arr[][URL_MAX], int n) {
 // playlist, identified by #EXT-X- tags) is NOT a channel list — for those we
 // return a single entry that points at the original URL so it can be cast.
 #define PLAYLIST_MAX_ENTRIES 200
-extern int aseg_fetch(const char *url, uint8_t **buf, int *len);
-extern void aseg_resume(void);
+// /playlist fetches through aseg_fetch_ui (aseg.h): an independent connection
+// with no stream headers (Referer/Cookie) that the playing stream's sticky
+// abort never touches, so loading a channel list can't fail or hang on account
+// of what is currently casting.
 
 // Append a JSON-escaped, length-capped string (with surrounding quotes).
 static void json_str(char *out, int cap, int *po, const char *s, int maxchars) {
@@ -377,8 +438,19 @@ int httpd_take_next(char *out, int len) {
         strncpy(out, g_queue[g_queueHead], len - 1); out[len-1] = '\0';
         g_queueHead = (g_queueHead + 1) % MAX_QUEUE; g_queueN--;
         got = 1;
+        // Auto-advance should look like any other cast (see
+        // set_pending_player_named below): update the HUD title/resume key
+        // and clear any tuned channel -- a queued URL isn't necessarily one.
+        // httpd_channels_tune uses its own module-local mutex, so calling it
+        // while g_mtx is held here is safe (same precedent as
+        // set_pending_local_file).
+        strncpy(g_last_push, out, sizeof(g_last_push) - 1);
+        g_last_push[sizeof(g_last_push) - 1] = '\0';
+        httpd_channels_tune(-1, NULL, 0);
+        g_lists_ver++;
     }
     scePthreadMutexUnlock(&g_mtx);
+    if (got) recent_add(out);   // takes g_mtx itself; must run unlocked
     return got;
 }
 
@@ -389,7 +461,13 @@ static void chan_tuned_push_cb(const char *url) {
 }
 static void chan_save_file(void) { httpd_channels_save(); }
 
-static const char DEVICE_XML[] =
+// %s = ssdp_uuid(): the per-install UUID, shared with SSDP's USN so a control
+// point's description.xml fetch and its SSDP discovery agree on one identity
+// (every earlier build hard-coded the SAME uuid here, so two consoles on one
+// LAN advertised identical UDNs). Formatted into a request-time buffer by the
+// /description.xml handler below, not served as a plain byte blob like the
+// other static *_XML tables.
+static const char DEVICE_XML_FMT[] =
 "<?xml version=\"1.0\"?>"
 "<root xmlns=\"urn:schemas-upnp-org:device-1-0\" xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">"
 "<specVersion><major>1</major><minor>0</minor></specVersion>"
@@ -403,7 +481,7 @@ static const char DEVICE_XML[] =
 "<modelNumber>1</modelNumber>"
 "<serialNumber>PCST00001</serialNumber>"
 "<dlna:X_DLNADOC>DMR-1.50</dlna:X_DLNADOC>"
-"<UDN>uuid:7b2f63a8-2530-4e47-9f3a-0000000c5701</UDN>"
+"<UDN>%s</UDN>"
 "<presentationURL>/</presentationURL>"
 "<serviceList>"
 "<service>"
@@ -717,6 +795,7 @@ static void set_pending_local_file(const char *displayName) {
     strncpy(g_last_push, displayName, sizeof(g_last_push) - 1);
     g_last_push[sizeof(g_last_push) - 1] = '\0';
     httpd_channels_tune(-1, NULL, 0);   // nothing tuned after a manual cast
+    g_lists_ver++;                      // the uploaded file (name/existence) changed
     scePthreadMutexUnlock(&g_mtx);
     g_avt_event_dirty = 1;
     player_interrupt();
@@ -818,11 +897,16 @@ static void send_all(OrbisNetId c, const char *buf, int len) {
 static void send_response(OrbisNetId c, const char *status, const char *ctype,
                           const char *body, int bodylen) {
     char hdr[256];
+    // No Access-Control-Allow-Origin: the only browser-side caller is the
+    // Chrome extension's background service worker (host_permissions, not
+    // fetch-from-a-page CORS); content.js/popup.js/overlay.js never fetch the
+    // receiver directly. A wildcard here would let ANY page a phone happens
+    // to have open read the pairing token and every /status/diagnostic field
+    // via plain JS fetch(), which is exactly what the token exists to stop.
     int h = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n\r\n",
         status, ctype, bodylen);
     send_all(c, hdr, h);
@@ -861,6 +945,53 @@ static int header_value(const char *req, const char *name, char *out, int cap) {
     memcpy(out, p, n);
     out[n] = '\0';
     return n > 0;
+}
+
+// Extract the UPnP action name a SOAP control request is invoking, from the
+// SOAPACTION header ("urn:...:AVTransport:1#Pause", quotes optional) or, if
+// that header is absent, from the first element inside <s:Body> (e.g.
+// "<u:Pause ...>" -> "Pause"). This replaces matching action names with
+// strstr() over the WHOLE request INCLUDING HEADERS, in program-order
+// priority: a control point whose User-Agent happened to contain "Player"
+// made "Play" match (and therefore win) for every action tested before it --
+// GetPositionInfo polls and even Pause were treated as Play. header_value is
+// already case-insensitive on the header name via ci_strstr.
+static int soap_action_name(const char *req, const char *body, char *out, int cap) {
+    char header[160];
+    if (header_value(req, "SOAPACTION:", header, sizeof(header))) {
+        const char *h = header;
+        int len = (int)strlen(h);
+        if (len >= 2 && h[0] == '"' && h[len - 1] == '"') { h++; len -= 2; }
+        const char *hash = (const char *)memchr(h, '#', (size_t)len);
+        if (hash) {
+            int n = (int)(h + len - (hash + 1));
+            if (n < 0) n = 0;
+            if (n >= cap) n = cap - 1;
+            memcpy(out, hash + 1, (size_t)n);
+            out[n] = '\0';
+            if (out[0]) return 1;
+        }
+    }
+    // No (usable) SOAPACTION header: fall back to the SOAP body's outermost
+    // element, "<prefix:ActionName ...>" or "<prefix:ActionName>". The prefix
+    // is whatever the client chose (usually "u", sometimes something else),
+    // so look for ":Body" rather than assuming "s:Body", then take the next
+    // "<...>" after it.
+    const char *b = ci_strstr(body, ":Body");
+    if (!b) return 0;
+    const char *lt = strchr(b + 1, '<');
+    if (!lt) return 0;
+    lt++;
+    const char *colon = strchr(lt, ':');
+    const char *nameStart = colon ? colon + 1 : lt;
+    int n = 0;
+    while (nameStart[n] && nameStart[n] != ' ' && nameStart[n] != '>' &&
+           nameStart[n] != '/' && nameStart[n] != '\t' && nameStart[n] != '\r' &&
+           nameStart[n] != '\n' && n < cap - 1) n++;
+    if (n <= 0) return 0;
+    memcpy(out, nameStart, (size_t)n);
+    out[n] = '\0';
+    return 1;
 }
 
 static int parse_callback(const char *value, char *host, int hostcap,
@@ -1163,6 +1294,93 @@ static void upload_name_load(char *out, int cap) {
     if (!out[0]) snprintf(out, cap, "Uploaded video");
 }
 
+// A multi-GB /upload used to run inline on server_main's single worker
+// thread, blocking /stop, /status and every DLNA action for the whole
+// transfer. handle_local_upload now only validates the request and (on
+// success) hands the already-accepted socket to a dedicated worker thread
+// that owns it for the rest of the transfer; server_main must not touch that
+// socket again. Only one upload runs at a time -- a concurrent one gets 409 --
+// so the worker's scratch buffer below can safely stay static.
+static int g_upload_active = 0;   // guarded by g_mtx
+#define UPLOAD_WORKER_STACK (256 * 1024)
+
+typedef struct {
+    OrbisNetId sock;
+    uint64_t   contentLen;
+    int        leadLen;
+    uint8_t    lead[8192];     // room for everything handle_client's req[] can hold
+    char       displayName[256];
+} UploadJob;
+
+// Set by handle_local_upload just before it returns, read once by server_main
+// right after handle_client(c) returns. Both sides run on server_main's own
+// thread (handle_client and everything it calls are that thread; the upload
+// worker is a separate thread that never touches this flag), so this is
+// plain sequential state, not something two threads race over.
+static int g_upload_handoff = 0;
+
+static void *upload_worker(void *arg) {
+    UploadJob *job = (UploadJob *)arg;
+    OrbisNetId c = job->sock;
+    uint64_t contentLen = job->contentLen;
+
+    sceKernelUnlink(UPLOAD_TMP_PATH);
+    int fd = sceKernelOpen(UPLOAD_TMP_PATH,
+                           0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
+    if (fd < 0) {
+        send_response(c, "507 Insufficient Storage", "text/plain", "cannot create upload", 20);
+        goto done;
+    }
+
+    {
+        uint64_t received = 0;
+        int failed = 0;
+        if (job->leadLen > 0) {
+            failed = write_file_all(fd, job->lead, job->leadLen) != 0;
+            received = (uint64_t)job->leadLen;
+        }
+
+        static uint8_t uploadBuf[64 * 1024];   // one upload at a time: g_upload_active gates reuse
+        while (!failed && received < contentLen) {
+            uint64_t left = contentLen - received;
+            int want = left < sizeof(uploadBuf) ? (int)left : (int)sizeof(uploadBuf);
+            int got = sceNetRecv(c, uploadBuf, want, 0);
+            if (got <= 0 || write_file_all(fd, uploadBuf, got) != 0) { failed = 1; break; }
+            received += (uint64_t)got;
+        }
+        if (!failed) sceKernelFsync(fd);
+        sceKernelClose(fd);
+
+        if (failed || received != contentLen) {
+            sceKernelUnlink(UPLOAD_TMP_PATH);
+            trace_mark("local upload failed name=%s bytes=%llu/%llu", job->displayName,
+                       (unsigned long long)received, (unsigned long long)contentLen);
+            send_response(c, "400 Bad Request", "text/plain", "upload interrupted", 18);
+            goto done;
+        }
+    }
+
+    if (sceKernelRename(UPLOAD_TMP_PATH, PLAYER_LOCAL_UPLOAD_PATH) != 0) {
+        sceKernelUnlink(UPLOAD_TMP_PATH);
+        send_response(c, "500 Internal Server Error", "text/plain", "cannot finalize upload", 22);
+        goto done;
+    }
+
+    upload_name_save(job->displayName);
+    trace_mark("local upload complete name=%s bytes=%llu", job->displayName,
+               (unsigned long long)contentLen);
+    set_pending_local_file(job->displayName);   // also bumps g_lists_ver
+    send_response(c, "200 OK", "text/plain", "ok", 2);
+
+done:
+    sceNetSocketClose(c);
+    scePthreadMutexLock(&g_mtx);
+    g_upload_active = 0;
+    scePthreadMutexUnlock(&g_mtx);
+    free(job);
+    return NULL;
+}
+
 static void handle_local_upload(OrbisNetId c, const char *req, int reqLen,
                                 const char *hdrend, uint64_t contentLen) {
     if (contentLen == 0) {
@@ -1178,64 +1396,63 @@ static void handle_local_upload(OrbisNetId c, const char *req, int reqLen,
         return;
     }
 
-    char encodedName[768], displayName[256];
+    scePthreadMutexLock(&g_mtx);
+    int busy = g_upload_active;
+    if (!busy) g_upload_active = 1;
+    scePthreadMutexUnlock(&g_mtx);
+    if (busy) {
+        send_response(c, "409 Conflict", "text/plain", "an upload is already in progress", 33);
+        return;
+    }
+
+    UploadJob *job = malloc(sizeof(*job));
+    if (!job) {
+        send_response(c, "500 Internal Server Error", "text/plain", "out of memory", 13);
+        scePthreadMutexLock(&g_mtx); g_upload_active = 0; scePthreadMutexUnlock(&g_mtx);
+        return;
+    }
+    job->sock = c;
+    job->contentLen = contentLen;
+
+    char encodedName[768];
     encodedName[0] = '\0';
     header_value(req, "X-PS4Cast-Filename:", encodedName, sizeof(encodedName));
-    decode_upload_name(encodedName, displayName, sizeof(displayName));
+    decode_upload_name(encodedName, job->displayName, sizeof(job->displayName));
 
-    // A client using Expect must receive the interim response before it sends
-    // the body. Browsers normally skip this, but supporting it keeps curl useful.
+    // handle_client's req[] buffer is static and reused by the very next
+    // accepted connection, so copy out the body bytes it already read
+    // (bounded by req[]'s own size, hence lead[]'s) before handing off.
+    const char *bodyStart = hdrend + 4;
+    int already = reqLen - (int)(bodyStart - req);
+    if (already < 0) already = 0;
+    if ((uint64_t)already > contentLen) already = (int)contentLen;
+    if (already > (int)sizeof(job->lead)) already = (int)sizeof(job->lead);
+    memcpy(job->lead, bodyStart, (size_t)already);
+    job->leadLen = already;
+
+    // Auth was already checked by handle_client's gate before this function
+    // was ever called, so it's safe to promise the client "send the body"
+    // here. A client using Expect must receive the interim response before
+    // it sends the body; browsers normally skip this, but supporting it
+    // keeps curl useful.
     if (ci_strstr(req, "Expect: 100-continue"))
         send_all(c, "HTTP/1.1 100 Continue\r\n\r\n", 25);
 
-    sceKernelUnlink(UPLOAD_TMP_PATH);
-    int fd = sceKernelOpen(UPLOAD_TMP_PATH,
-                           0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
-    if (fd < 0) {
-        send_response(c, "507 Insufficient Storage", "text/plain", "cannot create upload", 20);
-        return;
+    OrbisPthreadAttr attr;
+    OrbisPthreadAttr *pattr = NULL;
+    int attrInit = scePthreadAttrInit(&attr) == 0;
+    if (attrInit && scePthreadAttrSetstacksize(&attr, UPLOAD_WORKER_STACK) == 0) pattr = &attr;
+    OrbisPthread worker;
+    int trc = scePthreadCreate(&worker, pattr, upload_worker, job, "ps4cast_upload");
+    if (attrInit) scePthreadAttrDestroy(&attr);
+    if (trc != 0) {
+        send_response(c, "500 Internal Server Error", "text/plain", "cannot start upload", 19);
+        scePthreadMutexLock(&g_mtx); g_upload_active = 0; scePthreadMutexUnlock(&g_mtx);
+        free(job);
+        return;   // socket is still ours: server_main closes it as usual
     }
-
-    const char *body = hdrend + 4;
-    int already = reqLen - (int)(body - req);
-    if (already < 0) already = 0;
-    if ((uint64_t)already > contentLen) already = (int)contentLen;
-    uint64_t received = 0;
-    int failed = 0;
-    if (already > 0) {
-        failed = write_file_all(fd, body, already) != 0;
-        received = (uint64_t)already;
-    }
-
-    static uint8_t uploadBuf[64 * 1024];
-    while (!failed && received < contentLen) {
-        uint64_t left = contentLen - received;
-        int want = left < sizeof(uploadBuf) ? (int)left : (int)sizeof(uploadBuf);
-        int got = sceNetRecv(c, uploadBuf, want, 0);
-        if (got <= 0 || write_file_all(fd, uploadBuf, got) != 0) { failed = 1; break; }
-        received += (uint64_t)got;
-    }
-    if (!failed) sceKernelFsync(fd);
-    sceKernelClose(fd);
-
-    if (failed || received != contentLen) {
-        sceKernelUnlink(UPLOAD_TMP_PATH);
-        trace_mark("local upload failed name=%s bytes=%llu/%llu", displayName,
-                   (unsigned long long)received, (unsigned long long)contentLen);
-        send_response(c, "400 Bad Request", "text/plain", "upload interrupted", 18);
-        return;
-    }
-    if (sceKernelRename(UPLOAD_TMP_PATH, PLAYER_LOCAL_UPLOAD_PATH) != 0) {
-        sceKernelUnlink(UPLOAD_TMP_PATH);
-        send_response(c, "500 Internal Server Error", "text/plain", "cannot finalize upload", 22);
-        return;
-    }
-
-    upload_name_save(displayName);
-    trace_mark("local upload complete name=%s bytes=%llu", displayName,
-               (unsigned long long)contentLen);
-    set_pending_local_file(displayName);
-    send_response(c, "200 OK", "text/plain", "ok", 2);
+    scePthreadDetach(worker);   // fire-and-forget: nobody joins the upload thread
+    g_upload_handoff = 1;       // the worker now owns `c`; server_main must not close it
 }
 
 static void handle_client(OrbisNetId c) {
@@ -1275,6 +1492,25 @@ static void handle_client(OrbisNetId c) {
         const char *cl = ci_strstr(req, "Content-Length:");
         if (cl) contentLen = strtoull(cl + strlen("Content-Length:"), NULL, 10);
     }
+    if (strcmp(path, "/upnp/event/AVTransport") == 0 &&
+        handle_avt_subscription(c, method, req)) return;
+
+    // Pairing gate: mutations and UI pages need the token shown on the TV.
+    // DLNA/UPnP and read-only /status + /trace stay open (token_exempt).
+    // Moved above both the /upload dispatch and the body-read loop below: it
+    // only looks at already-complete headers (target/req), and gating
+    // /upload here (POST /upload used to be dispatched before this check
+    // ever ran, at v04.62) is what makes an upload require the token like
+    // every other mutation. GET /token additionally opens during a
+    // TV-triggered pairing window (httpd_pairing_window_left), since it
+    // can't require the very token it exists to hand out.
+    int tokenWindowOk = strcmp(path, "/token") == 0 && httpd_pairing_window_left() > 0;
+    if (!token_exempt(path) && !token_ok(target, req) && !tokenWindowOk) {
+        send_response(c, "401 Unauthorized", "text/plain",
+                      "missing pairing token (see the TV screen)", 41);
+        return;
+    }
+
     if (strcmp(method, "POST") == 0 && strcmp(path, "/upload") == 0) {
         handle_local_upload(c, req, n, hdrend, contentLen);
         return;
@@ -1294,17 +1530,6 @@ static void handle_client(OrbisNetId c) {
     const char *body = strstr(req, "\r\n\r\n");
     body = body ? body + 4 : "";
 
-    if (strcmp(path, "/upnp/event/AVTransport") == 0 &&
-        handle_avt_subscription(c, method, req)) return;
-
-    // Pairing gate: mutations and UI pages need the token shown on the TV.
-    // DLNA/UPnP and read-only /status + /trace stay open (token_exempt).
-    if (!token_exempt(path) && !token_ok(target, req)) {
-        send_response(c, "401 Unauthorized", "text/plain",
-                      "missing pairing token (see the TV screen)", 41);
-        return;
-    }
-
     // Channel store endpoints (GET /channels, POST /channel/*).
     if (httpd_channels_handle(c, method, path, body, send_response)) return;
 
@@ -1317,7 +1542,11 @@ static void handle_client(OrbisNetId c) {
     }
 
     if (strcmp(method, "GET") == 0 && strcmp(path, "/description.xml") == 0) {
-        send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", DEVICE_XML, (int)sizeof(DEVICE_XML) - 1);
+        static char deviceXml[sizeof(DEVICE_XML_FMT) + 64];
+        int dn = snprintf(deviceXml, sizeof(deviceXml), DEVICE_XML_FMT, ssdp_uuid());
+        if (dn < 0) dn = 0;
+        if (dn >= (int)sizeof(deviceXml)) dn = (int)sizeof(deviceXml) - 1;
+        send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", deviceXml, dn);
         return;
     }
 
@@ -1372,6 +1601,7 @@ static void handle_client(OrbisNetId c) {
         }
         if (activeLocal) g_stop_pending = 1;
         if (activeLocal || pendingLocal) g_last_push[0] = '\0';
+        g_lists_ver++;   // the uploaded file is going away
         scePthreadMutexUnlock(&g_mtx);
         if (activeLocal) player_interrupt();
         sceKernelUnlink(PLAYER_LOCAL_UPLOAD_PATH);
@@ -1415,9 +1645,13 @@ static void handle_client(OrbisNetId c) {
         json_str(json, cap, &o, g_last_push, 1023);
         JAPP(",\"diag\":"); json_str(json, cap, &o, dbg, 511);
         JAPP(",\"pad\":"); json_str(json, cap, &o, pad_diag_get(), 159);
-        JAPP(",\"hw_enabled\":%d,\"debug\":%d,\"pair\":%d,\"token\":\"%s\",\"chan_n\":%d,\"chan_cur\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":",
-             player_hw_enabled(), notify_get_debug(), g_cfgPair, g_token,
-             httpd_chan_count(), httpd_chan_current(),
+        // No "token" field here: /status is deliberately auth-exempt (the dev
+        // pipeline and SSDP-adjacent tooling poll it), so it must never leak
+        // the secret that gates every mutation. Fetch the token itself from
+        // GET /token instead (gated the same way, plus a TV-opened window).
+        JAPP(",\"hw_enabled\":%d,\"debug\":%d,\"pair\":%d,\"pair_window\":%d,\"chan_n\":%d,\"chan_cur\":%d,\"chan_ver\":%d,\"lists_ver\":%d,\"buf\":%d,\"rx\":%llu,\"sys\":",
+             player_hw_enabled(), notify_get_debug(), g_cfgPair, httpd_pairing_window_left(),
+             httpd_chan_count(), httpd_chan_current(), httpd_channels_version(), g_lists_ver,
              player_buffer_pct(), (unsigned long long)player_rx_total());
         json_str(json, cap, &o, sys_diag_get(), 159);
         JAPP(",\"fps\":%d,\"avsync\":%d,\"error_code\":", sys_get_fps(), player_get_avsync());
@@ -1622,7 +1856,9 @@ static void handle_client(OrbisNetId c) {
     }
 
     if (strcmp(method, "POST") == 0 && strcmp(path, "/upnp/control/AVTransport") == 0) {
-        if (strstr(req, "SetAVTransportURI")) {
+        char action[64] = "";
+        soap_action_name(req, body, action, sizeof(action));
+        if (strcmp(action, "SetAVTransportURI") == 0) {
             char uri[1024];
             if (!extract_tag(body, "CurrentURI", uri, sizeof(uri)) || !uri[0]) {
                 send_soap_fault(c, 402, "Invalid Args");
@@ -1652,7 +1888,7 @@ static void handle_client(OrbisNetId c) {
             send_soap_ok(c, "SetAVTransportURI", "");
             return;
         }
-        if (strstr(req, "Play")) {
+        if (strcmp(action, "Play") == 0) {
             if (!g_dlna_uri[0]) {
                 send_soap_fault(c, 716, "Resource not found");
                 return;
@@ -1668,29 +1904,29 @@ static void handle_client(OrbisNetId c) {
             send_soap_ok(c, "Play", "");
             return;
         }
-        if (strstr(req, "Stop") || strstr(req, "Pause")) {
-            if (strstr(req, "Pause")) {
-                if (!player_started()) {
-                    send_soap_fault(c, 701, "Transition not available");
-                    return;
-                }
-                player_pause(1);
-                g_avt_event_dirty = 1;
-                trace_mark("dlna pause");
-                send_soap_ok(c, "Pause", "");
-            } else {
-                scePthreadMutexLock(&g_mtx);
-                g_stop_pending = 1;
-                scePthreadMutexUnlock(&g_mtx);
-                g_dlna_started = 0;
-                player_interrupt();
-                g_avt_event_dirty = 1;
-                trace_mark("dlna stop");
-                send_soap_ok(c, "Stop", "");
+        if (strcmp(action, "Pause") == 0) {
+            if (!player_started()) {
+                send_soap_fault(c, 701, "Transition not available");
+                return;
             }
+            player_pause(1);
+            g_avt_event_dirty = 1;
+            trace_mark("dlna pause");
+            send_soap_ok(c, "Pause", "");
             return;
         }
-        if (strstr(req, "Seek")) {
+        if (strcmp(action, "Stop") == 0) {
+            scePthreadMutexLock(&g_mtx);
+            g_stop_pending = 1;
+            scePthreadMutexUnlock(&g_mtx);
+            g_dlna_started = 0;
+            player_interrupt();
+            g_avt_event_dirty = 1;
+            trace_mark("dlna stop");
+            send_soap_ok(c, "Stop", "");
+            return;
+        }
+        if (strcmp(action, "Seek") == 0) {
             char unit[32], target[64];
             double seconds = 0, duration = 0;
             player_progress(NULL, &duration);
@@ -1717,7 +1953,7 @@ static void handle_client(OrbisNetId c) {
             send_soap_ok(c, "Seek", "");
             return;
         }
-        if (strstr(req, "GetTransportInfo")) {
+        if (strcmp(action, "GetTransportInfo") == 0) {
             const char *state = player_started() ? (player_is_paused() ? "PAUSED_PLAYBACK" : "PLAYING")
                                                  : "STOPPED";
             char inner[220];
@@ -1729,7 +1965,7 @@ static void handle_client(OrbisNetId c) {
                          inner);
             return;
         }
-        if (strstr(req, "GetPositionInfo")) {
+        if (strcmp(action, "GetPositionInfo") == 0) {
             double current = 0, duration = 0;
             char cur[32], dur[32];
             static char uri[6144], inner[6656];
@@ -1746,7 +1982,7 @@ static void handle_client(OrbisNetId c) {
             send_soap_ok(c, "GetPositionInfo", inner);
             return;
         }
-        if (strstr(req, "GetMediaInfo")) {
+        if (strcmp(action, "GetMediaInfo") == 0) {
             double duration = 0;
             char dur[32];
             static char uri[6144], inner[6656];
@@ -1763,47 +1999,58 @@ static void handle_client(OrbisNetId c) {
             send_soap_ok(c, "GetMediaInfo", inner);
             return;
         }
-        if (strstr(req, "GetCurrentTransportActions")) {
+        if (strcmp(action, "GetCurrentTransportActions") == 0) {
             send_soap_ok(c, "GetCurrentTransportActions",
                          player_can_seek() ? "<Actions>Play,Stop,Pause,Seek</Actions>"
                                            : "<Actions>Play,Stop,Pause</Actions>");
             return;
         }
+        send_soap_fault(c, 401, "Invalid Action");
+        return;
     }
 
     if (strcmp(method, "POST") == 0 && strcmp(path, "/upnp/control/RenderingControl") == 0) {
-        if (strstr(req, "GetVolume")) {
+        char action[64] = "";
+        soap_action_name(req, body, action, sizeof(action));
+        if (strcmp(action, "GetVolume") == 0) {
             const char *body_ok =
                 "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
                 "<s:Body><u:GetVolumeResponse xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">"
                 "<CurrentVolume>50</CurrentVolume></u:GetVolumeResponse></s:Body></s:Envelope>";
             send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", body_ok, (int)strlen(body_ok));
-        } else if (strstr(req, "GetMute")) {
+        } else if (strcmp(action, "GetMute") == 0) {
             const char *body_ok =
                 "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
                 "<s:Body><u:GetMuteResponse xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">"
                 "<CurrentMute>0</CurrentMute></u:GetMuteResponse></s:Body></s:Envelope>";
             send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", body_ok, (int)strlen(body_ok));
-        } else {
+        } else if (strcmp(action, "SetVolume") == 0 || strcmp(action, "SetMute") == 0) {
+            // Accepted as a silent no-op: volume/mute aren't modeled (the PS4
+            // controls its own output), but faulting a control point's normal
+            // startup handshake here would be worse than answering OK.
             const char *rc_ok = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body/></s:Envelope>";
             send_response(c, "200 OK", "text/xml; charset=\"utf-8\"",
                           rc_ok, (int)strlen(rc_ok));
+        } else {
+            send_soap_fault(c, 401, "Invalid Action");
         }
         return;
     }
 
     if (strcmp(method, "POST") == 0 && strcmp(path, "/upnp/control/ConnectionManager") == 0) {
+        char action[64] = "";
+        soap_action_name(req, body, action, sizeof(action));
         const char *resp;
-        if (strstr(req, "GetProtocolInfo")) {
+        if (strcmp(action, "GetProtocolInfo") == 0) {
             resp = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
                    "<s:Body><u:GetProtocolInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">"
                    "<Source></Source><Sink>http-get:*:video/mp4:*,http-get:*:video/x-matroska:*,http-get:*:video/*:*</Sink>"
                    "</u:GetProtocolInfoResponse></s:Body></s:Envelope>";
-        } else if (strstr(req, "GetCurrentConnectionIDs")) {
+        } else if (strcmp(action, "GetCurrentConnectionIDs") == 0) {
             resp = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
                    "<s:Body><u:GetCurrentConnectionIDsResponse xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">"
                    "<ConnectionIDs>0</ConnectionIDs></u:GetCurrentConnectionIDsResponse></s:Body></s:Envelope>";
-        } else if (strstr(req, "GetCurrentConnectionInfo")) {
+        } else if (strcmp(action, "GetCurrentConnectionInfo") == 0) {
             resp = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
                    "<s:Body><u:GetCurrentConnectionInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">"
                    "<RcsID>0</RcsID><AVTransportID>0</AVTransportID>"
@@ -1812,7 +2059,8 @@ static void handle_client(OrbisNetId c) {
                    "<Direction>Input</Direction><Status>OK</Status>"
                    "</u:GetCurrentConnectionInfoResponse></s:Body></s:Envelope>";
         } else {
-            resp = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body/></s:Envelope>";
+            send_soap_fault(c, 401, "Invalid Action");
+            return;
         }
         send_response(c, "200 OK", "text/xml; charset=\"utf-8\"", resp, (int)strlen(resp));
         return;
@@ -1861,6 +2109,7 @@ static void handle_client(OrbisNetId c) {
         if (!u[0]) g_resN = 0;
         else for (int i = 0; i < g_resN; i++) if (strcmp(g_resUrl[i], u) == 0) { res_remove(i); break; }
         resume_save_file();
+        g_lists_ver++;
         scePthreadMutexUnlock(&g_mtx);
         send_response(c, "200 OK", "text/plain", "ok", 2); return;
     }
@@ -1874,6 +2123,7 @@ static void handle_client(OrbisNetId c) {
             for (int k = i; k < g_recentN - 1; k++) strncpy(g_recent[k], g_recent[k+1], URL_MAX - 1);
             g_recentN--; break;
         }
+        g_lists_ver++;
         scePthreadMutexUnlock(&g_mtx);
         send_response(c, "200 OK", "text/plain", "ok", 2); return;
     }
@@ -1898,14 +2148,13 @@ static void handle_client(OrbisNetId c) {
         char url[URL_MAX];
         strncpy(url, body, sizeof(url) - 1); url[sizeof(url) - 1] = '\0';
         for (int i = (int)strlen(url) - 1; i >= 0 && (url[i]=='\r'||url[i]=='\n'||url[i]==' '||url[i]=='\t'); i--) url[i] = '\0';
-        const int CAP = 512 * 1024;
+        const int CAP = 3 * 1024 * 1024;   // the channel store holds up to 2000 entries
         char *out = malloc(CAP);
         if (!out) { send_response(c, "200 OK", "application/json", "[]", 2); return; }
         int n = 0;
         if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {
             uint8_t *buf = NULL; int len = 0;
-            aseg_resume();   // sticky abort from a previous Stop must not block a web-UI playlist load
-            if (aseg_fetch(url, &buf, &len) == 0 && buf && len > 0) {
+            if (aseg_fetch_ui(url, &buf, &len) == 0 && buf && len > 0) {
                 uint8_t *txt = realloc(buf, (size_t)len + 1);
                 if (txt) {
                     buf = txt; buf[len] = '\0';
@@ -1953,11 +2202,16 @@ static void *server_main(void *arg) {
             continue;
         // A vanished phone must not leave the single HTTP worker blocked on an
         // unfinished upload forever. This is microseconds on Orbis/BSD sockets.
+        // (An actual upload's transfer runs on its own worker thread, which
+        // inherits this same timeout on `c` -- see handle_local_upload.)
         int tmo = 30 * 1000 * 1000;
         sceNetSetsockopt(c, SOL_SOCKET_PS4, SO_RCVTIMEO_PS4, &tmo, sizeof(tmo));
         sceNetSetsockopt(c, SOL_SOCKET_PS4, SO_SNDTIMEO_PS4, &tmo, sizeof(tmo));
+        g_upload_handoff = 0;
         handle_client(c);
-        sceNetSocketClose(c);
+        // A successful /upload handed `c` to its own worker thread, which
+        // owns the close; closing it here too would race that thread.
+        if (!g_upload_handoff) sceNetSocketClose(c);
     }
     return NULL;
 }

@@ -38,10 +38,12 @@ Use the extension only with media you are authorized to access.
 ## Pairing
 
 The receiver requires an 8-character pairing token on every command it accepts.
-You do not need to type it: `GET /token` is exempt from that check, so the
-extension asks the console for it the first time you save or test a receiver and
-remembers it. If the receiver ever regenerates its token, the next cast gets a
-401, and the extension re-pairs and retries once on its own.
+You do not need to type it: press **Square** on PS4 Cast's Cast home screen to
+open a 2-minute pairing window, then save or test the receiver in the popup.
+During that window `GET /token` answers without the token, so the extension
+fetches it and remembers it; outside the window the console never hands the
+token to an unpaired client. If the receiver ever regenerates its token, the
+next cast gets a 401: open the window again and the extension re-pairs.
 
 Pasting the TV's URL with `?t=` still works and takes precedence -- useful if you
 ever want to pin a specific token by hand.

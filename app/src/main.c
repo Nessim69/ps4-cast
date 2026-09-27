@@ -442,13 +442,24 @@ static void draw_lobby(Gfx *g, const char *ip, int net_ok) {
         panel(g, px, py, pw, ph, 8, SURF2, 235);
         gfx_circle(g, px + 30, py + ph / 2, 6, LIVE);
         gtext(g, px + 52, py + (ph - 32) / 2, url, 4, TXT, 0);
-        ctext(g, py + ph + 28, "Browser helper, direct link, or DLNA / UPnP", 2, FAINT, 0);
+        // The pairing token is only handed to an unauthenticated client (the
+        // Chrome extension's auto-pair) while the owner holds this window open
+        // from the couch; show it counting down where the hint line sits.
+        int pairLeft = httpd_pairing_window_left();
+        if (pairLeft > 0) {
+            char pw2[80];
+            snprintf(pw2, sizeof(pw2), "Pairing open  %ds  -  the Chrome extension can pair now", pairLeft);
+            ctext(g, py + ph + 28, pw2, 2, LIVE, 0);
+        } else {
+            ctext(g, py + ph + 28, "Browser helper, direct link, or DLNA / UPnP", 2, FAINT, 0);
+        }
     } else {
         ctext(g, 470, "No network connection", 5, TXT, 0);
         ctext(g, 560, "Connect the PS4 to Wi-Fi or LAN, then relaunch.", 3, MUT, 0);
     }
 
-    ctext(g, 1010, "L1 / R1  switch mode        Triangle  exit", 2, MUT, 0);
+    ctext(g, 1010, net_ok ? "L1 / R1  switch mode      Square  pair extension      Triangle  exit"
+                          : "L1 / R1  switch mode        Triangle  exit", 2, MUT, 0);
 }
 
 #ifndef BOOT_MINIMAL
@@ -1038,6 +1049,14 @@ int main(void) {
             if ((pressed & ORBIS_PAD_BUTTON_R1) && homeMode != HOME_IPTV) {
                 homeMode = HOME_IPTV; home_mode_save(homeMode);
             }
+            // Square on the Cast home opens the 2-minute pairing window: the only
+            // time GET /token answers without the token, so pairing the Chrome
+            // extension needs someone at the TV. (Live TV uses Square for
+            // favourites, hence Cast mode only.)
+            if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && homeMode == HOME_CAST && net_ok) {
+                httpd_pairing_window_open(120);
+                notify("Pairing open for 2 minutes - pair the Chrome extension now");
+            }
 
             if (homeMode == HOME_IPTV && nch > 0) {
                 if (!inChannels) {
@@ -1494,6 +1513,9 @@ int main(void) {
     // wedged in an unabortable call is left alone (it may be inside the audio
     // path too); LoadExec reaps the whole process either way.
     if (player_shutdown() == 0) audio_shutdown();
+    // Tell DLNA control points the renderer is leaving (ssdp:byebye) instead of
+    // leaving a dead entry in their device lists until max-age expires.
+    if (net_ok) ssdp_shutdown();
     // Clean close: returning from main / _exit can be read by the system as an
     // abnormal termination and pop the "application closed" crash dialog. LoadExec
     // ("exit") is the recognized normal app-exit path → returns to the home menu

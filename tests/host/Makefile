@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -Wno-unused-parameter -g -O1 -std=gnu11
 
 SRC = ../../app/src
 
-TESTS = test_hls_parse test_urlopt test_resolve test_qr
+TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token
 
 all: $(TESTS)
 
@@ -23,6 +23,14 @@ test_resolve: test_resolve.c
 test_qr: test_qr.c $(SRC)/qr.c $(SRC)/qrcodegen.c
 	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_qr.c $(SRC)/qr.c $(SRC)/qrcodegen.c
 
+# Opener worker's latest-wins request slot (app/src/openq.c).
+test_openq: test_openq.c $(SRC)/openq.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_openq.c $(SRC)/openq.c
+
+# Pairing token alphabet/validator/derivation (app/src/pairing.c).
+test_token: test_token.c $(SRC)/pairing.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_token.c $(SRC)/pairing.c
+
 test: all
 	@for t in $(TESTS); do ./$$t || exit 1; done
 	@./test_qr > /tmp/qr_now.txt
@@ -34,9 +42,3 @@ clean:
 	rm -f $(TESTS)
 
 .PHONY: all test clean
-
-# Opener worker's latest-wins request slot (app/src/openq.c): pure, links directly.
-TESTS += test_openq
-all: test_openq
-test_openq: test_openq.c $(SRC)/openq.c
-	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_openq.c $(SRC)/openq.c
