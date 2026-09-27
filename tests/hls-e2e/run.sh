@@ -7,7 +7,8 @@
 #   EXT-X-BYTERANGE (206, and a server that ignores Range), encrypted init +
 #   ranged fMP4, a master with an encrypted data:-URI audio rendition, a
 #   refetch of a bad cached key, the httpsrc->aseg init fallback, DRM refusal,
-#   and the TS segment-demux path.
+#   the TS segment-demux path, and audio-rendition choice (default, preferred
+#   language, a track picked by name; other groups never offered).
 #
 # Needs python3 with `cryptography` and the BearSSL tree portlibs/fetch.sh
 # unpacks (BEARSSL_SRC to override). Skips (exit 0) when either is missing.
@@ -29,7 +30,7 @@ AES="$BEARSSL_SRC/src/symcipher"
 ${CC:-cc} -std=gnu11 -g -O1 -w -fsanitize=address,undefined ${E2E_CFLAGS:-} \
   -I"$HERE/shim" -I"$A" -I"$BEARSSL_SRC/inc" -I"$BEARSSL_SRC/src" -o "$W/e2e" \
   "$HERE/driver.c" "$HERE/stubs.c" "$A/hls.c" "$A/hls_parse.c" "$A/hls_crypt.c" "$A/aseg.c" \
-  "$A/httpsrc.c" "$A/urlopt.c" "$A/netpolicy.c" \
+  "$A/httpsrc.c" "$A/urlopt.c" "$A/netpolicy.c" "$A/lang.c" \
   "$AES/aes_big_cbcdec.c" "$AES/aes_big_dec.c" "$AES/aes_common.c" "$AES/aes_x86ni.c" "$AES/aes_x86ni_cbcdec.c" \
   -lpthread || { echo "hls-e2e: build failed"; exit 1; }
 "$PY" "$HERE/server.py" "$W/out" 0 >"$W/server.err" 2>&1 & SRV=$!
@@ -53,5 +54,8 @@ run "bad cached key refetched"   "" "$U/rot/index.m3u8"  "$O/rot.bin"
 run "init via aseg fallback"     "" "$U/fb/index.m3u8"   "$O/fb.bin"
 run "drm refused"                "" "$U/drm/index.m3u8"  -
 run "segdemux aes-128"           "SEGDEMUX=1" "$U/aes/index.m3u8" "$O/aes.bin"
+run "audio: default rendition"   "EXPECT_RENDS=3" "$U/ml/master.m3u8" "$O/plain.bin" "$O/ml_en.bin"
+run "audio: preferred language"  "EXPECT_RENDS=3 APREF_LANG=fra" "$U/ml/master.m3u8" "$O/plain.bin" "$O/ml_fr.bin"
+run "audio: picked by name"      "EXPECT_RENDS=3 APREF_NAME=Deutsch APREF_LANG=fra" "$U/ml/master.m3u8" "$O/plain.bin" "$O/ml_de.bin"
 [ "$fail" = 0 ] && echo "hls-e2e: all ok" || echo "hls-e2e: FAILURES"
 exit $fail

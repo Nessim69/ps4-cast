@@ -659,6 +659,18 @@ static void draw_hud(Gfx *g, PlaybackOrigin origin) {
     gfx_circle(g, barX + 6, barY - 32, 6, paused ? WARN : LIVE);
     stext(g, barX + 24, barY - 44, state, 3, paused ? WARN : TXT);
 
+    // Audio track (only when there is a choice): R3 steps through them.
+    PlayerAudioTrack at[PLAYER_MAX_AUDIO];
+    int acur = -1, an = player_audio_tracks(at, PLAYER_MAX_AUDIO, &acur);
+    if (an >= 2) {
+        int k = -1;
+        for (int i = 0; i < an; i++) if (at[i].id == acur) k = i;
+        char aud[120];
+        if (k >= 0) snprintf(aud, sizeof(aud), "R3  Audio: %.60s  %d/%d", at[k].label, k + 1, an);
+        else snprintf(aud, sizeof(aud), "R3  Audio: %d tracks", an);
+        stext(g, barX + barW - gfx_text_w(aud, 3), barY - 44, aud, 3, MUT);
+    }
+
     if (dur > 0) {
         // seekable VOD: scrubber + times
         gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
@@ -1276,6 +1288,19 @@ int main(void) {
                 player_stop();
                 guideOpen = 0;
                 everDrew = 0; reconnecting = 0; reconnects = 0;
+            }
+            if (pressed & ORBIS_PAD_BUTTON_R3) {
+                // Next audio track (the switch reopens at this position).
+                PlayerAudioTrack at[PLAYER_MAX_AUDIO];
+                int acur = -1, an = player_audio_tracks(at, PLAYER_MAX_AUDIO, &acur);
+                if (an >= 2) {
+                    int k = 0;
+                    for (int i = 0; i < an; i++) if (at[i].id == acur) k = i;
+                    k = (k + 1) % an;
+                    if (player_select_audio(at[k].id) == 0) notify("Audio: %s", at[k].label);
+                } else {
+                    notify("This video has a single audio track");
+                }
             }
         }
 

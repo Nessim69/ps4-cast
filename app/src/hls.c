@@ -4,6 +4,7 @@
 #include "aseg.h"
 #include "hls_parse.h"
 #include "hls_crypt.h"
+#include "lang.h"
 #include "trace.h"
 
 #include <stdio.h>
@@ -959,32 +960,73 @@ static int attr_quoted(const char *line, const char *key, char *out, int cap) {
     return 1;
 }
 
-// Scan a master playlist for the audio rendition (EXT-X-MEDIA:TYPE=AUDIO) whose
-// GROUP-ID matches `group`, preferring DEFAULT=YES. Only renditions that carry
-// their own URI (separately-delivered audio) are considered. Resolves the chosen
-// URI against `base` into out[]. Returns 0 on success, -1 if none found.
+// Audio renditions of the playing variant's group, and the preference the
+// next open applies (hls_set_audio_pref).
+static HlsAudioRendition g_arends[HLS_MAX_AUDIO_RENDITIONS];
+static int               g_arendN, g_arendCur = -1;
+static char              g_aPrefName[64], g_aPrefLang[16];
+
+void hls_set_audio_pref(const char *name, const char *lang) {
+    snprintf(g_aPrefName, sizeof(g_aPrefName), "%s", name ? name : "");
+    snprintf(g_aPrefLang, sizeof(g_aPrefLang), "%s", lang ? lang : "");
+}
+
+int hls_audio_renditions(HlsAudioRendition *out, int max, int *cur) {
+    int n = g_audioReady ? g_arendN : 0;
+    if (n > max) n = max;
+    if (out) memcpy(out, g_arends, sizeof(HlsAudioRendition) * (size_t)n);
+    if (cur) *cur = n ? g_arendCur : -1;
+    return n;
+}
+
+// Scan a master playlist for the audio renditions (EXT-X-MEDIA:TYPE=AUDIO)
+// with their own URI (separately-delivered audio) in GROUP-ID `group` (all
+// groups if none matches), record them for hls_audio_renditions, and pick one:
+// the NAME the user chose, else the preferred LANGUAGE, else DEFAULT=YES,
+// else the first. Resolves its URI against `base` into out[]. Returns 0, or
+// -1 if there is none.
 static int find_audio_uri(const char *body, const char *base, const char *group,
                           char *out, int cap) {
-    char bestUri[2048] = ""; int bestRank = -1;
-    const char *p = body;
-    while ((p = strstr(p, "#EXT-X-MEDIA")) != NULL) {
-        const char *eol = strchr(p, '\n'); if (!eol) eol = p + strlen(p);
-        int linelen = (int)(eol - p);
-        char line[1024];
-        int cl = linelen < (int)sizeof(line) ? linelen : (int)sizeof(line) - 1;
-        memcpy(line, p, cl); line[cl] = '\0';
-        p = eol;
-        if (!strstr(line, "TYPE=AUDIO")) continue;
-        char uri[2048];
-        if (!attr_quoted(line, "URI=", uri, sizeof(uri))) continue;  // muxed default: skip
-        char gid[64] = ""; attr_quoted(line, "GROUP-ID=", gid, sizeof(gid));
-        int isDefault = strstr(line, "DEFAULT=YES") != NULL;
-        int matches = (group && group[0] && strcmp(gid, group) == 0);
-        int rank = (matches ? 2 : 0) + (isDefault ? 1 : 0);  // matching group + default = best
-        if (rank > bestRank) { bestRank = rank; strncpy(bestUri, uri, sizeof(bestUri) - 1); bestUri[sizeof(bestUri)-1] = '\0'; }
+    static char uris[HLS_MAX_AUDIO_RENDITIONS][2048];   // open path only (single-threaded)
+    int groupSeen = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        // Pass 0: does any rendition carry the variant's group? Pass 1: collect.
+        g_arendN = 0;
+        const char *p = body;
+        while ((p = strstr(p, "#EXT-X-MEDIA")) != NULL && g_arendN < HLS_MAX_AUDIO_RENDITIONS) {
+            const char *eol = strchr(p, '\n'); if (!eol) eol = p + strlen(p);
+            int linelen = (int)(eol - p);
+            char line[1024];
+            int cl = linelen < (int)sizeof(line) ? linelen : (int)sizeof(line) - 1;
+            memcpy(line, p, cl); line[cl] = '\0';
+            p = eol;
+            if (!strstr(line, "TYPE=AUDIO")) continue;
+            char uri[2048];
+            if (!attr_quoted(line, "URI=", uri, sizeof(uri))) continue;  // muxed: not a separate rendition
+            char gid[64] = ""; attr_quoted(line, "GROUP-ID=", gid, sizeof(gid));
+            int inGroup = group && group[0] && strcmp(gid, group) == 0;
+            if (pass == 0) { groupSeen |= inGroup; continue; }
+            if (groupSeen && !inGroup) continue;
+            HlsAudioRendition *r = &g_arends[g_arendN];
+            r->name[0] = r->lang[0] = '\0';
+            attr_quoted(line, "NAME=", r->name, sizeof(r->name));
+            attr_quoted(line, "LANGUAGE=", r->lang, sizeof(r->lang));
+            r->isDefault = strstr(line, "DEFAULT=YES") != NULL;
+            snprintf(uris[g_arendN], sizeof(uris[0]), "%s", uri);
+            g_arendN++;
+        }
     }
-    if (bestRank < 0) return -1;
-    hlspl_resolve_url(base, bestUri, out, cap);
+    int best = -1, bestRank = -1;
+    for (int i = 0; i < g_arendN; i++) {
+        HlsAudioRendition *r = &g_arends[i];
+        int rank = (g_aPrefName[0] && strcmp(r->name, g_aPrefName) == 0 ? 8 : 0) +
+                   (g_aPrefLang[0] && lang_matches(g_aPrefLang, r->lang[0] ? r->lang : r->name) ? 4 : 0) +
+                   (r->isDefault ? 1 : 0);
+        if (rank > bestRank) { bestRank = rank; best = i; }
+    }
+    g_arendCur = best;
+    if (best < 0) return -1;
+    hlspl_resolve_url(base, uris[best], out, cap);
     return 0;
 }
 
@@ -1002,6 +1044,7 @@ static void free_asegs(void) {
     if (g_aBuf) { free(g_aBuf); g_aBuf = NULL; }
     g_asegIdx = 0; g_aInitPending = 0;
     g_aBufLen = g_aBufPos = 0; g_audioReady = 0;
+    g_arendN = 0; g_arendCur = -1;
 }
 
 // Set up the separate audio path for the chosen variant: locate its rendition,

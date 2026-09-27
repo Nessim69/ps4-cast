@@ -77,6 +77,10 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
 .times{display:flex;justify-content:space-between;margin-top:9px;font-size:11.5px;color:var(--mut);
  font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
 .transport{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:13px}
+.aud{display:flex;align-items:center;gap:10px;margin-top:12px;font-size:12px;color:var(--mut)}
+.aud label{font-weight:700;text-transform:uppercase;letter-spacing:.35px;font-size:11px}
+.pick{flex:1;min-width:0;height:34px;border-radius:8px;border:1px solid var(--line2);background:#0c1226;color:var(--txt);font:inherit;font-size:13px;padding:0 8px}
+.set .pick{flex:none;width:132px}
 .tbtn{width:46px;height:46px;border-radius:50%;border:1px solid var(--line);background:var(--surf2);color:var(--txt);
  display:grid;place-items:center;cursor:pointer;transition:.14s}
 .tbtn:active{transform:scale(.9)}.tbtn svg{width:22px;height:22px}
@@ -255,6 +259,7 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
    <button class="tbtn" onclick="skip(15)" aria-label="Forward 15s"><svg viewBox="0 0 24 24" fill="none"><path d="M13 6l6 6-6 6M5 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
    <button class="tbtn stop" onclick="stop()" aria-label="Stop"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2.2"/></svg></button>
   </div>
+  <div class="aud" id="audRow" hidden><label for="aud">Audio</label><select class="pick" id="aud" onchange="pickAudio(this.value)"></select></div>
  </section>
 
  <section class="failure" id="failure" hidden>
@@ -357,6 +362,12 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
  <div class="set">
   <div class="txt"><div class="a">Verify HTTPS certificates</div><div class="b" id="tlsText">Check that HTTPS sources are who they claim to be. Local-network servers are always allowed. Turn off only for a source you trust whose certificate the PS4 rejects.</div></div>
   <div class="sw" id="swTls" onclick="toggleTls()"></div>
+ </div>
+ <div class="set">
+  <div class="txt"><div class="a">Audio language</div><div class="b">Play this language first when a video or stream offers several. Switch the track of what's playing from Now Playing (on the TV: R3).</div></div>
+  <select class="pick" id="alang" onchange="setAlang(this.value)">
+   <option value="">Stream default</option><option value="eng">English</option><option value="fra">French</option><option value="deu">German</option><option value="spa">Spanish</option><option value="ita">Italian</option><option value="por">Portuguese</option><option value="nld">Dutch</option><option value="ara">Arabic</option><option value="tur">Turkish</option><option value="rus">Russian</option><option value="pol">Polish</option><option value="hin">Hindi</option><option value="urd">Urdu</option><option value="fas">Persian</option><option value="jpn">Japanese</option><option value="kor">Korean</option><option value="zho">Chinese</option>
+  </select>
  </div>
  <div class="set">
   <div class="txt"><div class="a">Pairing required</div><div class="b">Reject cast and settings commands without the token shown on the TV. DLNA stays available either way.</div></div>
@@ -781,6 +792,16 @@ function setSeek(v){var m=+$('sk').max||100;$('sk').style.setProperty('--p',(m?(
 $('sk').addEventListener('input',function(){drag=true;setSeek(+this.value);$('cur').textContent=fmt(+this.value)});
 $('sk').addEventListener('change',async function(){await post('/seek',''+this.value);drag=false});
 
+/* Audio tracks: the select is rebuilt only when the list itself changes, so a
+   poll never resets it under the user's finger. */
+var audKey='',audBusy=0;
+function renderAudio(j,on){var t=on&&j.audio_tracks&&j.audio_tracks.length>1?j.audio_tracks:[];
+ $('audRow').hidden=!t.length;var k=JSON.stringify(t);
+ if(k!==audKey){audKey=k;var h='';for(var i=0;i<t.length;i++)h+='<option value="'+t[i].id+'">'+esc(t[i].label)+'</option>';$('aud').innerHTML=h}
+ if(t.length&&!audBusy&&j.audio_cur!=null&&j.audio_cur>=0)$('aud').value=''+j.audio_cur;
+ if(j.alang!=null&&document.activeElement!==$('alang')){var a=$('alang');if(![].some.call(a.options,function(o){return o.value===j.alang})){var o=document.createElement('option');o.value=o.textContent=j.alang;a.appendChild(o)}a.value=j.alang}}
+async function pickAudio(id){audBusy=1;busy(true);msg('Switching audio…');var r=await post('/audio',''+id);if(!r||!r.ok)msg('Could not switch the audio track');setTimeout(function(){audBusy=0},4000)}
+async function setAlang(v){await post('/alang',v);msg(v?'Audio language saved':'Using each stream\'s default audio')}
 async function poll(){if(document.hidden||uploading)return;var j=await getj('/status');
  if(!j){$('dot').className='dot';$('state').textContent='offline';busy(false);msg('Reconnecting to PS4…');return}
  var on=j.active==1||j.paused==1;
@@ -799,6 +820,7 @@ async function poll(){if(document.hidden||uploading)return;var j=await getj('/st
  if(j.debug!=null){dbg=j.debug;setSw('swDbg',dbg)}
  if(j.tls_verify!=null){tlsv=j.tls_verify;setSw('swTls',tlsv)}
  if(j.pair!=null){pair=j.pair;setSw('swPair',pair)}
+ renderAudio(j,on);
  if(!authLost&&document.getElementById('tokVal')&&document.getElementById('tokVal').textContent==='—')showToken()
  if(j.chan_cur!=null&&j.chan_cur!=chanCur){chanCur=j.chan_cur;if(plData.length)renderPane('pl')}
  if(j.error_code)showFailure(j);else if(on)$('failure').hidden=true;

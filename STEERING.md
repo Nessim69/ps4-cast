@@ -576,3 +576,23 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
   different one after 2 consecutive polls, a loss after 3.
 - Open connections to the old address (phone UI, a playing stream) still drop
   with it; the phone must reopen the URL shown on the TV.
+
+## Audio tracks
+
+- Tracks are a container's audio streams (MKV/MP4/TS, `audiotrack.c`) or,
+  for HLS with separate audio, the renditions of the playing variant's
+  GROUP-ID (`hls.c`, NAME/LANGUAGE/DEFAULT). `/status` lists them
+  (`audio_tracks`, `audio_cur`) when there are two or more.
+- Switching (`POST /audio`, web Now Playing picker, TV R3) reopens the source
+  at the current position through the opener worker -- the fMP4
+  quality-switch path -- so a codec change (AAC -> AC-3) gets a fresh
+  decoder. Plain files now honour the reopen position too (queued seek before
+  the decode thread starts). Live streams reopen at the live edge.
+- The pick is keyed by the replay spec: it survives the reopen and a re-cast
+  of the same source, never another stream. Renditions are re-found by NAME
+  and LANGUAGE, not position; TS segment-demux follows the chosen PID.
+- Settings -> Audio language (`POST /alang`, persisted as `alang=`) picks the
+  first decodable track in that language for new sources (`lang.c`
+  normalises en/eng/English, fre/fra, ger/deu, ...).
+- Host tests: `test_lang`; `test_audiotrack` with `FFMPEG_HOST=<host ffmpeg
+  prefix>`; the rendition choice runs in `tests/hls-e2e`.

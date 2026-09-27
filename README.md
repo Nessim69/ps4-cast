@@ -54,7 +54,10 @@ The build output is **`dist/PS4-Cast-v<version>.pkg`**. Two ways to install:
    The receiver keeps listening in both modes.
 7. During IPTV playback, **Down** opens the channel guide, **L1/R1** changes
    channel and **L2/R2** changes bouquet. During cast playback, Left/Right and
-   L1/R1 seek instead. Cross pauses, Circle stops and Triangle exits.
+   L1/R1 seek instead. Cross pauses, Circle stops and Triangle exits. When a
+   video has several audio tracks (languages, commentary), R3 switches between
+   them; the web UI's Now Playing card has a picker, and Settings sets a
+   preferred audio language.
 
 ### Cast directly from Chrome
 

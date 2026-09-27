@@ -52,6 +52,14 @@ void hls_close(void);
 // rendition's segments (on a separate connection) as one continuous byte stream,
 // to be demuxed/decoded independently and synced to the audio clock.
 int  hls_has_audio(void);
+// The separate audio renditions offered for the playing variant (EXT-X-MEDIA
+// TYPE=AUDIO with a URI, in its GROUP-ID), and which one is playing.
+#define HLS_MAX_AUDIO_RENDITIONS 16
+typedef struct { char name[64]; char lang[16]; int isDefault; } HlsAudioRendition;
+int  hls_audio_renditions(HlsAudioRendition *out, int max, int *cur);
+// Rendition to prefer at the next hls_open: exact NAME (the user picked it),
+// else LANGUAGE (Settings), else DEFAULT=YES. NULL/"" = no preference.
+void hls_set_audio_pref(const char *name, const char *lang);
 int  hls_audio_read(uint8_t *buf, uint32_t len);   // >0 bytes, 0 = end
 void hls_audio_abort(void);                          // unblock a stuck fetch (Stop/cast)
 

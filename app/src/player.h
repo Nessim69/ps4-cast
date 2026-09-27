@@ -51,6 +51,20 @@ uint64_t player_rx_total(void);      // total network bytes pulled (active sourc
 void player_set_avsync(int ms);      // +ms delays video (video-ahead), -ms advances it
 int  player_get_avsync(void);        // current A/V sync trim, ms
 
+// Audio tracks: the stream's audio streams (MKV/MP4/TS languages) or, for HLS
+// with separate audio, its renditions. Any thread.
+#define PLAYER_MAX_AUDIO 16
+typedef struct { int id; char label[72]; char lang[16]; } PlayerAudioTrack;
+int  player_audio_tracks(PlayerAudioTrack *out, int max, int *cur); // count; *cur = playing id (-1)
+// Switch to track `id`: reopens at the current position (a codec change such
+// as AAC -> AC-3 needs a new decoder anyway). 0 = switching, -1 = unknown id,
+// already playing, or nothing is playing. The choice sticks to this source.
+int  player_select_audio(int id);
+// Preferred audio language for newly opened sources (any ISO 639 form or a
+// name, "" = the stream's default). Settings -> Audio language.
+void player_set_audio_lang(const char *lang);
+const char *player_audio_lang(void);
+
 // Live playback telemetry for the on-screen stats overlay.
 typedef struct {
     int    hw;            // 1 = hardware H.264 decode, 0 = software

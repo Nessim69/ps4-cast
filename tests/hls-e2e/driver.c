@@ -35,12 +35,22 @@ int main(int argc, char **argv) {
     alarm(120);             // a stuck stream (e.g. an init segment replayed forever) fails, never hangs
     aseg_init();
     const char *url = argv[1], *want = argv[2];
+    if (getenv("APREF_NAME") || getenv("APREF_LANG"))
+        hls_set_audio_pref(getenv("APREF_NAME"), getenv("APREF_LANG"));
     int rc = hls_open(url);
     if (strcmp(want, "-") == 0) {
         printf("open rc=%d reason=[%s] dbg=[%s]\n", rc, hls_unsupported_reason(), hls_debug());
         return rc == 0;   // must fail
     }
     if (rc != 0) { printf("OPEN FAILED rc=%d dbg=%s\n", rc, hls_debug()); return 1; }
+    if (getenv("EXPECT_RENDS")) {        // audio renditions offered for the variant
+        HlsAudioRendition r[HLS_MAX_AUDIO_RENDITIONS];
+        int cur = -1, n = hls_audio_renditions(r, HLS_MAX_AUDIO_RENDITIONS, &cur);
+        printf("renditions=%d cur=%d:", n, cur);
+        for (int i = 0; i < n; i++) printf(" [%s/%s%s]", r[i].name, r[i].lang, r[i].isDefault ? "/default" : "");
+        printf("\n");
+        if (n != atoi(getenv("EXPECT_RENDS"))) { printf("rendition count mismatch\n"); return 1; }
+    }
     printf("dbg: %.160s\n", hls_debug());
     long wn, gn; unsigned char *w = slurp(want, &wn), *g;
     if (getenv("SEGDEMUX")) {           // the player's TS segment-demux path

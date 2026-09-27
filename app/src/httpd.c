@@ -261,18 +261,19 @@ static int token_exempt(const char *path) {
 static void cfg_save(void) {
     int fd = sceKernelOpen(CFG_PATH, 0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
     if (fd < 0) return;
-    char line[96];
+    char line[160];
     // avsync is user-tuned for their TV/soundbar; losing it on every relaunch
     // (while channels/recent/resume persisted) was an inconsistency.
-    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\npair=%d\ntlsverify=%d\n",
-                     notify_get_debug(), player_get_avsync(), g_cfgPair, tls_verify_enabled());
+    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\npair=%d\ntlsverify=%d\nalang=%s\n",
+                     notify_get_debug(), player_get_avsync(), g_cfgPair, tls_verify_enabled(),
+                     player_audio_lang());
     sceKernelWrite(fd, line, n);
     sceKernelClose(fd);
 }
 static void cfg_load(void) {
     int fd = sceKernelOpen(CFG_PATH, 0 /*O_RDONLY*/, 0);
     if (fd < 0) return;
-    char buf[128];
+    char buf[256];
     int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
     sceKernelClose(fd);
     if (n <= 0) return;
@@ -285,6 +286,14 @@ static void cfg_load(void) {
     if (p) g_cfgPair = atoi(p + 5) ? 1 : 0;
     const char *tv = strstr(buf, "tlsverify=");   // absent (older config) = on
     if (tv) tls_set_verify(atoi(tv + 10) ? 1 : 0);
+    const char *al = strstr(buf, "alang=");
+    if (al) {
+        char lang[16];
+        int k = 0;
+        for (al += 6; al[k] && al[k] != '\n' && k < (int)sizeof(lang) - 1; k++) lang[k] = al[k];
+        lang[k] = '\0';
+        player_set_audio_lang(lang);
+    }
 }
 
 // ---- resume positions: remember where each VOD was stopped, resume on replay.
@@ -1658,7 +1667,7 @@ static void handle_client(OrbisNetId c) {
         player_debug(dbg, sizeof(dbg));
         // Static because long URLs can nearly double when JSON-escaped; keeping
         // this off the HTTP thread's stack also leaves headroom for diagnostics.
-        static char json[6144];
+        static char json[8192];
         int active = player_is_active();
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
@@ -1693,6 +1702,20 @@ static void handle_client(OrbisNetId c) {
         JAPP(",\"fps\":%d,\"avsync\":%d,\"error_code\":", sys_get_fps(), player_get_avsync());
         json_str(json, cap, &o, player_error_code(), 31);
         JAPP(",\"error_message\":"); json_str(json, cap, &o, player_error_message(), 255);
+        {   // Audio tracks, listed only when there is a choice to make.
+            PlayerAudioTrack at[PLAYER_MAX_AUDIO];
+            int acur = -1, an = player_audio_tracks(at, PLAYER_MAX_AUDIO, &acur);
+            JAPP(",\"audio_cur\":%d,\"alang\":", acur);
+            json_str(json, cap, &o, player_audio_lang(), 15);
+            JAPP(",\"audio_tracks\":[");
+            for (int i = 0; an >= 2 && i < an; i++) {
+                JAPP("%s{\"id\":%d,\"label\":", i ? "," : "", at[i].id);
+                json_str(json, cap, &o, at[i].label, 71);
+                JAPP(",\"lang\":"); json_str(json, cap, &o, at[i].lang, 15);
+                JAPP("}");
+            }
+            JAPP("]");
+        }
         JAPP("}");
 #undef JAPP
         json[o] = '\0';
@@ -1748,6 +1771,31 @@ static void handle_client(OrbisNetId c) {
         tls_set_verify(on);
         cfg_save();
         send_response(c, "200 OK", "text/plain", on ? "verify on" : "verify off", on ? 9 : 10);
+        return;
+    }
+
+    // Audio track of the playing source: POST /audio body "<id>" (an id from
+    // /status audio_tracks). Reopens at the current position.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/audio") == 0) {
+        if (player_select_audio(atoi(body)) == 0) send_response(c, "200 OK", "text/plain", "switching", 9);
+        else send_response(c, "409 Conflict", "text/plain", "no such track or already playing", 32);
+        return;
+    }
+
+    // Settings: preferred audio language for newly opened sources. POST
+    // /alang body "eng" / "fr" / "" (= the stream's default track).
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/alang") == 0) {
+        char lang[16];
+        int k = 0;
+        for (; body[k] && k < (int)sizeof(lang) - 1; k++) {
+            char ch = body[k];
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '-' || ch == '_')) break;
+            lang[k] = ch;
+        }
+        lang[k] = '\0';
+        player_set_audio_lang(lang);
+        cfg_save();
+        send_response(c, "200 OK", "text/plain", "ok", 2);
         return;
     }
 

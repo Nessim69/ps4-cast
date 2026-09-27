@@ -98,6 +98,21 @@ files["/pm/master.m3u8"] = "\n".join(["#EXTM3U",
     '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01e"', "/plain/index.m3u8",
     '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS="avc1.64001f"', "/plain/index.m3u8"]).encode()
 
+# 10) master with several audio renditions (English default, French, German
+#     named "Deutsch") plus one in another group that must never be offered
+for code, seed in (("en", 80), ("fr", 81), ("de", 82), ("xx", 83)):
+    a = [rnd(2500 + i, seed * 10 + i) for i in range(2)]
+    for i in range(2): files[f"/ml/{code}{i}.aac"] = a[i]
+    files[f"/ml/{code}.m3u8"] = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:4"] +
+        sum([["#EXTINF:4,", f"{code}{i}.aac"] for i in range(2)], []) + ["#EXT-X-ENDLIST"]).encode()
+    expect(f"ml_{code}.bin", b"".join(a))
+files["/ml/master.m3u8"] = "\n".join(["#EXTM3U",
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="other",NAME="Decoy",LANGUAGE="fr",URI="xx.m3u8"',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="en.m3u8"',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Francais",LANGUAGE="fr",URI="fr.m3u8"',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Deutsch",LANGUAGE="de",URI="de.m3u8"',
+    '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01e,mp4a.40.2",AUDIO="aud"', "/plain/index.m3u8"]).encode()
+
 log = open(os.path.join(OUT, "server.log"), "w")
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"

@@ -17,6 +17,8 @@
 #include "openq.h"
 #include "tls.h"
 #include "watchdog.h"
+#include "lang.h"
+#include "audiotrack.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -92,6 +94,22 @@ static AVFrame          *g_aframe;
 static int16_t          *g_abuf;      // resampled S16 stereo scratch
 static int               g_abufCap;   // in stereo frames
 static int               g_haveAudio = 0;
+// Audio tracks (player_audio_tracks). The user's pick is keyed by the replay
+// spec, so it survives the reopen that applies it (and a re-cast of the same
+// source) but never leaks into another stream. Ids below AUDIO_REND_ID are
+// container stream indices; from it up, HLS audio renditions.
+#define AUDIO_REND_ID 100
+static char              g_aPickSpec[OPENQ_SPEC_MAX];
+static int               g_aPickId = -1;
+static char              g_aPickName[64];      // the picked rendition's NAME...
+static char              g_aPickLang[16];      // ...and LANGUAGE
+static char              g_aLangPref[16];      // Settings: preferred language, "" = stream default
+static PlayerAudioTrack  g_aTracks[PLAYER_MAX_AUDIO];
+static int               g_aTrackN, g_aTrackCur = -1;
+static volatile int      g_aTrackLock;
+static int               g_aSegPid = -1;       // TS PID of the playing muxed track (segment demux)
+static void atrack_lock(void)   { while (__atomic_exchange_n(&g_aTrackLock, 1, __ATOMIC_ACQUIRE)) sceKernelUsleep(50); }
+static void atrack_unlock(void) { __atomic_store_n(&g_aTrackLock, 0, __ATOMIC_RELEASE); }
 // Stream layout is constant within an HLS rendition, but av_find_best_stream
 // can transiently fail on a fresh per-segment TS. Cache the last-known-good
 // indices so audio/video never drop out between segments.
@@ -489,6 +507,8 @@ static void player_teardown(void) {
     if (g_afmt)  { avformat_close_input(&g_afmt); }
     if (g_aavio) { av_freep(&g_aavio->buffer); avio_context_free(&g_aavio); }
     g_astream = -1; g_aastream = -1; g_haveAudio = 0; g_sepAudioMode = 0; g_sepAudioEof = 0;
+    atrack_lock(); g_aTrackN = 0; g_aTrackCur = -1; atrack_unlock();
+    g_aSegPid = -1;
     if (g_sws)   { sws_freeContext(g_sws); g_sws = NULL; }
     if (g_frame) { av_frame_free(&g_frame); }
     if (g_pkt)   { av_packet_free(&g_pkt); }
@@ -622,6 +642,63 @@ static int set_cert_error(unsigned vfGen0) {
     return 1;
 }
 
+// ---- audio tracks -------------------------------------------------------------
+
+// The user's pick for this source, else the preferred language, else best.
+static int pick_audio_stream(const AVCodec **adec) {
+    int pick = (strcmp(g_aPickSpec, g_playSpec) == 0 && g_aPickId < AUDIO_REND_ID) ? g_aPickId : -1;
+    return atrack_pick(g_fmt, pick, g_aLangPref, adec);
+}
+
+static void build_audio_tracks(void) {
+    PlayerAudioTrack t[PLAYER_MAX_AUDIO];
+    int n = 0, cur = -1;
+    if (g_sepAudioMode) {
+        HlsAudioRendition r[HLS_MAX_AUDIO_RENDITIONS];
+        int rc = -1, rn = hls_audio_renditions(r, HLS_MAX_AUDIO_RENDITIONS, &rc);
+        for (int i = 0; i < rn && n < PLAYER_MAX_AUDIO; i++, n++) {
+            const char *nm = r[i].lang[0] ? lang_name(r[i].lang) : NULL;
+            t[n].id = AUDIO_REND_ID + i;
+            if (r[i].name[0]) snprintf(t[n].label, sizeof(t[n].label), "%s", r[i].name);
+            else if (nm) snprintf(t[n].label, sizeof(t[n].label), "%s", nm);
+            else snprintf(t[n].label, sizeof(t[n].label), "Audio %d", i + 1);
+            snprintf(t[n].lang, sizeof(t[n].lang), "%s", r[i].lang);
+        }
+        if (rc >= 0) cur = AUDIO_REND_ID + rc;
+    } else {
+        int ord = 0;
+        for (unsigned i = 0; i < g_fmt->nb_streams && n < PLAYER_MAX_AUDIO; i++) {
+            const AVStream *st = g_fmt->streams[i];
+            if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+            t[n].id = (int)i;
+            atrack_label(st, ++ord, t[n].label, sizeof(t[n].label));
+            const char *l = atrack_tag(st, "language");
+            snprintf(t[n].lang, sizeof(t[n].lang), "%s", l ? l : "");
+            n++;
+        }
+        if (g_haveAudio && g_astream >= 0) cur = g_astream;
+    }
+    g_aSegPid = (!g_sepAudioMode && g_haveAudio && g_astream >= 0) ? g_fmt->streams[g_astream]->id : -1;
+    atrack_lock();
+    memcpy(g_aTracks, t, sizeof(PlayerAudioTrack) * (size_t)n);
+    g_aTrackN = n; g_aTrackCur = cur;
+    atrack_unlock();
+}
+
+int player_audio_tracks(PlayerAudioTrack *out, int max, int *cur) {
+    atrack_lock();
+    int n = g_aTrackN < max ? g_aTrackN : max;
+    if (out && n > 0) memcpy(out, g_aTracks, sizeof(PlayerAudioTrack) * (size_t)n);
+    if (cur) *cur = g_aTrackCur;
+    atrack_unlock();
+    return n;
+}
+
+void player_set_audio_lang(const char *lang) {
+    snprintf(g_aLangPref, sizeof(g_aLangPref), "%s", lang ? lang : "");
+}
+const char *player_audio_lang(void) { return g_aLangPref; }
+
 static int play_open(const char *url, int requestedHeadstart, double resumeSec) {
     g_playStage = "enter";
     unsigned vfGen0 = tls_verify_failure(NULL, 0, NULL);
@@ -697,7 +774,12 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
             orc = -1;
         }
     } else {
-        if (g_isHls) hls_set_decode_cap(g_hwEnabled ? 1080 : 720);
+        if (g_isHls) {
+            hls_set_decode_cap(g_hwEnabled ? 1080 : 720);
+            int picked = strcmp(g_aPickSpec, g_playSpec) == 0 && g_aPickId >= AUDIO_REND_ID;
+            hls_set_audio_pref(picked ? g_aPickName : "",
+                               picked && g_aPickLang[0] ? g_aPickLang : g_aLangPref);
+        }
         op_abort_window(g_isHls ? OP_ABORT_ASEG : OP_ABORT_HTTPSRC);   // playlist fetches / connect+headers
         orc = g_isHls ? hls_open(startUrl) : httpsrc_open(startUrl);
         op_abort_window(0);   // closed BEFORE the open_cancelled() check below
@@ -821,7 +903,7 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
     // Pick the audio stream (for sound). Discard any OTHER streams (data/subs)
     // so the demuxer doesn't seek across the file for packets we never use.
     const AVCodec *adec = NULL;
-    g_astream = av_find_best_stream(g_fmt, AVMEDIA_TYPE_AUDIO, -1, -1, &adec, 0);
+    g_astream = pick_audio_stream(&adec);
     if (g_astream < 0) g_astream = -1;
     for (unsigned i = 0; i < g_fmt->nb_streams; i++)
         if ((int)i != g_vstream && (int)i != g_astream)
@@ -875,6 +957,8 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
             g_aastream = -1;
         }
     }
+
+    build_audio_tracks();
 
     // Hardware H.264 fast path: decode on the GPU silicon (CPU stays free for
     // networking/scaling). Set up a mp4->annexb bitstream filter and bring up the
@@ -986,6 +1070,16 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
     g_playStage = "started";
     snprintf(g_status, sizeof(g_status), "buffering %s %dx%d", dec->name, g_srcW, g_srcH);
     notify_dbg("PS4 Cast: ffmpeg %s %dx%d", dec->name, g_srcW, g_srcH);
+
+    // An audio-track switch reopens a plain file at the position it was
+    // playing (HLS repositioned before its demuxer opened, above). Queued
+    // before the decode thread starts, so its first act is this seek.
+    if (!g_isHls && resumeSec > 0 && g_durSec > 0) {
+        g_seekTo = resumeSec < g_durSec ? resumeSec : g_durSec;
+        g_seekRequestedAt = sceKernelGetProcessTime() - 200000ULL;   // past the seek debounce
+        g_seekPending = 1;
+        trace_mark("seek file resume target=%.3f", g_seekTo);
+    }
 
 #if PLAYER_DECODE_THREAD
     // Start the decode thread; main thread will only present. On failure fall
@@ -1310,6 +1404,49 @@ void player_seek(double seconds) {
         g_seekPending = 1;
     }
     pipe_leave();
+}
+
+int player_select_audio(int id) {
+    // Guarded like a seek: the switch must reach THIS stream's reopen, never
+    // a teardown or the next stream (see "pipeline guard").
+    if (!pipe_enter()) return -1;
+    int rc = -1;
+    if (!player_opening() && g_started && g_playSpec[0]) {
+        char name[64] = "";
+        int found = 0, cur;
+        atrack_lock();
+        cur = g_aTrackCur;
+        for (int i = 0; i < g_aTrackN; i++)
+            if (g_aTracks[i].id == id) { found = 1; snprintf(name, sizeof(name), "%s", g_aTracks[i].label); }
+        atrack_unlock();
+        if (found && id != cur) {
+            snprintf(g_aPickSpec, sizeof(g_aPickSpec), "%s", g_playSpec);
+            g_aPickId = id;
+            // A rendition is found again by its NAME and LANGUAGE, not its
+            // position: the next master playlist fetch may order them differently.
+            g_aPickName[0] = g_aPickLang[0] = '\0';
+            if (id >= AUDIO_REND_ID) {
+                HlsAudioRendition r[HLS_MAX_AUDIO_RENDITIONS];
+                int rn = hls_audio_renditions(r, HLS_MAX_AUDIO_RENDITIONS, NULL);
+                int k = id - AUDIO_REND_ID;
+                if (k < rn) {
+                    snprintf(g_aPickName, sizeof(g_aPickName), "%s", r[k].name);
+                    snprintf(g_aPickLang, sizeof(g_aPickLang), "%s", r[k].lang);
+                }
+            }
+            // Same machinery as an fMP4 quality switch: reopen through the
+            // opener worker at the current position (live: at the live edge).
+            double pos = 0;
+            player_progress(&pos, NULL);
+            g_hlsResumeSec = (!player_is_live() && pos > 1.0) ? pos : -1.0;
+            g_liveRestartPending = 1;
+            snprintf(g_status, sizeof(g_status), "switching audio");
+            trace_mark("audio switch id=%d (%s) at %.2f", id, name, pos);
+            rc = 0;
+        }
+    }
+    pipe_leave();
+    return rc;
 }
 
 static int seek_debounce_elapsed(void) {
@@ -2706,7 +2843,10 @@ static void *decode_segment_thread_main(void *arg) {
         }
 
         int sv = av_find_best_stream(sfmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-        int sa = g_haveAudio ? av_find_best_stream(sfmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0) : -1;
+        // The audio decoder was opened for one track: keep feeding it that
+        // track (same TS PID) in every segment, not whatever looks best here.
+        int sa = (g_haveAudio && g_aSegPid >= 0) ? atrack_find_id(sfmt, g_aSegPid) : -1;
+        if (g_haveAudio && sa < 0) sa = av_find_best_stream(sfmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
         // av_find_best_stream needs a fully-classified decodable codec. On live
         // TS segments the AAC stream is sometimes not classified within the
         // analyze window and it returns STREAM_NOT_FOUND even though the PMT
