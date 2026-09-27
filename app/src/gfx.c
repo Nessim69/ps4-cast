@@ -33,6 +33,116 @@ static inline uint32_t encode(GfxColor c) {
     return 0x80000000u | ((uint32_t)c.r << 16) | ((uint32_t)c.g << 8) | (uint32_t)c.b;
 }
 
+// ---- queued drawing + surface reuse (contract in gfx.h) --------------------
+// Every scanout surface is write-combined GARLIC memory, and the loop used to
+// repaint one completely at 60 Hz even when nothing on screen changed: the
+// idle lobby (gradient + panels + QR), a paused video under its HUD, and every
+// held repeat of 30 fps content (the frame was re-converted on 5 threads just
+// to show it again). Queueing the frame's drawing until gfx_present lets that
+// be decided with the whole frame known, instead of predicting it up front.
+//
+// Invariant: g->tag[i] only ever describes what was actually drawn into
+// surface i. It is written in exactly one place (q_commit) from the frame
+// that just ran into that surface, so two equal tags mean equal pixels. The
+// description is conservative: a frame drawn over unknown content (tag 0)
+// stays unknown and is never reused.
+enum { Q_DIRECT, Q_RECORD, Q_REPLAY };
+enum { OP_PIXEL, OP_RECT, OP_BLEND, OP_RECT_A, OP_CIRCLE_A, OP_ROUND_A,
+       OP_VGRAD, OP_TRI, OP_ARC, OP_TEXT };
+typedef struct { int op, text, a[7]; } QCmd;
+#define Q_CMDS 4096                 // the lobby, QR modules included, is ~600
+#define Q_TEXT (32 * 1024)
+#define Q_TAG_FULL 0x46554c4c53435245ull   // base of a frame that opens with a full-screen fill
+static QCmd     s_q[Q_CMDS];
+static char     s_qText[Q_TEXT];
+static int      s_qN, s_qTextN;
+static int      s_qOn;              // gfx_init succeeded: queue instead of drawing
+static int      s_qMode = Q_DIRECT; // RECORD: queue; DIRECT: draw now; REPLAY: running the queue
+static int      s_qTouched;         // anything drawn, queued or painted this frame
+static uint64_t s_qTag;             // what the target holds once this frame is drawn (0 = unknown)
+static int    (*s_qPaint)(Gfx *);   // gfx_video picture queued under the frame
+static uint64_t s_reused, s_reshown;
+
+static inline int q_int(GfxColor c) { return (c.r << 16) | (c.g << 8) | c.b; }
+static inline GfxColor q_col(int v) {
+    GfxColor c = { (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v };
+    return c;
+}
+// splitmix64 finaliser over (running hash ^ input): order-sensitive, and every
+// input bit reaches every output bit, so distinct frames don't share a tag.
+static uint64_t q_mix(uint64_t h, uint64_t v) {
+    uint64_t x = (h ^ v) + 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+static void q_drop(void) { s_qN = s_qTextN = 0; s_qPaint = NULL; }
+static void q_run(Gfx *g);
+static void q_begin(Gfx *g) {       // a new frame starts from what the target holds
+    q_drop();
+    s_qTouched = 0;
+    s_qTag = g->tag[g->activeIdx];
+    s_qMode = s_qOn ? Q_RECORD : Q_DIRECT;
+}
+
+// Called first by every drawing entry point. Folds the call into the frame's
+// tag and, while recording, queues it: returns 1 when the caller must not draw.
+static int q_hook(Gfx *g, int op, const int *a, int n, const char *text) {
+    if (s_qMode == Q_REPLAY) return 0;
+    s_qTouched = 1;
+    if ((op == OP_RECT || op == OP_VGRAD) && a[0] <= 0 && a[1] <= 0 &&
+        a[0] + a[2] >= g->width && a[1] + a[3] >= g->height) {
+        s_qTag = Q_TAG_FULL;                 // opaque over everything: nothing earlier survives
+        if (s_qMode == Q_RECORD) q_drop();
+    }
+    if (s_qTag) {
+        uint64_t h = q_mix(s_qTag, ((uint64_t)op << 32) | (uint32_t)n);
+        for (int i = 0; i < n; i++) h = q_mix(h, (uint32_t)a[i]);
+        if (text) {
+            size_t len = strlen(text);
+            for (size_t i = 0; i < len; i += 8) {
+                uint64_t w = 0;
+                memcpy(&w, text + i, len - i < 8 ? len - i : 8);
+                h = q_mix(h, w);
+            }
+            h = q_mix(h, len);
+        }
+        h &= ~GFX_TAG_VIDEO;
+        s_qTag = h ? h : 1;
+    }
+    if (s_qMode != Q_RECORD) return 0;
+    size_t len = text ? strlen(text) + 1 : 0;
+    if (s_qN == Q_CMDS || s_qTextN + len > Q_TEXT) {   // out of room: draw the rest directly
+        q_run(g);
+        s_qMode = Q_DIRECT;
+        return 0;
+    }
+    QCmd *c = &s_q[s_qN++];
+    c->op = op;
+    c->text = -1;
+    for (int i = 0; i < n; i++) c->a[i] = a[i];
+    if (text) { memcpy(s_qText + s_qTextN, text, len); c->text = s_qTextN; s_qTextN += (int)len; }
+    return 1;
+}
+
+// Resolve the frame at present time. Returns the surface to flip.
+static int q_commit(Gfx *g) {
+    int a = g->activeIdx, s = g->shownIdx;
+    if (s_qMode == Q_RECORD) {
+        uint64_t t = s_qTag;
+        // Nothing drawn at all (a stalled player keeping its last frame): show
+        // the on-screen picture again rather than an older surface.
+        if (!s_qTouched && s >= 0) { s_reshown++; return s; }
+        if (t && t == g->tag[a]) { s_reused++; q_drop(); return a; }
+        // Prefer drawing into a surface whose content is unknown, so each one
+        // holds a real picture before it can ever be shown under an overlay.
+        if (t && s >= 0 && t == g->tag[s] && g->tag[a]) { s_reshown++; q_drop(); return s; }
+        q_run(g);
+    }
+    g->tag[a] = s_qTag;
+    return a;
+}
+
 #ifndef GFX_HOST_PREVIEW
 int gfx_init(Gfx *g, int width, int height) {
     memset(g, 0, sizeof(*g));
@@ -41,6 +151,8 @@ int gfx_init(Gfx *g, int width, int height) {
     g->depth  = 4;
     g->frameBufferSize = width * height * g->depth;
     g->activeIdx = 0;
+    g->shownIdx = -1;
+    g->lastFlipId = -1;
     g_flipUsTotal = g_flipUsMax = g_flipWaitUsTotal = g_flipWaitUsMax = g_flipCalls = 0;
     for (int i = 0; i < GFX_BUFFERS; i++)
         g->lastSubmitted[i] = -1;
@@ -88,6 +200,8 @@ int gfx_init(Gfx *g, int width, int height) {
 
     sceVideoOutSetFlipRate(g->video, 0);
     g_gfx = g;                 // for gfx_emergency_release on a fatal exit
+    s_qOn = 1;                 // queue drawing from here on (surface tags start unknown)
+    q_begin(g);
     return 0;
 }
 
@@ -121,12 +235,19 @@ static void gfx_fatal(const char *what, int rc) {
 }
 
 void gfx_present(Gfx *g, int frameID) {
+    // Draw the queued frame into the target, or pick a surface that already
+    // holds exactly that picture (the target, or the one on screen: flipped
+    // again unchanged, which leaves the target free for the next frame).
+    int idx = q_commit(g);
     uint64_t flipT0 = sceKernelGetProcessTime();
     // A failed flip submit means the video-out/GPU rejected the frame — treat it
     // as a display fault and fail-closed instead of continuing blind.
-    int rc = sceVideoOutSubmitFlip(g->video, g->activeIdx, ORBIS_VIDEO_OUT_FLIP_VSYNC, frameID);
+    int rc = sceVideoOutSubmitFlip(g->video, idx, ORBIS_VIDEO_OUT_FLIP_VSYNC, frameID);
     if (rc < 0) gfx_fatal("submitflip", rc);   // negative = SCE error: display rejected the flip
-    g->lastSubmitted[g->activeIdx] = frameID;
+    int prevFlip = g->lastFlipId;
+    g->lastSubmitted[idx] = frameID;
+    g->lastFlipId = frameID;
+    g->shownIdx = idx;
     // Signal a clean GPU frame boundary every frame. Without this the system can
     // never find a quiesced point to suspend the app, so closing it from the menu
     // hits CPU_FAULT_SUBMITDONE_TIMEOUT_IN_SUSPEND and crashes instead of quitting.
@@ -135,8 +256,13 @@ void gfx_present(Gfx *g, int frameID) {
     // A buffer becomes writable only after a frame newer than its previous flip
     // is scanning. Waiting merely for that buffer's own flipArg is too early: at
     // that point VideoOut is actively reading it, which caused partial frames.
-    int nextIdx = (g->activeIdx + 1) % GFX_BUFFERS;
+    // A re-show keeps the same target. Also wait for the previous flip to be on
+    // screen: in plain rotation that is the same frame the target retires with,
+    // but after re-shows the target may have retired long ago, and nothing else
+    // would pace the loop to vsync or bound the flip queue (<= 2 pending).
+    int nextIdx = idx == g->activeIdx ? (g->activeIdx + 1) % GFX_BUFFERS : g->activeIdx;
     int retiredFrame = g->lastSubmitted[nextIdx];
+    if (prevFlip - 1 > retiredFrame) retiredFrame = prevFlip - 1;
     uint64_t waitT0 = sceKernelGetProcessTime();
 
     // Hard ceiling: if flips stop completing the display/GPU has hung -> fail
@@ -162,6 +288,7 @@ void gfx_present(Gfx *g, int frameID) {
     if (waitUs > g_flipWaitUsMax) g_flipWaitUsMax = waitUs;
     if (flipUs > g_flipUsMax) g_flipUsMax = flipUs;
     g->activeIdx = nextIdx;
+    q_begin(g);
 }
 
 void gfx_present_stats(uint64_t *avg_us, uint64_t *max_us,
@@ -174,16 +301,21 @@ void gfx_present_stats(uint64_t *avg_us, uint64_t *max_us,
 
 void gfx_present_stats_reset(void) {
     g_flipUsTotal = g_flipUsMax = g_flipWaitUsTotal = g_flipWaitUsMax = g_flipCalls = 0;
+    s_reused = s_reshown = 0;
 }
 #endif // GFX_HOST_PREVIEW
 
 void gfx_pixel(Gfx *g, int x, int y, GfxColor c) {
+    int q[] = { x, y, q_int(c) };
+    if (q_hook(g, OP_PIXEL, q, 3, NULL)) return;
     if (x < 0 || y < 0 || x >= g->width || y >= g->height)
         return;
     ((uint32_t *)g->frameBuffers[g->activeIdx])[y * g->width + x] = encode(c);
 }
 
 void gfx_rect(Gfx *g, int x, int y, int w, int h, GfxColor c) {
+    int q[] = { x, y, w, h, q_int(c) };
+    if (q_hook(g, OP_RECT, q, 5, NULL)) return;
     uint32_t e = encode(c);
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
     int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
@@ -205,7 +337,9 @@ void gfx_clear(Gfx *g, GfxColor c) {
 // All of these read-modify-write the back buffer so edges can be anti-aliased
 // and panels can be translucent — the difference between a "homebrew" look and
 // a polished one. AA coverage uses the clang sqrt intrinsic (no libm link).
-void gfx_blend(Gfx *g, int x, int y, GfxColor c, int a) {
+// Per-pixel blend behind the shape primitives: they are queued as one call, so
+// their pixels skip the queue hook.
+static void blend_px(Gfx *g, int x, int y, GfxColor c, int a) {
     if (x < 0 || y < 0 || x >= g->width || y >= g->height || a <= 0) return;
     uint32_t *p = &((uint32_t *)g->frameBuffers[g->activeIdx])[y * g->width + x];
     if (a >= 255) { *p = encode(c); return; }
@@ -218,11 +352,18 @@ void gfx_blend(Gfx *g, int x, int y, GfxColor c, int a) {
     };
     *p = encode(o);
 }
+void gfx_blend(Gfx *g, int x, int y, GfxColor c, int a) {
+    int q[] = { x, y, q_int(c), a };
+    if (q_hook(g, OP_BLEND, q, 4, NULL)) return;
+    blend_px(g, x, y, c, a);
+}
 
 // Translucent fill — the hot path for every panel/HUD/overlay. Kept tight (no
 // per-pixel function call or bounds check, row-pointer walk, integer blend) so
 // it doesn't steal CPU from the software video decode on the same cores.
 void gfx_rect_a(Gfx *g, int x, int y, int w, int h, GfxColor c, int a) {
+    int q[] = { x, y, w, h, q_int(c), a };
+    if (q_hook(g, OP_RECT_A, q, 6, NULL)) return;
     if (a >= 255) { gfx_rect(g, x, y, w, h, c); return; }
     if (a <= 0) return;
     int x1 = x + w, y1 = y + h;
@@ -245,19 +386,23 @@ void gfx_rect_a(Gfx *g, int x, int y, int w, int h, GfxColor c, int a) {
 }
 
 void gfx_circle_a(Gfx *g, int cx, int cy, int r, GfxColor c, int a) {
+    int q[] = { cx, cy, r, q_int(c), a };
+    if (q_hook(g, OP_CIRCLE_A, q, 5, NULL)) return;
     if (r <= 0) return;
     for (int y = cy - r - 1; y <= cy + r + 1; y++) {
         for (int x = cx - r - 1; x <= cx + r + 1; x++) {
             float dx = (float)(x - cx), dy = (float)(y - cy);
             float cov = (float)r + 0.5f - __builtin_sqrtf(dx * dx + dy * dy);
             if (cov <= 0) continue; if (cov > 1) cov = 1;
-            gfx_blend(g, x, y, c, (int)(cov * a));
+            blend_px(g, x, y, c, (int)(cov * a));
         }
     }
 }
 void gfx_circle(Gfx *g, int cx, int cy, int r, GfxColor c) { gfx_circle_a(g, cx, cy, r, c, 255); }
 
 void gfx_round_a(Gfx *g, int x, int y, int w, int h, int r, GfxColor c, int a) {
+    int q[] = { x, y, w, h, r, q_int(c), a };
+    if (q_hook(g, OP_ROUND_A, q, 7, NULL)) return;
     if (r * 2 > w) r = w / 2; if (r * 2 > h) r = h / 2; if (r < 0) r = 0;
     gfx_rect_a(g, x + r, y, w - 2 * r, h, c, a);          // center column
     gfx_rect_a(g, x, y + r, r, h - 2 * r, c, a);          // left strip
@@ -270,12 +415,14 @@ void gfx_round_a(Gfx *g, int x, int y, int w, int h, int r, GfxColor c, int a) {
             for (int xx = 0; xx <= r; xx++) {
                 float cov = (float)r + 0.5f - __builtin_sqrtf((float)(xx * xx + yy * yy));
                 if (cov <= 0) continue; if (cov > 1) cov = 1;
-                gfx_blend(g, ccx[k] + qx[k] * xx, ccy[k] + qy[k] * yy, c, (int)(cov * a));
+                blend_px(g, ccx[k] + qx[k] * xx, ccy[k] + qy[k] * yy, c, (int)(cov * a));
             }
 }
 void gfx_round(Gfx *g, int x, int y, int w, int h, int r, GfxColor c) { gfx_round_a(g, x, y, w, h, r, c, 255); }
 
 void gfx_vgrad(Gfx *g, int x, int y, int w, int h, GfxColor top, GfxColor bot) {
+    int q[] = { x, y, w, h, q_int(top), q_int(bot) };
+    if (q_hook(g, OP_VGRAD, q, 6, NULL)) return;
     int oy = y, x0 = x, x1 = x + w;
     if (x0 < 0) x0 = 0; if (x1 > g->width) x1 = g->width;
     int yy0 = y < 0 ? 0 : y, yy1 = (y + h) > g->height ? g->height : (y + h);
@@ -294,6 +441,8 @@ void gfx_vgrad(Gfx *g, int x, int y, int w, int h, GfxColor top, GfxColor bot) {
 }
 
 void gfx_tri(Gfx *g, int x0, int y0, int x1, int y1, int x2, int y2, GfxColor c) {
+    int q[] = { x0, y0, x1, y1, x2, y2, q_int(c) };
+    if (q_hook(g, OP_TRI, q, 7, NULL)) return;
     int minx = x0 < x1 ? (x0 < x2 ? x0 : x2) : (x1 < x2 ? x1 : x2);
     int maxx = x0 > x1 ? (x0 > x2 ? x0 : x2) : (x1 > x2 ? x1 : x2);
     int miny = y0 < y1 ? (y0 < y2 ? y0 : y2) : (y1 < y2 ? y1 : y2);
@@ -310,12 +459,14 @@ void gfx_tri(Gfx *g, int x0, int y0, int x1, int y1, int x2, int y2, GfxColor c)
                 float cc = 1 - a - b;
                 if (a >= 0 && b >= 0 && cc >= 0) hit++;
             }
-            if (hit) gfx_blend(g, x, y, c, hit * 255 / 4);
+            if (hit) blend_px(g, x, y, c, hit * 255 / 4);
         }
     }
 }
 
 void gfx_arc(Gfx *g, int cx, int cy, int r, int thick, int quad, GfxColor c) {
+    int q[] = { cx, cy, r, thick, quad, q_int(c) };
+    if (q_hook(g, OP_ARC, q, 6, NULL)) return;
     for (int y = cy - r - 1; y <= cy + r + 1; y++) {
         for (int x = cx - r - 1; x <= cx + r + 1; x++) {
             int dx = x - cx, dy = y - cy;
@@ -328,7 +479,7 @@ void gfx_arc(Gfx *g, int cx, int cy, int r, int thick, int quad, GfxColor c) {
             float inner = dd - (float)(r - thick) + 0.5f;
             float cov = outer < inner ? outer : inner;
             if (cov <= 0) continue; if (cov > 1) cov = 1;
-            gfx_blend(g, x, y, c, (int)(cov * 255));
+            blend_px(g, x, y, c, (int)(cov * 255));
         }
     }
 }
@@ -514,6 +665,9 @@ static void blit_glyph(Gfx *g, const unsigned char *gly, int cell, int dx, int d
 }
 
 int gfx_text_tr(Gfx *g, int x, int y, const char *s, int scale, GfxColor c, int track) {
+    int q[] = { x, y, scale, q_int(c), track };
+    // Queued: the advance is the measured width (same glyph walk, no drawing).
+    if (q_hook(g, OP_TEXT, q, 5, s)) return gfx_text_tr_w(s, scale, track);
     // Anti-aliased proportional atlas for scale 2..6; scale 1 keeps the 8x8
     // bitmap. UTF-8 titles are folded to safe ASCII so metadata cannot corrupt
     // layout or walk the atlas out of bounds.
@@ -558,4 +712,63 @@ int gfx_text_tr_w(const char *s, int scale, int track) {
 
 int gfx_text(Gfx *g, int x, int y, const char *s, int scale, GfxColor c) {
     return gfx_text_tr(g, x, y, s, scale, c, default_track(scale));
+}
+
+// Draw the queued frame into the target: the video picture first, then every
+// queued call in order through the same primitives, so the pixels match what
+// immediate drawing would have produced.
+static void q_run(Gfx *g) {
+    int mode = s_qMode;
+    s_qMode = Q_REPLAY;
+    if (s_qPaint) {
+        int (*paint)(Gfx *) = s_qPaint;
+        s_qPaint = NULL;
+        if (paint(g) != 0) s_qTag = 0;       // nothing known was painted
+    }
+    for (int i = 0; i < s_qN; i++) {
+        const int *a = s_q[i].a;
+        switch (s_q[i].op) {
+        case OP_PIXEL:    gfx_pixel(g, a[0], a[1], q_col(a[2])); break;
+        case OP_RECT:     gfx_rect(g, a[0], a[1], a[2], a[3], q_col(a[4])); break;
+        case OP_BLEND:    gfx_blend(g, a[0], a[1], q_col(a[2]), a[3]); break;
+        case OP_RECT_A:   gfx_rect_a(g, a[0], a[1], a[2], a[3], q_col(a[4]), a[5]); break;
+        case OP_CIRCLE_A: gfx_circle_a(g, a[0], a[1], a[2], q_col(a[3]), a[4]); break;
+        case OP_ROUND_A:  gfx_round_a(g, a[0], a[1], a[2], a[3], a[4], q_col(a[5]), a[6]); break;
+        case OP_VGRAD:    gfx_vgrad(g, a[0], a[1], a[2], a[3], q_col(a[4]), q_col(a[5])); break;
+        case OP_TRI:      gfx_tri(g, a[0], a[1], a[2], a[3], a[4], a[5], q_col(a[6])); break;
+        case OP_ARC:      gfx_arc(g, a[0], a[1], a[2], a[3], a[4], q_col(a[5])); break;
+        case OP_TEXT:     gfx_text_tr(g, a[0], a[1], s_q[i].text >= 0 ? s_qText + s_q[i].text : NULL,
+                                      a[2], q_col(a[3]), a[4]); break;
+        }
+    }
+    s_qN = s_qTextN = 0;
+    s_qMode = mode;
+}
+
+void gfx_video(Gfx *g, uint64_t tag, int (*paint)(Gfx *g)) {
+    if (s_qMode == Q_RECORD && s_qN == 0) {  // nothing queued yet: the picture is the frame's base
+        s_qPaint = paint;
+        s_qTag = tag;
+        s_qTouched = 1;
+        return;
+    }
+    // Drawing already under way (or queueing off): keep draw order by running
+    // what is queued first and painting now. Anything drawn before may survive
+    // around the picture, so the result is only known if nothing was.
+    int known = !s_qTouched;
+    if (s_qMode == Q_RECORD) { q_run(g); s_qMode = Q_DIRECT; }
+    int rc = paint(g);
+    s_qTag = (known && rc == 0) ? tag : 0;
+    s_qTouched = 1;
+}
+
+// What the target holds right now: while drawing directly that is the running
+// frame tag, otherwise (queueing, or inside q_run before any call) its own tag.
+uint64_t gfx_tag(const Gfx *g) {
+    return s_qMode == Q_DIRECT ? s_qTag : g->tag[g->activeIdx];
+}
+
+void gfx_reuse_stats(uint64_t *reused, uint64_t *reshown) {
+    if (reused) *reused = s_reused;
+    if (reshown) *reshown = s_reshown;
 }

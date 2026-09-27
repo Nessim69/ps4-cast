@@ -112,6 +112,10 @@ static int               g_sepAudioMode = 0;
 
 static uint8_t *g_scaled;          // BGRA scaled output, display-fit (software path)
 static int      g_scaledW, g_scaledH;
+static AVBufferRef *g_scaledBuf;   // owns g_scaled: sws_scale_frame needs a refcounted dst
+static AVFrame *g_swsIn, *g_swsOut; // reusable frame headers for sws_scale_frame
+static uint64_t g_scaledTag;       // names g_scaled's picture for gfx_video (0 = none)
+static uint64_t g_videoTagSeq;     // video tags are never reused
 static int      g_srcW, g_srcH;
 // Source geometry/format the cached g_sws was built for. If a frame arrives with
 // different source dims/format (e.g. an HLS discontinuity changes resolution),
@@ -122,6 +126,10 @@ static int      g_swsSrcFmt = -1;  // AV_PIX_FMT_NONE
 // ref to the last shown frame and re-present it on holds/pause/EOF — otherwise a
 // held frame flips to a stale back-buffer (judder). NULL in software mode.
 static AVFrame *g_lastShown = NULL;
+static AVFrame *g_nvFrame;          // picture paint_nv12 converts (see build_scaled_nv12_direct)
+static int      g_nvVisW, g_nvVisH; // visible size g_nvTag was issued for
+static uint64_t g_nvTag;
+static AVBufferPool *g_nv12Pool;    // decoded HW frame buffers (see nv12_frame_buffer)
 // Bumped whenever a newly decoded frame becomes the frame on screen.
 static unsigned g_shownGen = 0;
 unsigned player_present_generation(void) { return g_shownGen; }
@@ -445,7 +453,10 @@ static void player_teardown(void) {
     if (g_avio)  { av_freep(&g_avio->buffer); avio_context_free(&g_avio); }
     present_pool_stop();                 // join present workers before freeing buffers
     if (g_lastShown) av_frame_free(&g_lastShown);
-    if (g_scaled){ free(g_scaled); g_scaled = NULL; }
+    g_nvFrame = NULL;                    // it was g_lastShown
+    av_buffer_pool_uninit(&g_nv12Pool);  // decode thread joined; buffers still referenced outlive it
+    av_buffer_unref(&g_scaledBuf); g_scaled = NULL; g_scaledTag = 0;
+    av_frame_free(&g_swsIn); av_frame_free(&g_swsOut);
     if (g_isLocal) {
         if (g_localFd >= 0) sceKernelClose(g_localFd);
     } else if (g_isHls) {
@@ -474,6 +485,54 @@ static void player_teardown(void) {
 void player_set_hw(int on) { g_hwEnabled = on ? 1 : 0; }
 int  player_hw_enabled(void) { return g_hwEnabled; }
 
+// Adaptive in-loop deblocking for software decode. Skipping it (AVDISCARD_ALL)
+// is the single biggest software-decode speedup, but doing so unconditionally
+// made every software-decoded stream visibly blocky. Up to 720p the filter now
+// starts ON and steps down only once decode demonstrably can't keep up: first
+// skipped on non-reference frames (nothing predicts from those, so no drift),
+// then on all. Larger frames keep skipping from the start, where the CPU cost
+// demands it. One-way per decoder: stepping back up would just re-stall.
+// Changing it mid-stream is safe with frame threads (FFmpeg 6.1): each packet's
+// submit_packet copies skip_loop_filter from this user context into that frame
+// thread's own context under its lock (pthread_frame.c
+// update_context_from_user), and h264_slice.c / hevc_filter.c read it from the
+// thread's copy. Only the thread calling avcodec_send_packet writes it here.
+static const enum AVDiscard LF_LEVEL[3] = { AVDISCARD_DEFAULT, AVDISCARD_NONREF, AVDISCARD_ALL };
+static int      g_lfLevel;
+static long     g_lfRebufSeen, g_lfLateSeen;
+static uint64_t g_lfLateT0, g_lfSettleUntil;
+
+// Is the decoder being fed? Then a starving frame queue means decoding itself
+// is too slow, not the network. Unknown counts as not healthy.
+static int sw_input_healthy(void) {
+    if (g_isLocal) return 1;
+    if (g_hlsSegDemux) return g_segReadAhead && g_srCount > 0;   // a whole segment waiting
+    if (g_isHls) return hls_buffer_pct() >= 50;
+    if (g_bytesPerSec > 0) return (double)httpsrc_ahead_bytes() / g_bytesPerSec >= 2.0;
+    return httpsrc_fill_pct() >= 50;
+}
+
+// Decode thread, before each software avcodec_send_packet. A strike is a
+// rebuffer, or 12+ late drops within 5s, while the input is healthy; each
+// strike steps the filter down one level, then waits 3s for the queue to
+// refill before judging again.
+static void sw_adapt_loop_filter(void) {
+    if (!g_vdec || g_lfLevel >= 2) return;
+    uint64_t now = sceKernelGetProcessTime();
+    long rebuf = g_rebufTotal, late = g_lateDrops;
+    int strike = 0;
+    if (rebuf < g_lfRebufSeen) g_lfRebufSeen = rebuf;   // counters reset by a new playback
+    if (late < g_lfLateSeen) g_lfLateSeen = late;
+    if (rebuf > g_lfRebufSeen) { g_lfRebufSeen = rebuf; strike = 1; }
+    if (now - g_lfLateT0 > 5000000ULL) { g_lfLateSeen = late; g_lfLateT0 = now; }
+    else if (late - g_lfLateSeen >= 12) { g_lfLateSeen = late; g_lfLateT0 = now; strike = 1; }
+    if (!strike || now < g_lfSettleUntil || !sw_input_healthy()) return;
+    g_lfLevel++;
+    g_vdec->skip_loop_filter = LF_LEVEL[g_lfLevel];
+    g_lfSettleUntil = now + 3000000ULL;
+    trace_mark("sw loop filter level %d (rebuf=%ld late=%ld)", g_lfLevel, rebuf, late);
+}
+
 // Open the multi-threaded software H.264/etc decoder into g_vdec. Returns 0/-1.
 // Used for the normal software path and as the hardware-failure fallback.
 static int open_sw_video(const AVCodec *dec) {
@@ -481,12 +540,16 @@ static int open_sw_video(const AVCodec *dec) {
     if (!g_vdec) return -1;
     avcodec_parameters_to_context(g_vdec, g_fmt->streams[g_vstream]->codecpar);
     // Multi-core software decode — the PS4 has ~6 usable Jaguar cores. Frame +
-    // slice threading is the biggest win for smooth HD playback. Disabling the
-    // in-loop deblocking filter is the single biggest software-decode speedup;
-    // FLAG2_FAST allows non-compliant shortcuts (slight blockiness for fps).
+    // slice threading is the biggest win for smooth HD playback. Deblocking is
+    // adaptive (sw_adapt_loop_filter); FLAG2_FAST allows non-compliant
+    // shortcuts (slight blockiness for fps).
     g_vdec->thread_count = 6;
     g_vdec->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
-    g_vdec->skip_loop_filter = AVDISCARD_ALL;
+    g_lfLevel = (int64_t)g_vdec->width * g_vdec->height > 1280 * 720 ? 2 : 0;
+    g_vdec->skip_loop_filter = LF_LEVEL[g_lfLevel];
+    g_lfRebufSeen = g_rebufTotal; g_lfLateSeen = g_lateDrops;
+    g_lfLateT0 = sceKernelGetProcessTime();
+    g_lfSettleUntil = g_lfLateT0 + 3000000ULL;    // startup queue fill is not a strike
     g_vdec->flags2 |= AV_CODEC_FLAG2_FAST;
     if (avcodec_open2(g_vdec, dec, NULL) < 0) return -1;
     return 0;
@@ -1361,8 +1424,10 @@ void player_debug(char *out, int len) {
     // httpsrc_debug() lock mutexes it may be destroying: name its stage instead.
     char opening[48] = "";
     if (player_opening()) snprintf(opening, sizeof(opening), "opening at %s", (const char *)g_playStage);
+    uint64_t fbReused = 0, fbReshown = 0;   // presents that needed no drawing (see gfx.h)
+    gfx_reuse_stats(&fbReused, &fbReshown);
     snprintf(out, len,
-             "ff%s%s%s %dx%d | fr=%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%llu/%llu dc=%llu/%llu qw=%llu/%llu flip=%llu/%llu(w%llu/%llu)us ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
+             "ff%s%s%s %dx%d | fr=%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%llu/%llu dc=%llu/%llu qw=%llu/%llu flip=%llu/%llu(w%llu/%llu)us reuse=%llu/%llu lf=%d ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
              g_useHw ? "/HW" : "", g_isHls ? (g_hlsSegDemux ? "/hls-seg" : "/hls") : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
              g_frames, g_drops, g_queueDrops, g_lateDrops, g_reorderDrops, g_fqCount, FQ_SLOTS,
              g_hwReorder,
@@ -1374,6 +1439,7 @@ void player_debug(char *out, int len) {
              (unsigned long long)g_fqWaitUsMax,
              (unsigned long long)flipAvg, (unsigned long long)flipMax,
              (unsigned long long)flipWaitAvg, (unsigned long long)flipWaitMax,
+             (unsigned long long)fbReused, (unsigned long long)fbReshown, g_useHw ? -1 : g_lfLevel,
              g_srCount, SEG_RING, g_rebufTotal, ahead,
              (long long)(g_lastLagUs / 1000), g_lastErr, vdec_hw_dmem_outstanding() / 1024,
              g_sepAudioMode ? g_aastream : g_astream, g_sepAudioMode ? "/sep" : "",
@@ -1396,7 +1462,9 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
     if (scaledH > dh) { scaledH = dh; scaledW = (int)((int64_t)dh * sw / sh); }
     if (scaledW < 1) scaledW = 1; if (scaledH < 1) scaledH = 1;
 
-    enum AVPixelFormat srcFmt = g_useHw ? AV_PIX_FMT_NV12 : g_vdec->pix_fmt;
+    // The frame's own format, not the decoder's: after a HW->SW failover the
+    // queue still holds NV12 frames, which g_vdec->pix_fmt would misdescribe.
+    enum AVPixelFormat srcFmt = (enum AVPixelFormat)fr->format;
     // Bob-deinterlace: for an interlaced source (1080i broadcast, forced to
     // software decode) feed sws ONE field — half the lines via doubled strides —
     // and let it scale that field up to full height. Removes combing on motion;
@@ -1404,10 +1472,13 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
     int di = g_interlaced ? 1 : 0;
     int srcH = di ? sh / 2 : sh;
 
+    g_scaledTag = 0;                   // g_scaled changes below: no surface shows it yet
     if (scaledW != g_scaledW || scaledH != g_scaledH || !g_scaled) {
-        free(g_scaled);
-        g_scaled = malloc((size_t)scaledW * scaledH * 4);
-        if (!g_scaled) return -1;
+        av_buffer_unref(&g_scaledBuf);
+        g_scaled = NULL;
+        g_scaledBuf = av_buffer_alloc((size_t)scaledW * scaledH * 4);
+        if (!g_scaledBuf) return -1;
+        g_scaled = g_scaledBuf->data;
         g_scaledW = scaledW; g_scaledH = scaledH;
         if (g_sws) { sws_freeContext(g_sws); g_sws = NULL; }
     }
@@ -1420,21 +1491,45 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
         // FAST_BILINEAR: the software present (HLS path) was dropping frames because
         // the single-threaded 720p->1080p upscale couldn't sustain 30fps. Fast
         // bilinear is materially cheaper at near-identical quality for upscales.
-        g_sws = sws_getContext(sw, srcH, srcFmt,
-                               scaledW, scaledH, AV_PIX_FMT_BGRA,
-                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
+        // Slice threads (FFmpeg 6.1 "threads" option): 3 workers plus this thread
+        // each scale a band of output rows, horizontally scaling only the source
+        // rows that band needs. Only sws_scale_frame uses them; legacy sws_scale
+        // runs slice_ctx[0] alone. 4 leaves the 6 usable cores to the decoder.
+        g_sws = sws_alloc_context();
         if (!g_sws) return -1;
+        if (av_opt_set_int(g_sws, "srcw", sw, 0) < 0 || av_opt_set_int(g_sws, "srch", srcH, 0) < 0 ||
+            av_opt_set_int(g_sws, "src_format", srcFmt, 0) < 0 ||
+            av_opt_set_int(g_sws, "dstw", scaledW, 0) < 0 || av_opt_set_int(g_sws, "dsth", scaledH, 0) < 0 ||
+            av_opt_set_int(g_sws, "dst_format", AV_PIX_FMT_BGRA, 0) < 0 ||
+            av_opt_set_int(g_sws, "sws_flags", SWS_FAST_BILINEAR, 0) < 0 ||
+            av_opt_set_int(g_sws, "threads", 4, 0) < 0 ||
+            sws_init_context(g_sws, NULL, NULL) < 0) {
+            sws_freeContext(g_sws); g_sws = NULL;
+            return -1;
+        }
         g_swsSrcW = sw; g_swsSrcH = srcH; g_swsSrcFmt = (int)srcFmt;
     }
-    uint8_t *dst[4] = { g_scaled, NULL, NULL, NULL };
-    int dstStride[4] = { g_scaledW * 4, 0, 0, 0 };
+    if (!g_swsIn && !(g_swsIn = av_frame_alloc())) return -1;
+    if (!g_swsOut && !(g_swsOut = av_frame_alloc())) return -1;
+    // Source: a new reference to the frame (no copy); the bob field is the same
+    // buffers read with doubled strides and half the height.
+    if (av_frame_ref(g_swsIn, fr) < 0) return -1;
     if (di) {
-        const uint8_t *src[4] = { fr->data[0], fr->data[1], fr->data[2], fr->data[3] };
-        int srcStr[4] = { fr->linesize[0] * 2, fr->linesize[1] * 2, fr->linesize[2] * 2, fr->linesize[3] * 2 };
-        sws_scale(g_sws, src, srcStr, 0, srcH, dst, dstStride);
-    } else {
-        sws_scale(g_sws, (const uint8_t * const *)fr->data, fr->linesize, 0, sh, dst, dstStride);
+        for (int i = 0; i < 4; i++) g_swsIn->linesize[i] *= 2;
+        g_swsIn->height = srcH;
     }
+    // Destination: g_scaled itself, so sws_scale_frame allocates nothing.
+    g_swsOut->buf[0] = av_buffer_ref(g_scaledBuf);
+    if (!g_swsOut->buf[0]) { av_frame_unref(g_swsIn); return -1; }
+    g_swsOut->data[0] = g_scaled;
+    g_swsOut->linesize[0] = g_scaledW * 4;
+    g_swsOut->width = g_scaledW; g_swsOut->height = g_scaledH;
+    g_swsOut->format = AV_PIX_FMT_BGRA;
+    int rc = sws_scale_frame(g_sws, g_swsOut, g_swsIn);
+    av_frame_unref(g_swsIn);
+    av_frame_unref(g_swsOut);
+    if (rc < 0) return -1;
+    g_scaledTag = GFX_TAG_VIDEO | ++g_videoTagSeq;
     return 0;
 }
 
@@ -1457,8 +1552,10 @@ static void clear_bars_gated(Gfx *g, int ox, int oy, int sW, int sH) {
         s_lw = sW; s_lh = sH; s_lx = ox; s_ly = oy;
         g_barClearLeft = (sW != dw || sH != dh) ? GFX_BUFFER_COUNT + 1 : 0;
     }
-    if (g_barClearLeft <= 0) return;
-    g_barClearLeft--;
+    // Also whenever the target holds anything but a clean picture (see the
+    // same rule in paint_nv12): a video tag must imply clean bars.
+    if (g_barClearLeft <= 0 && (gfx_tag(g) & GFX_TAG_VIDEO)) return;
+    if (g_barClearLeft > 0) g_barClearLeft--;
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
     const uint32_t BAR = 0x80000000u;
     int vy0 = oy < 0 ? 0 : oy, vy1 = oy + sH > dh ? dh : oy + sH;
@@ -1474,7 +1571,8 @@ static void clear_bars_gated(Gfx *g, int ox, int oy, int sW, int sH) {
     }
 }
 
-static void blit_scaled(Gfx *g) {
+static int paint_scaled(Gfx *g) {
+    if (!g_scaled) return -1;
     int dw = g->width, dh = g->height;
     int ox = (dw - g_scaledW) / 2, oy = (dh - g_scaledH) / 2;
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
@@ -1488,7 +1586,12 @@ static void blit_scaled(Gfx *g) {
         for (int x = 0; x < g_scaledW; x++)
             out[x] = (row[x] & 0x00FFFFFFu) | 0x80000000u;
     }
+    return 0;
 }
+// Present g_scaled this frame. Like build_scaled_nv12_direct, the full-frame
+// copy is queued and skipped when a surface already shows this picture; the
+// tag is issued by build_scaled, the only writer of g_scaled.
+static void blit_scaled(Gfx *g) { gfx_video(g, g_scaledTag, paint_scaled); }
 
 // Decode one audio packet (from either demuxer), resample to S16 stereo 48k,
 // queue to sceAudioOut. `atb` is the audio stream's time_base for the clock.
@@ -1723,6 +1826,42 @@ static int hw_reopen_for_params(const AVCodecParameters *par) {
     return hw_failover_to_software(-9001);
 }
 
+// Every decoded HW picture is copied out of vdec_hw into an AVFrame. With
+// av_frame_get_buffer that was a fresh ~3 MB allocation per frame at 1080p
+// (~180 MB/s of large malloc/free churn at 60 fps, on the decode thread). The
+// buffers now come from a pool laid out exactly like av_frame_get_buffer(cl, 32)
+// would: same buffer size, plane offset and linesizes, captured from one
+// template frame whenever the dimensions change (convert_band reads data[0],
+// data[1] and linesize[] only). Frames queued, reordered or held keep their
+// pool references: replacing or uninitialising the pool frees each buffer only
+// when its last reference goes (av_buffer_pool_uninit defers the free).
+// Decode thread only; player_stop frees the pool after joining it.
+static int    g_nv12W, g_nv12H, g_nv12Ls[2];
+static size_t g_nv12Off1;
+
+static int nv12_frame_buffer(AVFrame *cl) {
+    if (!g_nv12Pool || cl->width != g_nv12W || cl->height != g_nv12H) {
+        AVFrame *t = av_frame_alloc();
+        if (!t) return -1;
+        t->format = AV_PIX_FMT_NV12; t->width = cl->width; t->height = cl->height;
+        if (av_frame_get_buffer(t, 32) < 0) { av_frame_free(&t); return -1; }
+        av_buffer_pool_uninit(&g_nv12Pool);
+        g_nv12Pool = av_buffer_pool_init(t->buf[0]->size, NULL);   // NULL: av_buffer_alloc, as the template
+        g_nv12W = cl->width; g_nv12H = cl->height;
+        g_nv12Ls[0] = t->linesize[0]; g_nv12Ls[1] = t->linesize[1];
+        g_nv12Off1 = (size_t)(t->data[1] - t->data[0]);
+        av_frame_free(&t);
+        if (!g_nv12Pool) return -1;
+    }
+    cl->buf[0] = av_buffer_pool_get(g_nv12Pool);
+    if (!cl->buf[0]) return -1;
+    cl->data[0] = cl->buf[0]->data;
+    cl->data[1] = cl->buf[0]->data + g_nv12Off1;
+    cl->linesize[0] = g_nv12Ls[0]; cl->linesize[1] = g_nv12Ls[1];
+    cl->extended_data = cl->data;
+    return 0;
+}
+
 // Hardware H.264 path: convert the packet to Annex B, decode each access unit on
 // the GPU silicon into NV12, copy it into an AVFrame, and feed it through the
 // reorder buffer -> queue -> sync/scale/blit path (sws converts NV12->BGRA).
@@ -1743,7 +1882,7 @@ static void decode_video_hw(AVPacket *pkt) {
         AVFrame *cl = av_frame_alloc();
         if (!cl) continue;
         cl->format = AV_PIX_FMT_NV12; cl->width = hf.width; cl->height = hf.height;
-        if (av_frame_get_buffer(cl, 32) < 0) { av_frame_free(&cl); continue; }
+        if (nv12_frame_buffer(cl) < 0) { av_frame_free(&cl); continue; }
         for (int y = 0; y < hf.height; y++)
             memcpy(cl->data[0] + (size_t)y * cl->linesize[0], hf.y + (size_t)y * hf.pitch, hf.width);
         for (int y = 0; y < hf.height / 2; y++)
@@ -1781,6 +1920,7 @@ static int decode_video_packet(AVPacket *pkt) {
         return !g_decStop && !g_seekPending;
     }
 
+    sw_adapt_loop_filter();
     if (avcodec_send_packet(g_vdec, pkt) < 0) return 1;
     for (;;) {
         int got = avcodec_receive_frame(g_vdec, g_frame);
@@ -1848,7 +1988,7 @@ static void decode_video_hw_seg(AVPacket *pkt, AVRational vtb) {
     AVFrame *cl = av_frame_alloc();
     if (!cl) return;
     cl->format = AV_PIX_FMT_NV12; cl->width = hf.width; cl->height = hf.height;
-    if (av_frame_get_buffer(cl, 32) < 0) { av_frame_free(&cl); return; }
+    if (nv12_frame_buffer(cl) < 0) { av_frame_free(&cl); return; }
     for (int y = 0; y < hf.height; y++)
         memcpy(cl->data[0] + (size_t)y * cl->linesize[0], hf.y + (size_t)y * hf.pitch, hf.width);
     for (int y = 0; y < hf.height / 2; y++)
@@ -2050,15 +2190,22 @@ static void present_pool_stop(void) {
 }
 
 // NV12 -> active framebuffer directly. This fuses color conversion, scaling, and
-// final blit for the hardware path.
-static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
+// final blit for the hardware path. It is the gfx_video paint queued by
+// build_scaled_nv12_direct: g_nvFrame is the shown frame (alive as g_lastShown
+// until a later player_render or player_stop, both after this frame's
+// gfx_present), at the visible size snapshotted with its tag, because the
+// decode thread rewrites g_srcW/H on a resolution change and a tag must name
+// exactly one picture.
+static int paint_nv12(Gfx *g) {
+    AVFrame *fr = g_nvFrame;
+    if (!fr) return -1;
     uint64_t presentT0 = sceKernelGetProcessTime();
     int dw = g->width, dh = g->height, sw = fr->width, sh = fr->height;
     // Hardware decode returns coded dimensions (e.g. 1920x1088 for 1080p).
     // Present only the visible stream size when known; otherwise the scaler
     // shrinks 1920x1088 into 1905x1080 and wastes work on padding/pillarbox.
-    if (g_srcW > 0 && g_srcW <= sw) sw = g_srcW;
-    if (g_srcH > 0 && g_srcH <= sh) sh = g_srcH;
+    if (g_nvVisW > 0 && g_nvVisW <= sw) sw = g_nvVisW;
+    if (g_nvVisH > 0 && g_nvVisH <= sh) sh = g_nvVisH;
     if (sw <= 0 || sh <= 0) return -1;
     int scaledW = dw, scaledH = (int)((int64_t)dw * sh / sw);
     if (scaledH > dh) { scaledH = dh; scaledW = (int)((int64_t)dh * sw / sh); }
@@ -2073,14 +2220,17 @@ static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
     // clear entirely and runs at full render rate. The video rect itself never
     // needs a clear (the NV12 convert below fills it). The countdown spans all
     // rotating framebuffers so a dismissed overlay is wiped from every buffer.
+    // Also clear whenever the target holds anything but a clean picture (a
+    // menu, an overlay, unknown): with surfaces reused and re-shown, a video tag
+    // must imply clean bars, and nothing may rely on callers requesting it.
     {
         static int s_lastSW = -1, s_lastSH = -1, s_lastOX = -1, s_lastOY = -1;
         if (scaledW != s_lastSW || scaledH != s_lastSH || ox != s_lastOX || oy != s_lastOY) {
             s_lastSW = scaledW; s_lastSH = scaledH; s_lastOX = ox; s_lastOY = oy;
             g_barClearLeft = GFX_BUFFER_COUNT + 1;
         }
-        if (g_barClearLeft > 0) {
-            g_barClearLeft--;
+        if (g_barClearLeft > 0 || !(gfx_tag(g) & GFX_TAG_VIDEO)) {
+            if (g_barClearLeft > 0) g_barClearLeft--;
             const uint32_t BAR = 0x80000000u;
             int vy0 = oy, vy1 = oy + scaledH, vx0 = ox, vx1 = ox + scaledW;
             if (vy0 < 0) vy0 = 0; if (vy1 > dh) vy1 = dh;
@@ -2126,6 +2276,22 @@ static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
     g_presentUsTotal += presentUs;
     g_presentCalls++;
     if (presentUs > g_presentUsMax) g_presentUsMax = presentUs;
+    return 0;
+}
+
+// Present `fr` this frame: a newly due frame (about to become g_lastShown) or
+// the held g_lastShown. The conversion is queued with gfx_video and runs from
+// gfx_present only when no scanout surface already holds the picture, so held
+// repeats (30 fps content on the 60 Hz loop, pause, EOF, stalls) cost nothing
+// unless an overlay changed. `fr != g_lastShown` is safe for "new": both are
+// live frames here, so equal addresses mean the same frame.
+static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
+    int vw = g_srcW, vh = g_srcH;
+    if (fr != g_lastShown || fr != g_nvFrame || vw != g_nvVisW || vh != g_nvVisH) {
+        g_nvFrame = fr; g_nvVisW = vw; g_nvVisH = vh;
+        g_nvTag = GFX_TAG_VIDEO | ++g_videoTagSeq;
+    }
+    gfx_video(g, g_nvTag, paint_nv12);
     return 0;
 }
 
@@ -2481,6 +2647,7 @@ static void *decode_segment_thread_main(void *arg) {
                 decode_video_hw_seg(g_pkt, vtb);
                 av_packet_unref(g_pkt);
             } else {
+                sw_adapt_loop_filter();
                 if (avcodec_send_packet(g_vdec, g_pkt) < 0) { av_packet_unref(g_pkt); continue; }
                 av_packet_unref(g_pkt);
                 queue_sw_frame_us(vtb);
@@ -2507,6 +2674,11 @@ static void *decode_segment_thread_main(void *arg) {
 // never outweigh that extra copy. A real win would have to skip the work
 // ENTIRELY on repeats (per-framebuffer generation tracking), which needs care
 // because overlays drawn into a buffer would otherwise go stale.
+// That is what build_scaled_nv12_direct/blit_scaled + gfx_video now do: the
+// conversion still writes once, straight into the framebuffer, but only when
+// no surface already holds the picture with identical overlays (tags cover the
+// overlay calls too). With triple buffering a hold's own target never holds the
+// frame (it went to the previous surface), so a repeat re-shows that surface.
 
 static int render_threaded(Gfx *g) {
     if (g_liveRestartPending) {
