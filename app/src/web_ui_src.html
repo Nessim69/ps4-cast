@@ -585,7 +585,7 @@ async function pasteTo(id){var el=$(id);el.focus();el.select();
 
 async function loadPlaylist(){var u=$('purl').value.trim();if(!u){msg('Paste an M3U / playlist link first');$('purl').focus();return}
  busy(true);msg('Loading playlist…');
- try{var r=await fetch('/playlist',{method:'POST',headers:{'Content-Type':'text/plain'},body:u});var a=await r.json();busy(false);
+ try{var r=await post('/playlist',u);var a=await r.json();busy(false);
   plData=a||[];chanCur=-1;curGroup='';curSearch='';if($('chSearch'))$('chSearch').value='';setMode('iptv');renderPane('pl');
   if(!plData.length){msg('No channels found in that link')}else{msg(plData.length+' channels — tap one to play')}}
  catch(e){busy(false);msg('Could not load that playlist')}}

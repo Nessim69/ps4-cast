@@ -592,7 +592,7 @@ static const char WEB_UI_HTML[] =
 "\n"
 "async function loadPlaylist(){var u=$('purl').value.trim();if(!u){msg('Paste an M3U / playlist link first');$('purl').focus();return}\n"
 " busy(true);msg('Loading playlist…');\n"
-" try{var r=await fetch('/playlist',{method:'POST',headers:{'Content-Type':'text/plain'},body:u});var a=await r.json();busy(false);\n"
+" try{var r=await post('/playlist',u);var a=await r.json();busy(false);\n"
 "  plData=a||[];chanCur=-1;curGroup='';curSearch='';if($('chSearch'))$('chSearch').value='';setMode('iptv');renderPane('pl');\n"
 "  if(!plData.length){msg('No channels found in that link')}else{msg(plData.length+' channels — tap one to play')}}\n"
 " catch(e){busy(false);msg('Could not load that playlist')}}\n"
