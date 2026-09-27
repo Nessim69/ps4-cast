@@ -2222,6 +2222,8 @@ int httpd_start(int port) {
     favs_load();    // restore saved favorites from /data
     cfg_load();     // restore persisted settings (debug toasts)
     token_load_or_create(); // pairing token for state-changing requests
+    ssdp_uuid();            // load/mint the device UUID now, single-threaded: the HTTP
+                            // thread (description.xml) and SSDP thread only read it
     resume_load();  // restore saved per-URL resume positions
     httpd_channels_init(); // channel store mutex + restore the last-loaded list
     httpd_channels_set_push_cb(chan_tuned_push_cb);
