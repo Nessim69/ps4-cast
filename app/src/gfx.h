@@ -29,6 +29,9 @@ typedef struct {
     void *frameBuffers[GFX_BUFFER_COUNT]; // pipeline CPU conversion with scanout
     void *flipQueue;    // OrbisKernelEqueue (pointer-sized opaque handle)
     char attr[64];      // OrbisVideoOutBufferAttribute storage (over-sized, safe)
+    uint64_t tag[GFX_BUFFER_COUNT]; // what each surface holds (see gfx_video); 0 = unknown
+    int shownIdx;       // surface of the most recent flip (-1 before the first)
+    int lastFlipId;     // frame id of the most recent flip
 } Gfx;
 
 // Lifecycle
@@ -67,5 +70,24 @@ int  gfx_text_tr_w(const char *s, int scale, int track);
 // scale*scale block. Returns the x advance in pixels.
 int  gfx_text(Gfx *g, int x, int y, const char *s, int scale, GfxColor c);
 int  gfx_text_w(const char *s, int scale);      // measured pixel width
+
+// ---- redraw skipping (PS4 build; the host preview draws immediately) -------
+// Drawing calls between two gfx_present calls are queued, not drawn. At present
+// the queued frame is summarised as a tag: the picture it starts from (a video
+// tag, a full-screen fill, or what the target surface already held) hashed with
+// every queued call and its arguments/text. Each surface remembers the tag of
+// what was last drawn into it, so a frame identical to one a surface already
+// holds costs no pixel work: the target is flipped as-is, or the on-screen
+// surface is flipped again. Otherwise the queue runs into the target as usual.
+// A frame with nothing drawn keeps the on-screen picture. Video tags have bit 63
+// set; their owner guarantees one tag never names two different pictures.
+#define GFX_TAG_VIDEO (1ull << 63)
+// Use `paint` to put a full-screen video picture named `tag` under this frame's
+// drawing. It runs from gfx_present (or at once when drawing is already under
+// way), only if no surface already holds the result; it writes the target
+// directly and returns 0, or nonzero if it painted nothing.
+void     gfx_video(Gfx *g, uint64_t tag, int (*paint)(Gfx *g));
+uint64_t gfx_tag(const Gfx *g);                 // what the target surface holds now
+void     gfx_reuse_stats(uint64_t *reused, uint64_t *reshown);
 
 #endif

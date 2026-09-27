@@ -110,6 +110,8 @@ static int               g_sepAudioMode = 0;
 
 static uint8_t *g_scaled;          // BGRA scaled output, display-fit (software path)
 static int      g_scaledW, g_scaledH;
+static uint64_t g_scaledTag;       // names g_scaled's picture for gfx_video (0 = none)
+static uint64_t g_videoTagSeq;     // video tags are never reused
 static int      g_srcW, g_srcH;
 // Source geometry/format the cached g_sws was built for. If a frame arrives with
 // different source dims/format (e.g. an HLS discontinuity changes resolution),
@@ -120,6 +122,9 @@ static int      g_swsSrcFmt = -1;  // AV_PIX_FMT_NONE
 // ref to the last shown frame and re-present it on holds/pause/EOF — otherwise a
 // held frame flips to a stale back-buffer (judder). NULL in software mode.
 static AVFrame *g_lastShown = NULL;
+static AVFrame *g_nvFrame;          // picture paint_nv12 converts (see build_scaled_nv12_direct)
+static int      g_nvVisW, g_nvVisH; // visible size g_nvTag was issued for
+static uint64_t g_nvTag;
 // Bumped whenever a newly decoded frame becomes the frame on screen.
 static unsigned g_shownGen = 0;
 unsigned player_present_generation(void) { return g_shownGen; }
@@ -391,7 +396,9 @@ void player_stop(void) {
     if (g_avio)  { av_freep(&g_avio->buffer); avio_context_free(&g_avio); }
     present_pool_stop();                 // join present workers before freeing buffers
     if (g_lastShown) av_frame_free(&g_lastShown);
+    g_nvFrame = NULL;                    // it was g_lastShown
     if (g_scaled){ free(g_scaled); g_scaled = NULL; }
+    g_scaledTag = 0;
     if (g_isLocal) {
         if (g_localFd >= 0) sceKernelClose(g_localFd);
     } else if (g_isHls) {
@@ -1050,8 +1057,10 @@ void player_debug(char *out, int len) {
     double ahead = (!g_isLocal && g_bytesPerSec > 0) ? (double)httpsrc_ahead_bytes() / g_bytesPerSec : 0;
     uint64_t flipAvg = 0, flipMax = 0, flipWaitAvg = 0, flipWaitMax = 0;
     gfx_present_stats(&flipAvg, &flipMax, &flipWaitAvg, &flipWaitMax);
+    uint64_t fbReused = 0, fbReshown = 0;   // presents that needed no drawing (see gfx.h)
+    gfx_reuse_stats(&fbReused, &fbReshown);
     snprintf(out, len,
-             "ff%s%s%s %dx%d | fr=%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%llu/%llu dc=%llu/%llu qw=%llu/%llu flip=%llu/%llu(w%llu/%llu)us ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
+             "ff%s%s%s %dx%d | fr=%ld drop=%ld(q%ld/l%ld/r%ld) q=%d/%d ro=%d cv=%llu/%llu dc=%llu/%llu qw=%llu/%llu flip=%llu/%llu(w%llu/%llu)us reuse=%llu/%llu ra=%d/%d rb=%d ahead=%.1fs lag=%lldms er=%d dmem=%ldKB | as=%d%s%s %s | %s | %s | %s",
              g_useHw ? "/HW" : "", g_isHls ? (g_hlsSegDemux ? "/hls-seg" : "/hls") : "", g_threaded ? "/T" : "", g_srcW, g_srcH,
              g_frames, g_drops, g_queueDrops, g_lateDrops, g_reorderDrops, g_fqCount, FQ_SLOTS,
              g_hwReorder,
@@ -1063,6 +1072,7 @@ void player_debug(char *out, int len) {
              (unsigned long long)g_fqWaitUsMax,
              (unsigned long long)flipAvg, (unsigned long long)flipMax,
              (unsigned long long)flipWaitAvg, (unsigned long long)flipWaitMax,
+             (unsigned long long)fbReused, (unsigned long long)fbReshown,
              g_srCount, SEG_RING, g_rebufTotal, ahead,
              (long long)(g_lastLagUs / 1000), g_lastErr, vdec_hw_dmem_outstanding() / 1024,
              g_sepAudioMode ? g_aastream : g_astream, g_sepAudioMode ? "/sep" : "",
@@ -1092,6 +1102,7 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
     int di = g_interlaced ? 1 : 0;
     int srcH = di ? sh / 2 : sh;
 
+    g_scaledTag = 0;                   // g_scaled changes below: no surface shows it yet
     if (scaledW != g_scaledW || scaledH != g_scaledH || !g_scaled) {
         free(g_scaled);
         g_scaled = malloc((size_t)scaledW * scaledH * 4);
@@ -1123,6 +1134,7 @@ static int build_scaled(AVFrame *fr, Gfx *g) {
     } else {
         sws_scale(g_sws, (const uint8_t * const *)fr->data, fr->linesize, 0, sh, dst, dstStride);
     }
+    g_scaledTag = GFX_TAG_VIDEO | ++g_videoTagSeq;
     return 0;
 }
 
@@ -1145,8 +1157,10 @@ static void clear_bars_gated(Gfx *g, int ox, int oy, int sW, int sH) {
         s_lw = sW; s_lh = sH; s_lx = ox; s_ly = oy;
         g_barClearLeft = (sW != dw || sH != dh) ? GFX_BUFFER_COUNT + 1 : 0;
     }
-    if (g_barClearLeft <= 0) return;
-    g_barClearLeft--;
+    // Also whenever the target holds anything but a clean picture (see the
+    // same rule in paint_nv12): a video tag must imply clean bars.
+    if (g_barClearLeft <= 0 && (gfx_tag(g) & GFX_TAG_VIDEO)) return;
+    if (g_barClearLeft > 0) g_barClearLeft--;
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
     const uint32_t BAR = 0x80000000u;
     int vy0 = oy < 0 ? 0 : oy, vy1 = oy + sH > dh ? dh : oy + sH;
@@ -1162,7 +1176,8 @@ static void clear_bars_gated(Gfx *g, int ox, int oy, int sW, int sH) {
     }
 }
 
-static void blit_scaled(Gfx *g) {
+static int paint_scaled(Gfx *g) {
+    if (!g_scaled) return -1;
     int dw = g->width, dh = g->height;
     int ox = (dw - g_scaledW) / 2, oy = (dh - g_scaledH) / 2;
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
@@ -1176,7 +1191,12 @@ static void blit_scaled(Gfx *g) {
         for (int x = 0; x < g_scaledW; x++)
             out[x] = (row[x] & 0x00FFFFFFu) | 0x80000000u;
     }
+    return 0;
 }
+// Present g_scaled this frame. Like build_scaled_nv12_direct, the full-frame
+// copy is queued and skipped when a surface already shows this picture; the
+// tag is issued by build_scaled, the only writer of g_scaled.
+static void blit_scaled(Gfx *g) { gfx_video(g, g_scaledTag, paint_scaled); }
 
 // Decode one audio packet (from either demuxer), resample to S16 stereo 48k,
 // queue to sceAudioOut. `atb` is the audio stream's time_base for the clock.
@@ -1738,15 +1758,22 @@ static void present_pool_stop(void) {
 }
 
 // NV12 -> active framebuffer directly. This fuses color conversion, scaling, and
-// final blit for the hardware path.
-static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
+// final blit for the hardware path. It is the gfx_video paint queued by
+// build_scaled_nv12_direct: g_nvFrame is the shown frame (alive as g_lastShown
+// until a later player_render or player_stop, both after this frame's
+// gfx_present), at the visible size snapshotted with its tag, because the
+// decode thread rewrites g_srcW/H on a resolution change and a tag must name
+// exactly one picture.
+static int paint_nv12(Gfx *g) {
+    AVFrame *fr = g_nvFrame;
+    if (!fr) return -1;
     uint64_t presentT0 = sceKernelGetProcessTime();
     int dw = g->width, dh = g->height, sw = fr->width, sh = fr->height;
     // Hardware decode returns coded dimensions (e.g. 1920x1088 for 1080p).
     // Present only the visible stream size when known; otherwise the scaler
     // shrinks 1920x1088 into 1905x1080 and wastes work on padding/pillarbox.
-    if (g_srcW > 0 && g_srcW <= sw) sw = g_srcW;
-    if (g_srcH > 0 && g_srcH <= sh) sh = g_srcH;
+    if (g_nvVisW > 0 && g_nvVisW <= sw) sw = g_nvVisW;
+    if (g_nvVisH > 0 && g_nvVisH <= sh) sh = g_nvVisH;
     if (sw <= 0 || sh <= 0) return -1;
     int scaledW = dw, scaledH = (int)((int64_t)dw * sh / sw);
     if (scaledH > dh) { scaledH = dh; scaledW = (int)((int64_t)dh * sw / sh); }
@@ -1761,14 +1788,17 @@ static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
     // clear entirely and runs at full render rate. The video rect itself never
     // needs a clear (the NV12 convert below fills it). The countdown spans all
     // rotating framebuffers so a dismissed overlay is wiped from every buffer.
+    // Also clear whenever the target holds anything but a clean picture (a
+    // menu, an overlay, unknown): with surfaces reused and re-shown, a video tag
+    // must imply clean bars, and nothing may rely on callers requesting it.
     {
         static int s_lastSW = -1, s_lastSH = -1, s_lastOX = -1, s_lastOY = -1;
         if (scaledW != s_lastSW || scaledH != s_lastSH || ox != s_lastOX || oy != s_lastOY) {
             s_lastSW = scaledW; s_lastSH = scaledH; s_lastOX = ox; s_lastOY = oy;
             g_barClearLeft = GFX_BUFFER_COUNT + 1;
         }
-        if (g_barClearLeft > 0) {
-            g_barClearLeft--;
+        if (g_barClearLeft > 0 || !(gfx_tag(g) & GFX_TAG_VIDEO)) {
+            if (g_barClearLeft > 0) g_barClearLeft--;
             const uint32_t BAR = 0x80000000u;
             int vy0 = oy, vy1 = oy + scaledH, vx0 = ox, vx1 = ox + scaledW;
             if (vy0 < 0) vy0 = 0; if (vy1 > dh) vy1 = dh;
@@ -1814,6 +1844,22 @@ static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
     g_presentUsTotal += presentUs;
     g_presentCalls++;
     if (presentUs > g_presentUsMax) g_presentUsMax = presentUs;
+    return 0;
+}
+
+// Present `fr` this frame: a newly due frame (about to become g_lastShown) or
+// the held g_lastShown. The conversion is queued with gfx_video and runs from
+// gfx_present only when no scanout surface already holds the picture, so held
+// repeats (30 fps content on the 60 Hz loop, pause, EOF, stalls) cost nothing
+// unless an overlay changed. `fr != g_lastShown` is safe for "new": both are
+// live frames here, so equal addresses mean the same frame.
+static int build_scaled_nv12_direct(AVFrame *fr, Gfx *g) {
+    int vw = g_srcW, vh = g_srcH;
+    if (fr != g_lastShown || fr != g_nvFrame || vw != g_nvVisW || vh != g_nvVisH) {
+        g_nvFrame = fr; g_nvVisW = vw; g_nvVisH = vh;
+        g_nvTag = GFX_TAG_VIDEO | ++g_videoTagSeq;
+    }
+    gfx_video(g, g_nvTag, paint_nv12);
     return 0;
 }
 
@@ -2195,6 +2241,11 @@ static void *decode_segment_thread_main(void *arg) {
 // never outweigh that extra copy. A real win would have to skip the work
 // ENTIRELY on repeats (per-framebuffer generation tracking), which needs care
 // because overlays drawn into a buffer would otherwise go stale.
+// That is what build_scaled_nv12_direct/blit_scaled + gfx_video now do: the
+// conversion still writes once, straight into the framebuffer, but only when
+// no surface already holds the picture with identical overlays (tags cover the
+// overlay calls too). With triple buffering a hold's own target never holds the
+// frame (it went to the previous surface), so a repeat re-shows that surface.
 
 static int render_threaded(Gfx *g) {
     if (g_liveRestartPending) {
