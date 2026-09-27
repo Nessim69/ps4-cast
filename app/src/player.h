@@ -10,10 +10,17 @@
 #define PLAYER_LOCAL_UPLOAD_PATH "/data/ps4cast_upload.bin"
 
 int  player_init(void);              // initialize playback backend; 0 ok
-int  player_play(const char *url);   // start streaming a URL/file; 0 ok
-void player_stop(void);              // stop current playback
-int  player_is_active(void);         // 1 while playback is active (post-buffer)
-int  player_started(void);           // 1 from Start until Stop (drives the pump)
+// Opening runs on the player's opener worker, never on the render thread (it
+// can take tens of seconds). Main thread only: requests are latest-wins -- a
+// newer play/stop cancels the one in flight and replaces a queued one.
+void player_play_async(const char *spec); // queue stop+open of "url|Referer=..&Type=hls"
+void player_stop(void);              // queue a stop (cancels an in-flight open)
+int  player_opening(void);           // 1 while a play/stop is queued or executing
+int  player_poll_open(int *rc);      // 1 once when the newest play finished; *rc 0 = playing
+const char *player_current_spec(void); // spec (options intact) the pipeline was opened from; read while !player_opening()
+int  player_shutdown(void);          // app exit: cancel, join the worker, tear down; -1 = worker wedged
+int  player_is_active(void);         // 1 while playback is active (post-buffer); 1 while a play is opening
+int  player_started(void);           // 1 from Start until Stop (drives the pump), incl. while opening
 int  player_is_live(void);           // 1 if the current source is a live stream
 int  player_is_local(void);          // 1 while the uploaded local file is open
 int  player_render(Gfx *g);          // blit newest video frame to g; 1 if drawn

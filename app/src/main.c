@@ -133,10 +133,11 @@ static void install_fatal_handlers(void) {
 // loop stamps a heartbeat each frame; this independent thread force-exits if the
 // heartbeat goes stale, turning an indefinite freeze into an auto clean-close.
 static volatile uint64_t g_heartbeat = 0;
-// Set while a known-slow main-thread operation is running (player_play: tearing
-// down the old pipeline + opening/probing the new stream — esp. switching off a
-// 1080i software/deinterlace channel). The watchdog grants a longer grace then,
-// so a slow-but-progressing channel switch isn't killed as a freeze (CE-34878).
+// Set while a known-slow main-thread operation is running (a stop+open run
+// synchronously: tearing down the old pipeline + opening/probing the new stream
+// — esp. switching off a 1080i software/deinterlace channel). The watchdog grants
+// a longer grace then, so a slow-but-progressing channel switch isn't killed as a
+// freeze (CE-34878). Normally opens run on the player's opener worker instead.
 static volatile int g_wdBusy = 0;
 // Names the blocking operation currently in flight (e.g. "dns"), so a HANG line
 // says WHERE it blocked instead of only which stage. Set it around unabortable
@@ -146,6 +147,17 @@ static const char *volatile g_wdNote = "";
 // heartbeat means "the main loop is alive", so letting the read-ahead / audio
 // threads refresh it would keep a frozen main loop looking healthy forever.
 static OrbisPthread g_mainTh = NULL;
+// The player's opener worker (player_ff.c) now runs every stop+open, so the main
+// loop never blocks on one and keeps the strict 15s grace. The worker gets its
+// OWN progress beat instead: >0 while it executes a request, refreshed by the
+// kicks the network/probe code already makes (watchdog_kick routes them here
+// when they come from that thread). An open that makes no progress for 35s --
+// the same grace a switch had when it blocked the main loop -- fail-closes as
+// OPENHANG. Anything bounded (8s DNS, budgeted fetches) is merely waited out
+// while the UI stays live and newer requests queue behind it.
+static volatile uint64_t g_openBeat = 0;
+static OrbisPthread g_openTh = NULL;
+static const char *volatile g_wdOpenNote = "";
 static void *watchdog_main(void *arg) {
     (void)arg;
     for (;;) {
@@ -166,6 +178,21 @@ static void *watchdog_main(void *arg) {
                               "HWHANG v" APP_VER " sceVideodec2Decode blocked %llums\n",
                               (unsigned long long)(hwStuck / 1000));
             persist_crash(hb2, hn);
+            _exit(0);
+        }
+        // A wedged opener (no progress for 35s) would leave every later cast and
+        // Stop queued behind it forever while the lobby looks healthy: close
+        // cleanly so the user can relaunch, naming where it blocked.
+        uint64_t ob = g_openBeat;
+        if (ob && now > ob && (now - ob) > 35ULL * 1000 * 1000) {
+            gfx_emergency_release();
+            char ob2[128];
+            const char *stg = "?"; player_stage(&stg);
+            const char *nte = (const char *)g_wdOpenNote;
+            int on = snprintf(ob2, sizeof(ob2), "OPENHANG v" APP_VER " stale=%llums stage=%s at=%s\n",
+                              (unsigned long long)((now - ob) / 1000), stg ? stg : "?",
+                              (nte && *nte) ? nte : "-");
+            persist_crash(ob2, on);
             _exit(0);
         }
         uint64_t lim = g_wdBusy ? 35ULL * 1000 * 1000     // mid channel-switch: generous
@@ -190,7 +217,7 @@ static void *watchdog_main(void *arg) {
 }
 
 // Pet the freeze watchdog from a long, legitimately-progressing blocking call on
-// the main thread (e.g. player_play's demux probe while switching channels),
+// the main thread (e.g. the demux probe of a synchronous channel switch),
 // so a slow-but-alive stream switch isn't mistaken for a freeze and killed
 // (that was the CE-34878 on channel switching). Only kicks once the loop is
 // running; safe to call from anywhere.
@@ -199,9 +226,16 @@ static void *watchdog_main(void *arg) {
 // single global and aseg/hls/httpsrc all run on worker threads too -- a worker
 // setting "dns"/"tls" clobbered main's marker, and its restore wrote back the
 // WORKER's saved value. That made at= report a thread other than the stuck one.
-// Same rule as watchdog_kick(): calls from workers are ignored.
+// Same rule as watchdog_kick(): calls from workers are ignored -- except the
+// opener worker's, which get their own marker for the OPENHANG line.
 const char *watchdog_note(const char *w) {
-    if (g_mainTh && scePthreadSelf() != g_mainTh) return "";
+    OrbisPthread self = scePthreadSelf();
+    if (g_mainTh && self != g_mainTh) {
+        if (!g_openBeat || self != g_openTh) return "";
+        const char *po = (const char *)g_wdOpenNote;
+        g_wdOpenNote = w ? w : "";
+        return po;
+    }
     const char *p = (const char *)g_wdNote;
     g_wdNote = w ? w : "";
     return p;
@@ -209,13 +243,36 @@ const char *watchdog_note(const char *w) {
 
 void watchdog_kick(void) {
     if (!g_heartbeat) return;
-    if (g_mainTh && scePthreadSelf() != g_mainTh) return;   // worker thread: not our liveness to vouch for
+    OrbisPthread self = scePthreadSelf();
+    if (g_mainTh && self != g_mainTh) {
+        // Worker thread: not our liveness to vouch for. The opener's kicks are
+        // its own progress beat (a probe read, a DNS try, a fetch hop).
+        if (g_openBeat && self == g_openTh) g_openBeat = sceKernelGetProcessTime();
+        return;
+    }
     g_heartbeat = sceKernelGetProcessTime();
 }
 
-// player_play() calls this(1) at entry; the main loop clears it (0) the moment it
-// resumes, so the longer grace covers exactly the blocking switch and nothing more.
+// The opener worker brackets every request with this (player_ff.c). Only that
+// thread writes g_openBeat, so a kick can never revive a finished beat.
+void watchdog_open_job(int on) {
+    if (on) {
+        g_openTh = scePthreadSelf();
+        g_wdOpenNote = "";
+        g_openBeat = sceKernelGetProcessTime();
+    } else {
+        g_openBeat = 0;
+    }
+}
+
+// Set(1) only where the MAIN thread itself blocks on a switch now: the
+// synchronous fallback when the opener worker could not start, and the
+// teardown at exit. The main loop clears it (0) the moment it resumes, so the
+// longer grace covers exactly the blocking switch and nothing more. Calls from
+// other threads are ignored: refreshing the heartbeat from a worker would keep a
+// frozen main loop looking healthy.
 void watchdog_set_busy(int on) {
+    if (g_mainTh && scePthreadSelf() != g_mainTh) return;
     g_wdBusy = on ? 1 : 0;
     if (on && g_heartbeat) g_heartbeat = sceKernelGetProcessTime();
 }
@@ -596,7 +653,7 @@ static void draw_hud(Gfx *g, PlaybackOrigin origin) {
         fmt_time(dur, durS, sizeof(durS));
         stext(g, barX, barY + 18, curS, 3, TXT);
         stext(g, barX + barW - gfx_text_w(durS, 3), barY + 18, durS, 3, MUT);
-    } else {
+    } else if (!player_opening()) {   // mid-open dur is 0 for VOD too: no false LIVE tag
         // live stream: a thin static accent line + LIVE tag
         gfx_round(g, barX, barY, barW, barH, barH / 2, SURF2);
         gfx_round(g, barX, barY, barW, barH, barH / 2, ACCENT);
@@ -854,6 +911,10 @@ int main(void) {
     int liveSource = 0;               // current source has no finite duration (live)
     int reconnecting = 0, reconnects = 0;   // auto-reconnect a dropped live stream
     uint64_t reconnectAt = 0, healthySince = 0;
+    // What a reconnect replays: the dropped stream's own spec, options intact.
+    // Not lastUrl -- httpd_last_push() is the bare media URL for /cast, so a
+    // Referer/UA-gated CDN answered every retry with 403.
+    char reconnectSpec[2048] = "";
     const int MAX_RECONNECT = 30;     // ~give up after this many attempts
     uint64_t noUserSince = 0;         // first time we saw NO valid signed-in user (debounce)
     uint64_t scrubStart = 0, scrubStep = 0;   // continuous-scrub timing
@@ -913,7 +974,12 @@ int main(void) {
         }
 
         // ---- resume: remember VOD position; seek back to it on replay --------
-        if (!player_started()) {
+        if (player_opening()) {
+            // Frozen while a play/stop is in flight -- the span the loop used to
+            // spend blocked inside player_play. The new stream has no timeline
+            // yet: its 10s resume window would expire on a slow open, and a
+            // checkpoint would pair the OLD key with the new stream's position.
+        } else if (!player_started()) {
             lastUrl[0] = '\0';
         } else {
             const char *lp = httpd_last_push();
@@ -934,6 +1000,26 @@ int main(void) {
                 double sc = 0, sd = 0; player_progress(&sc, &sd);
                 if (sd > 0) httpd_resume_save(lastUrl, (int)sc, (int)sd);
                 lastResumeSave = now;
+            }
+        }
+
+        // ---- settled opens --------------------------------------------------
+        // player_play_async() returns before the open does; its result lands
+        // here once. Polled BEFORE anything this frame can queue a newer request
+        // (only the newest play reports). A failed cast/zap drops the held frame
+        // (as `rc != 0 -> everDrew = 0` did); mid-reconnect the dropped stream's
+        // frame stays under the banner and the result only paces the next retry.
+        {
+            int orc = 0;
+            if (player_poll_open(&orc)) {
+                if (reconnecting) {
+                    uint64_t s = reconnects < 4 ? (uint64_t)reconnects : 4;   // 1,2,3,4,4.. *2s
+                    // A reopen that worked still needs its startup gate (<=5s)
+                    // to show a frame before it is judged dead and retried.
+                    reconnectAt = now + s * 2000000ULL + (orc == 0 ? 8000000ULL : 0);
+                } else if (orc != 0) {
+                    everDrew = 0;
+                }
             }
         }
 
@@ -976,7 +1062,7 @@ int main(void) {
                             httpd_chan_set_current(abs);
                             playbackOrigin = PLAYBACK_IPTV;
                             guideOpen = 0;
-                            player_play(curl);
+                            player_play_async(curl);
                             everDrew = 0; reconnecting = 0; reconnects = 0;
                             hudUntil = now + 5000000ULL;
                         }
@@ -1083,8 +1169,10 @@ int main(void) {
                     if (httpd_chan_get(tuneAbs, NULL, 0, curl, sizeof(curl))) {
                         int wasPlaying = player_started() && everDrew;
                         httpd_chan_set_current(tuneAbs);
-                        int rc = player_play(curl);
-                        if (rc != 0 || !wasPlaying) everDrew = 0;
+                        // Zapping on while this opens just supersedes it: only
+                        // the last channel of a burst is ever opened.
+                        player_play_async(curl);
+                        if (!wasPlaying) everDrew = 0;   // a failed open: see "settled opens"
                         reconnecting = 0; reconnects = 0;
                     }
                 }
@@ -1185,8 +1273,8 @@ int main(void) {
             } else {
                 int wasPlaying = player_started() && everDrew;
                 player_set_startup_headstart(1);
-                int rc = player_play(url);
-                if (rc != 0 || !wasPlaying) everDrew = 0; // hold old frame across the switch
+                player_play_async(url);   // returns at once; the open runs on the opener worker
+                if (!wasPlaying) everDrew = 0; // hold old frame across the switch (a failed open: "settled opens")
                 reconnecting = 0; reconnects = 0;
                 hudUntil = sceKernelGetProcessTime() + 6000000ULL;
             }
@@ -1210,8 +1298,8 @@ int main(void) {
             } else {
                 int wasPlaying = player_started() && everDrew;
                 player_set_startup_headstart(1);
-                int rc = player_play(url);
-                if (rc != 0 || !wasPlaying) everDrew = 0; // hold old frame across the switch
+                player_play_async(url);
+                if (!wasPlaying) everDrew = 0; // hold old frame across the switch
                 reconnecting = 0; reconnects = 0;
                 hudUntil = sceKernelGetProcessTime() + 6000000ULL;
             }
@@ -1233,30 +1321,35 @@ int main(void) {
         // advance to the queued item or fully tear down the finished playback.
         // Playback went inactive (EOF / dropped stream). Advance the queue, or —
         // for a LIVE source that dropped — begin auto-reconnect instead of dying.
+        // (player_is_active() stays 1 while a play is opening, so this never
+        // mistakes an open in flight for a finished stream.)
         if (!reconnecting && player_started() && !player_is_active()) {
             healthySince = 0;
             if (httpd_take_next(url, sizeof(url))) {
-                player_play(url);
+                player_play_async(url);
                 everDrew = 0; reconnecting = 0; reconnects = 0;
                 hudUntil = sceKernelGetProcessTime() + 6000000ULL;
-            } else if (liveSource && lastUrl[0]) {
+            } else if (liveSource && player_current_spec()[0]) {
+                snprintf(reconnectSpec, sizeof(reconnectSpec), "%s", player_current_spec());
                 reconnecting = 1; reconnects = 0; reconnectAt = now + 800000ULL;
             } else {
                 player_stop();
                 everDrew = 0;
             }
         }
-        // Reconnect driver: retry the same live URL with capped exponential backoff
+        // Reconnect driver: retry the same live spec with capped exponential backoff
         // until frames resume (clears `reconnecting`) or we exhaust the budget.
-        if (reconnecting) {
+        // One attempt in flight at a time: the next is armed only when this one
+        // settles (player_poll_open above), so the backoff timer can never cut a
+        // slow reopen short and restart it from scratch.
+        if (reconnecting && !player_opening() && now >= reconnectAt) {
             if (reconnects >= MAX_RECONNECT) {
                 reconnecting = 0; player_stop(); everDrew = 0;
                 notify("Stream lost - tap a channel to retry");
-            } else if (now >= reconnectAt) {
+            } else {
                 reconnects++;
-                player_play(lastUrl);
-                uint64_t s = reconnects < 4 ? (uint64_t)reconnects : 4;   // 1,2,3,4,4.. *2s
-                reconnectAt = now + (s * 2000000ULL);
+                player_play_async(reconnectSpec);
+                reconnectAt = now + 60000000ULL;   // re-armed when this attempt settles
             }
         }
 
@@ -1290,6 +1383,11 @@ int main(void) {
                 char st[200];
                 snprintf(st, sizeof(st), "%s", player_status());
                 ctext(&g, py + 212, st, 2, MUT, 0);
+                // The open runs off-thread now, so this loop keeps presenting:
+                // a cycling dot shows the receiver is alive (Circle still stops).
+                int phase = (int)((now / 300000ULL) % 3);
+                for (int d = 0; d < 3; d++)
+                    gfx_circle(&g, g.width / 2 + (d - 1) * 26, py + 244, 5, d == phase ? ACCENT : SURF2);
             }
             // if !drew && everDrew: keep the previous frame (no black flicker)
 
@@ -1371,8 +1469,11 @@ int main(void) {
     // blocked after close. LoadExec tears down the process immediately below;
     // waiting for this optional input worker would make clean exit less robust.
     (void)remoteThreadUp;
-    player_stop();
-    audio_shutdown();
+    // The in-loop player_stop() calls only QUEUED a stop. Tear down for real
+    // here, after cancelling any open and joining the opener worker. A worker
+    // wedged in an unabortable call is left alone (it may be inside the audio
+    // path too); LoadExec reaps the whole process either way.
+    if (player_shutdown() == 0) audio_shutdown();
     // Clean close: returning from main / _exit can be read by the system as an
     // abnormal termination and pop the "application closed" crash dialog. LoadExec
     // ("exit") is the recognized normal app-exit path → returns to the home menu
