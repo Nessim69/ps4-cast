@@ -1037,6 +1037,13 @@ int main(void) {
                     reconnectAt = now + s * 2000000ULL + (orc == 0 ? 8000000ULL : 0);
                 } else if (orc != 0) {
                     everDrew = 0;
+                } else if (playbackOrigin == PLAYBACK_IPTV) {
+                    // Overlays wait while an open holds the old picture (see
+                    // `frozen` below), so show the zap banner once it lands:
+                    // a slow switch still names the channel it tuned.
+                    channelBannerUntil = now + 3500000ULL;
+                } else {
+                    hudUntil = now + 5000000ULL;
                 }
             }
         }
@@ -1399,6 +1406,14 @@ int main(void) {
         // "idle-death"). Ticking unconditionally keeps the lobby alive too.
         sceSystemServicePowerTick();
 
+        // An open running off-thread over a picture already on screen. Nothing
+        // repaints the video meanwhile, so an overlay would land on whichever
+        // scanout surface is next -- each holding an OLDER frame -- making the
+        // held picture cycle through the last 2-3 frames and translucent panels
+        // darken pass after pass. Draw nothing: gfx then keeps the on-screen
+        // surface up, exactly the still frame the blocking open used to show.
+        int frozen = player_opening() && everDrew;
+
         if (player_started()) {
             // Only poke the system "video playing" notifier with a VALID user —
             // ticking it under an ANONYMOUS user is what drives SceShellUI's
@@ -1451,7 +1466,8 @@ int main(void) {
 
             // The guide replaces the HUD while browsing, so only one control
             // surface is ever visible over playback.
-            if (!guideOpen && (!everDrew || player_is_paused() || sceKernelGetProcessTime() < hudUntil)) {
+            if (!guideOpen && !frozen &&
+                (!everDrew || player_is_paused() || sceKernelGetProcessTime() < hudUntil)) {
                 draw_hud(&g, playbackOrigin);
                 player_request_bar_clear();   // HUD scrubber/times sit on the bottom bar
             }
@@ -1467,7 +1483,7 @@ int main(void) {
         if (guideOpen && player_started() && playbackOrigin == PLAYBACK_IPTV) {
             draw_channel_guide(&g, homeSel, railSel);
             player_request_bar_clear();
-        } else if (player_started() && playbackOrigin == PLAYBACK_IPTV &&
+        } else if (player_started() && playbackOrigin == PLAYBACK_IPTV && !frozen &&
                    sceKernelGetProcessTime() < channelBannerUntil) {
             draw_channel_banner(&g);
             player_request_bar_clear();
@@ -1495,7 +1511,7 @@ int main(void) {
         }
 
         // Lightweight stream stats (touchpad), top-right, only while playing.
-        if (statsOn && player_started()) {
+        if (statsOn && player_started() && !frozen) {
             draw_stats_overlay(&g, netBps, fpsVal);
             player_request_bar_clear();   // stats top rows sit on the top bar
         }
