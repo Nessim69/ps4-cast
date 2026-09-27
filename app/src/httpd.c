@@ -1300,6 +1300,93 @@ static void upload_name_load(char *out, int cap) {
     if (!out[0]) snprintf(out, cap, "Uploaded video");
 }
 
+// A multi-GB /upload used to run inline on server_main's single worker
+// thread, blocking /stop, /status and every DLNA action for the whole
+// transfer. handle_local_upload now only validates the request and (on
+// success) hands the already-accepted socket to a dedicated worker thread
+// that owns it for the rest of the transfer; server_main must not touch that
+// socket again. Only one upload runs at a time -- a concurrent one gets 409 --
+// so the worker's scratch buffer below can safely stay static.
+static int g_upload_active = 0;   // guarded by g_mtx
+#define UPLOAD_WORKER_STACK (256 * 1024)
+
+typedef struct {
+    OrbisNetId sock;
+    uint64_t   contentLen;
+    int        leadLen;
+    uint8_t    lead[8192];     // room for everything handle_client's req[] can hold
+    char       displayName[256];
+} UploadJob;
+
+// Set by handle_local_upload just before it returns, read once by server_main
+// right after handle_client(c) returns. Both sides run on server_main's own
+// thread (handle_client and everything it calls are that thread; the upload
+// worker is a separate thread that never touches this flag), so this is
+// plain sequential state, not something two threads race over.
+static int g_upload_handoff = 0;
+
+static void *upload_worker(void *arg) {
+    UploadJob *job = (UploadJob *)arg;
+    OrbisNetId c = job->sock;
+    uint64_t contentLen = job->contentLen;
+
+    sceKernelUnlink(UPLOAD_TMP_PATH);
+    int fd = sceKernelOpen(UPLOAD_TMP_PATH,
+                           0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
+    if (fd < 0) {
+        send_response(c, "507 Insufficient Storage", "text/plain", "cannot create upload", 20);
+        goto done;
+    }
+
+    {
+        uint64_t received = 0;
+        int failed = 0;
+        if (job->leadLen > 0) {
+            failed = write_file_all(fd, job->lead, job->leadLen) != 0;
+            received = (uint64_t)job->leadLen;
+        }
+
+        static uint8_t uploadBuf[64 * 1024];   // one upload at a time: g_upload_active gates reuse
+        while (!failed && received < contentLen) {
+            uint64_t left = contentLen - received;
+            int want = left < sizeof(uploadBuf) ? (int)left : (int)sizeof(uploadBuf);
+            int got = sceNetRecv(c, uploadBuf, want, 0);
+            if (got <= 0 || write_file_all(fd, uploadBuf, got) != 0) { failed = 1; break; }
+            received += (uint64_t)got;
+        }
+        if (!failed) sceKernelFsync(fd);
+        sceKernelClose(fd);
+
+        if (failed || received != contentLen) {
+            sceKernelUnlink(UPLOAD_TMP_PATH);
+            trace_mark("local upload failed name=%s bytes=%llu/%llu", job->displayName,
+                       (unsigned long long)received, (unsigned long long)contentLen);
+            send_response(c, "400 Bad Request", "text/plain", "upload interrupted", 18);
+            goto done;
+        }
+    }
+
+    if (sceKernelRename(UPLOAD_TMP_PATH, PLAYER_LOCAL_UPLOAD_PATH) != 0) {
+        sceKernelUnlink(UPLOAD_TMP_PATH);
+        send_response(c, "500 Internal Server Error", "text/plain", "cannot finalize upload", 22);
+        goto done;
+    }
+
+    upload_name_save(job->displayName);
+    trace_mark("local upload complete name=%s bytes=%llu", job->displayName,
+               (unsigned long long)contentLen);
+    set_pending_local_file(job->displayName);   // also bumps g_lists_ver
+    send_response(c, "200 OK", "text/plain", "ok", 2);
+
+done:
+    sceNetSocketClose(c);
+    scePthreadMutexLock(&g_mtx);
+    g_upload_active = 0;
+    scePthreadMutexUnlock(&g_mtx);
+    free(job);
+    return NULL;
+}
+
 static void handle_local_upload(OrbisNetId c, const char *req, int reqLen,
                                 const char *hdrend, uint64_t contentLen) {
     if (contentLen == 0) {
@@ -1315,64 +1402,63 @@ static void handle_local_upload(OrbisNetId c, const char *req, int reqLen,
         return;
     }
 
-    char encodedName[768], displayName[256];
+    scePthreadMutexLock(&g_mtx);
+    int busy = g_upload_active;
+    if (!busy) g_upload_active = 1;
+    scePthreadMutexUnlock(&g_mtx);
+    if (busy) {
+        send_response(c, "409 Conflict", "text/plain", "an upload is already in progress", 33);
+        return;
+    }
+
+    UploadJob *job = malloc(sizeof(*job));
+    if (!job) {
+        send_response(c, "500 Internal Server Error", "text/plain", "out of memory", 13);
+        scePthreadMutexLock(&g_mtx); g_upload_active = 0; scePthreadMutexUnlock(&g_mtx);
+        return;
+    }
+    job->sock = c;
+    job->contentLen = contentLen;
+
+    char encodedName[768];
     encodedName[0] = '\0';
     header_value(req, "X-PS4Cast-Filename:", encodedName, sizeof(encodedName));
-    decode_upload_name(encodedName, displayName, sizeof(displayName));
+    decode_upload_name(encodedName, job->displayName, sizeof(job->displayName));
 
-    // A client using Expect must receive the interim response before it sends
-    // the body. Browsers normally skip this, but supporting it keeps curl useful.
+    // handle_client's req[] buffer is static and reused by the very next
+    // accepted connection, so copy out the body bytes it already read
+    // (bounded by req[]'s own size, hence lead[]'s) before handing off.
+    const char *bodyStart = hdrend + 4;
+    int already = reqLen - (int)(bodyStart - req);
+    if (already < 0) already = 0;
+    if ((uint64_t)already > contentLen) already = (int)contentLen;
+    if (already > (int)sizeof(job->lead)) already = (int)sizeof(job->lead);
+    memcpy(job->lead, bodyStart, (size_t)already);
+    job->leadLen = already;
+
+    // Auth was already checked by handle_client's gate before this function
+    // was ever called, so it's safe to promise the client "send the body"
+    // here. A client using Expect must receive the interim response before
+    // it sends the body; browsers normally skip this, but supporting it
+    // keeps curl useful.
     if (ci_strstr(req, "Expect: 100-continue"))
         send_all(c, "HTTP/1.1 100 Continue\r\n\r\n", 25);
 
-    sceKernelUnlink(UPLOAD_TMP_PATH);
-    int fd = sceKernelOpen(UPLOAD_TMP_PATH,
-                           0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
-    if (fd < 0) {
-        send_response(c, "507 Insufficient Storage", "text/plain", "cannot create upload", 20);
-        return;
+    OrbisPthreadAttr attr;
+    OrbisPthreadAttr *pattr = NULL;
+    int attrInit = scePthreadAttrInit(&attr) == 0;
+    if (attrInit && scePthreadAttrSetstacksize(&attr, UPLOAD_WORKER_STACK) == 0) pattr = &attr;
+    OrbisPthread worker;
+    int trc = scePthreadCreate(&worker, pattr, upload_worker, job, "ps4cast_upload");
+    if (attrInit) scePthreadAttrDestroy(&attr);
+    if (trc != 0) {
+        send_response(c, "500 Internal Server Error", "text/plain", "cannot start upload", 19);
+        scePthreadMutexLock(&g_mtx); g_upload_active = 0; scePthreadMutexUnlock(&g_mtx);
+        free(job);
+        return;   // socket is still ours: server_main closes it as usual
     }
-
-    const char *body = hdrend + 4;
-    int already = reqLen - (int)(body - req);
-    if (already < 0) already = 0;
-    if ((uint64_t)already > contentLen) already = (int)contentLen;
-    uint64_t received = 0;
-    int failed = 0;
-    if (already > 0) {
-        failed = write_file_all(fd, body, already) != 0;
-        received = (uint64_t)already;
-    }
-
-    static uint8_t uploadBuf[64 * 1024];
-    while (!failed && received < contentLen) {
-        uint64_t left = contentLen - received;
-        int want = left < sizeof(uploadBuf) ? (int)left : (int)sizeof(uploadBuf);
-        int got = sceNetRecv(c, uploadBuf, want, 0);
-        if (got <= 0 || write_file_all(fd, uploadBuf, got) != 0) { failed = 1; break; }
-        received += (uint64_t)got;
-    }
-    if (!failed) sceKernelFsync(fd);
-    sceKernelClose(fd);
-
-    if (failed || received != contentLen) {
-        sceKernelUnlink(UPLOAD_TMP_PATH);
-        trace_mark("local upload failed name=%s bytes=%llu/%llu", displayName,
-                   (unsigned long long)received, (unsigned long long)contentLen);
-        send_response(c, "400 Bad Request", "text/plain", "upload interrupted", 18);
-        return;
-    }
-    if (sceKernelRename(UPLOAD_TMP_PATH, PLAYER_LOCAL_UPLOAD_PATH) != 0) {
-        sceKernelUnlink(UPLOAD_TMP_PATH);
-        send_response(c, "500 Internal Server Error", "text/plain", "cannot finalize upload", 22);
-        return;
-    }
-
-    upload_name_save(displayName);
-    trace_mark("local upload complete name=%s bytes=%llu", displayName,
-               (unsigned long long)contentLen);
-    set_pending_local_file(displayName);
-    send_response(c, "200 OK", "text/plain", "ok", 2);
+    scePthreadDetach(worker);   // fire-and-forget: nobody joins the upload thread
+    g_upload_handoff = 1;       // the worker now owns `c`; server_main must not close it
 }
 
 static void handle_client(OrbisNetId c) {
@@ -1412,6 +1498,25 @@ static void handle_client(OrbisNetId c) {
         const char *cl = ci_strstr(req, "Content-Length:");
         if (cl) contentLen = strtoull(cl + strlen("Content-Length:"), NULL, 10);
     }
+    if (strcmp(path, "/upnp/event/AVTransport") == 0 &&
+        handle_avt_subscription(c, method, req)) return;
+
+    // Pairing gate: mutations and UI pages need the token shown on the TV.
+    // DLNA/UPnP and read-only /status + /trace stay open (token_exempt).
+    // Moved above both the /upload dispatch and the body-read loop below: it
+    // only looks at already-complete headers (target/req), and gating
+    // /upload here (POST /upload used to be dispatched before this check
+    // ever ran, at v04.62) is what makes an upload require the token like
+    // every other mutation. GET /token additionally opens during a
+    // TV-triggered pairing window (httpd_pairing_window_left), since it
+    // can't require the very token it exists to hand out.
+    int tokenWindowOk = strcmp(path, "/token") == 0 && httpd_pairing_window_left() > 0;
+    if (!token_exempt(path) && !token_ok(target, req) && !tokenWindowOk) {
+        send_response(c, "401 Unauthorized", "text/plain",
+                      "missing pairing token (see the TV screen)", 41);
+        return;
+    }
+
     if (strcmp(method, "POST") == 0 && strcmp(path, "/upload") == 0) {
         handle_local_upload(c, req, n, hdrend, contentLen);
         return;
@@ -1430,17 +1535,6 @@ static void handle_client(OrbisNetId c) {
 
     const char *body = strstr(req, "\r\n\r\n");
     body = body ? body + 4 : "";
-
-    if (strcmp(path, "/upnp/event/AVTransport") == 0 &&
-        handle_avt_subscription(c, method, req)) return;
-
-    // Pairing gate: mutations and UI pages need the token shown on the TV.
-    // DLNA/UPnP and read-only /status + /trace stay open (token_exempt).
-    if (!token_exempt(path) && !token_ok(target, req)) {
-        send_response(c, "401 Unauthorized", "text/plain",
-                      "missing pairing token (see the TV screen)", 41);
-        return;
-    }
 
     // Channel store endpoints (GET /channels, POST /channel/*).
     if (httpd_channels_handle(c, method, path, body, send_response)) return;
@@ -2114,11 +2208,16 @@ static void *server_main(void *arg) {
             continue;
         // A vanished phone must not leave the single HTTP worker blocked on an
         // unfinished upload forever. This is microseconds on Orbis/BSD sockets.
+        // (An actual upload's transfer runs on its own worker thread, which
+        // inherits this same timeout on `c` -- see handle_local_upload.)
         int tmo = 30 * 1000 * 1000;
         sceNetSetsockopt(c, SOL_SOCKET_PS4, SO_RCVTIMEO_PS4, &tmo, sizeof(tmo));
         sceNetSetsockopt(c, SOL_SOCKET_PS4, SO_SNDTIMEO_PS4, &tmo, sizeof(tmo));
+        g_upload_handoff = 0;
         handle_client(c);
-        sceNetSocketClose(c);
+        // A successful /upload handed `c` to its own worker thread, which
+        // owns the close; closing it here too would race that thread.
+        if (!g_upload_handoff) sceNetSocketClose(c);
     }
     return NULL;
 }
