@@ -8,7 +8,11 @@
 #   ranged fMP4, a master with an encrypted data:-URI audio rendition, a
 #   refetch of a bad cached key, the httpsrc->aseg init fallback, DRM refusal,
 #   the TS segment-demux path, and audio-rendition choice (default, preferred
-#   language, a track picked by name; other groups never offered).
+#   language, a track picked by name; other groups never offered), and the
+#   streamed (sink) download the programme guide uses: Content-Length,
+#   chunked and read-to-close bodies, each fetched twice on one channel, and
+#   a sink that stops early; and the programme guide end to end (epg.c:
+#   download, /data cache, link override, refresh, a link that is no guide).
 #
 # Needs python3 with `cryptography` and the BearSSL tree portlibs/fetch.sh
 # unpacks (BEARSSL_SRC to override). Skips (exit 0) when either is missing.
@@ -33,6 +37,11 @@ ${CC:-cc} -std=gnu11 -g -O1 -w -fsanitize=address,undefined ${E2E_CFLAGS:-} \
   "$A/httpsrc.c" "$A/urlopt.c" "$A/netpolicy.c" "$A/lang.c" \
   "$AES/aes_big_cbcdec.c" "$AES/aes_big_dec.c" "$AES/aes_common.c" "$AES/aes_x86ni.c" "$AES/aes_x86ni_cbcdec.c" \
   -lpthread || { echo "hls-e2e: build failed"; exit 1; }
+${CC:-cc} -std=gnu11 -g -O1 -w -fsanitize=address,undefined ${E2E_CFLAGS:-} \
+  -I"$HERE/shim" -I"$A" -o "$W/epg" \
+  "$HERE/epg_driver.c" "$HERE/stubs.c" "$A/epg.c" "$A/guide.c" "$A/xmltv.c" "$A/inflate.c" "$A/aseg.c" \
+  "$A/hls_parse.c" "$A/httpd_channels.c" "$A/m3u.c" "$A/urlopt.c" "$A/netpolicy.c" \
+  -lpthread || { echo "hls-e2e: guide build failed"; exit 1; }
 "$PY" "$HERE/server.py" "$W/out" 0 >"$W/server.err" 2>&1 & SRV=$!
 for _ in $(seq 50); do [ -s "$W/out/port" ] && break; sleep 0.1; done
 [ -s "$W/out/port" ] || { echo "hls-e2e: server did not start"; cat "$W/server.err"; exit 1; }
@@ -57,5 +66,12 @@ run "segdemux aes-128"           "SEGDEMUX=1" "$U/aes/index.m3u8" "$O/aes.bin"
 run "audio: default rendition"   "EXPECT_RENDS=3" "$U/ml/master.m3u8" "$O/plain.bin" "$O/ml_en.bin"
 run "audio: preferred language"  "EXPECT_RENDS=3 APREF_LANG=fra" "$U/ml/master.m3u8" "$O/plain.bin" "$O/ml_fr.bin"
 run "audio: picked by name"      "EXPECT_RENDS=3 APREF_NAME=Deutsch APREF_LANG=fra" "$U/ml/master.m3u8" "$O/plain.bin" "$O/ml_de.bin"
+run "stream: content-length"     "STREAM=1" "$U/stream/known.bin" "$O/stream.bin"
+run "stream: chunked"            "STREAM=1" "$U/stream/chunked.bin" "$O/stream.bin"
+run "stream: to close"           "STREAM=1" "$U/stream/eof.bin" "$O/stream.bin"
+run "stream: sink stops"         "STREAM=1 STREAM_STOP=100000" "$U/stream/chunked.bin" "$O/stream.bin"
+mkdir -p "$W/data"
+if out=$(PS4CAST_DATA="$W/data" "$W/epg" "$U" "$O/server.log" 2>&1); then echo "ok   guide: download, cache, override, refresh"
+else echo "FAIL guide: download, cache, override, refresh"; echo "$out" | sed 's/^/     /' | head -12; fail=1; fi
 [ "$fail" = 0 ] && echo "hls-e2e: all ok" || echo "hls-e2e: FAILURES"
 exit $fail

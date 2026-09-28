@@ -631,6 +631,39 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
 - Host test: `test_channels` (100k parse/index/save/list, filters, reload,
   endpoints) with `tests/host/shim/orbis`.
 
+## Programme guide (XMLTV)
+
+- Chain: `aseg` streams the download (AsegOpts.sink, channel ASEG_CH_BG) ->
+  `inflate.c` (gzip/zlib, detected; anything else passes through) ->
+  `xmltv.c` (push parser) -> `guide.c` (compact store). Nothing but a 32 KB
+  window and one element is held while parsing; a 113 MB guide unpacks and
+  parses in about 1 s on a desktop.
+- `guide.c` keeps only channels the playlist can use: tvg-id (case-insensitive),
+  else a name key (lowercase, "UK:"-style prefix, brackets and HD/FHD/4K/...
+  dropped; "+1" kept), programmes within now-3 h..now+36 h, strings interned.
+  Caps: 200k programmes, 16 MB of strings (descriptions stop at 3/4).
+- `epg.c` thread: source = Settings override, else the playlist's x-tvg-url
+  (kept in the channel file as `#EPG`). The download is kept as
+  /data/ps4cast_epg.cache (+ .meta with URL and time; up to 96 MB) so a
+  restart or a playlist change re-reads it. Downloads every 12 h, re-reads
+  the cache every 6 h to move the window, retries failures after 10 min,
+  falls back to an older cached copy of the same link. The new guide is built
+  beside the old one and swapped in.
+- Time: `wallclock.c`. Local time comes from libkernel's
+  sceKernelConvertUtcToLocaltime (OpenOrbis only declares it without a
+  prototype, so it's called through a typed pointer with oversized zeroed out
+  buffers and a plausibility check), else from the phone (`POST /tz`, cfg `tz=`).
+  Not verified on a console.
+- HTTP: `POST /epg` (indices -> now/next), `POST /epg/chan` (schedule),
+  `POST /epg/url`, `POST /epg/refresh`, `/status` epg_ver/epg_on/epg_status/
+  epg_url/epg_src; cfg `epg=` is written last and cut off before the other
+  keys are parsed (a URL query can contain "pair=0").
+- TV: now in each list row, an info strip (now, progress, description, next)
+  for the highlighted channel, now under each row of the playback guide,
+  now/next in the zap banner.
+- Tests: host `test_inflate` (vectors from Python's zlib), `test_xmltv`,
+  `test_guide`; `tests/hls-e2e` runs epg.c end to end against server.py.
+
 ## Subtitles
 
 - Sources: embedded tracks (text: SubRip, ASS/SSA, WebVTT, mov_text, read

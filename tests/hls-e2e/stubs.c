@@ -20,6 +20,6 @@ int tls_last_error(tls_ctx *t) { (void)t; return 0; }
 void tls_set_read_deadline(tls_ctx *t, uint64_t d) { (void)t; (void)d; }
 void native_http_init(void) {}
 int native_http_fetch(int slot, const char *url, const char *headers, uint8_t **body, int *len, int *status,
-                      uint64_t t, int m, const volatile int *a) { (void)slot; (void)url; (void)headers; (void)body; (void)len; (void)status; (void)t; (void)m; (void)a; return -1; }
+                      uint64_t t, int m, int cap, const volatile int *a) { (void)slot; (void)url; (void)headers; (void)body; (void)len; (void)status; (void)t; (void)m; (void)cap; (void)a; return -1; }
 void native_http_abort(int slot) { (void)slot; }
 const char *native_http_debug(void) { return ""; }

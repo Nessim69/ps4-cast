@@ -19,6 +19,38 @@ static unsigned char *slurp(const char *p, long *n) {
     fclose(f); return b;
 }
 
+// STREAM=1: the programme-guide download path (aseg_fetch_opts with a sink on
+// ASEG_CH_BG), run twice so a kept-alive socket must have been left exactly
+// at the end of the previous body. STREAM_STOP=n: the sink stops after n bytes.
+typedef struct { unsigned char *b; long n, cap, stopAt; } Got;
+static int sink(void *ctx, const uint8_t *p, int n) {
+    Got *g = ctx;
+    if (g->n + n > g->cap) { g->cap = (g->n + n) * 2; g->b = realloc(g->b, (size_t)g->cap); }
+    memcpy(g->b + g->n, p, (size_t)n); g->n += n;
+    return g->stopAt && g->n >= g->stopAt;
+}
+static int stream_test(const char *url, const char *want) {
+    long wn; unsigned char *w = slurp(want, &wn);
+    long stopAt = getenv("STREAM_STOP") ? atol(getenv("STREAM_STOP")) : 0;
+    for (int pass = 0; pass < 2; pass++) {
+        Got g = { 0 };
+        g.stopAt = stopAt;
+        AsegOpts o = { 0 };
+        o.sink = sink; o.sinkCtx = &g;
+        uint8_t *buf = (uint8_t *)1; int len = -1;
+        int rc = aseg_fetch_opts(ASEG_CH_BG, url, &buf, &len, &o);
+        if (stopAt) {
+            if (rc != ASEG_STOPPED || g.n < stopAt || g.n > stopAt + 65536 || memcmp(g.b, w, (size_t)g.n) != 0) {
+                printf("pass %d: stop rc=%d got=%ld\n", pass, rc, g.n); return 1;
+            }
+        } else if (rc != 0 || buf != NULL || len != g.n || g.n != wn || memcmp(g.b, w, (size_t)wn) != 0) {
+            printf("pass %d: rc=%d buf=%p len=%d got=%ld want=%ld\n", pass, rc, (void *)buf, len, g.n, wn); return 1;
+        }
+        free(g.b);
+    }
+    return 0;
+}
+
 static int read_all(int audio, unsigned char **out, long *outN) {
     long cap = 1 << 20, n = 0; unsigned char *b = malloc(cap);
     for (;;) {
@@ -35,6 +67,7 @@ int main(int argc, char **argv) {
     alarm(120);             // a stuck stream (e.g. an init segment replayed forever) fails, never hangs
     aseg_init();
     const char *url = argv[1], *want = argv[2];
+    if (getenv("STREAM")) return stream_test(url, want);
     if (getenv("APREF_NAME") || getenv("APREF_LANG"))
         hls_set_audio_pref(getenv("APREF_NAME"), getenv("APREF_LANG"));
     int rc = hls_open(url);

@@ -24,6 +24,8 @@
 #include "audio.h"
 #include "watchdog.h"
 #include "subtitle.h"
+#include "epg.h"
+#include "wallclock.h"
 #endif
 
 #ifndef BOOT_MINIMAL
@@ -725,6 +727,54 @@ static int chan_rail_for_abs(int absolute) {
 // ---- Live TV home: one full-width bouquet/channel browser ----------------
 // Cast reception remains active while this screen is open. Keeping the two
 // products visually separate makes the current input semantics obvious.
+// ---- programme guide (epg.c) on the TV -------------------------------------
+// Cut s to fit maxW pixels at scale sc, ending in ".." when shortened.
+static void clip_text(char *s, int cap, int maxW, int sc) {
+    int len = (int)strlen(s), w = gfx_text_w(s, sc);
+    if (w <= maxW) return;
+    if (len > cap - 3) { len = cap - 3; while (len > 0 && ((unsigned char)s[len] & 0xC0) == 0x80) len--; s[len] = '\0'; }
+    int dots = gfx_text_w("..", sc);
+    while (len > 0 && w > maxW - dots) {
+        int cut = (int)((long)len * (maxW - dots) / (w > 0 ? w : 1));
+        if (cut >= len) cut = len - 1;
+        if (cut < 0) cut = 0;
+        while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) cut--;   // UTF-8 boundary
+        len = cut;
+        s[len] = '\0';
+        w = gfx_text_w(s, sc);
+    }
+    while (len > 0 && s[len - 1] == ' ') s[--len] = '\0';
+    s[len] = '.'; s[len + 1] = '.'; s[len + 2] = '\0';          // len <= cap - 3
+}
+
+// Now/next for channel `chan`; returns epg_now_next()'s bits.
+static int chan_epg(int chan, EpgProgramme *on, EpgProgramme *nx) {
+    int64_t now = wallclock_utc();
+    return now ? epg_now_next(chan, now, on, nx) : 0;
+}
+
+static int prog_pct(const EpgProgramme *p) {
+    int64_t now = wallclock_utc(), len = p->stop - p->start;
+    if (len <= 0 || now <= p->start) return 0;
+    if (now >= p->stop) return 100;
+    return (int)((now - p->start) * 100 / len);
+}
+
+// "20:00-21:00  Title" (range = 1) or "21:00  Title".
+static void prog_line(const EpgProgramme *p, int range, char *out, int cap) {
+    char a[8], b[8];
+    wallclock_hhmm(p->start, a, sizeof(a));
+    wallclock_hhmm(p->stop, b, sizeof(b));
+    if (range) snprintf(out, (size_t)cap, "%s-%s  %s", a, b, p->title);
+    else snprintf(out, (size_t)cap, "%s  %s", a, p->title);
+}
+
+static void draw_prog_bar(Gfx *g, int x, int y, int w, int pct, GfxColor fill) {
+    gfx_round(g, x, y, w, 6, 3, SURF2);
+    int f = w * pct / 100;
+    if (f > 6) gfx_round(g, x, y, f, 6, 3, fill);
+}
+
 static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
                               const char *ip, int net_ok) {
     gfx_vgrad(g, 0, 0, g->width, g->height, BG_TOP, BG_BOT);
@@ -753,7 +803,14 @@ static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
         return;
     }
 
-    int rows = (H - ly - 112) / rowH;
+    // With a guide, the highlighted channel gets an info strip under the list
+    // (reserved while any guide is loaded, so the list never jumps).
+    static EpgProgramme selOn, selNx;
+    int selAbs = inChannels ? httpd_chan_filter_abs(sel) : -1;
+    int guideUp = inChannels && epg_loaded();
+    int selEpg = guideUp && selAbs >= 0 ? chan_epg(selAbs, &selOn, &selNx) : 0;
+    int infoH = guideUp ? 150 : 0;
+    int rows = (H - ly - 112 - infoH) / rowH;
     int start = sel - rows / 2;
     if (start > n - rows) start = n - rows;
     if (start < 0) start = 0;
@@ -769,11 +826,21 @@ static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
             int abs = httpd_chan_filter_abs(i);
             if (abs < 0) continue;
             char nm[96]; httpd_chan_get(abs, nm, sizeof(nm), NULL, 0);
-            int maxch = (lw - 240) / 24; if (maxch < 6) maxch = 6;
-            if ((int)strlen(nm) > maxch) nm[maxch] = 0;
+            static EpgProgramme rOn;
+            int rEpg = chan_epg(abs, &rOn, NULL) & 1;
+            // Name, then (with a guide) what is on now in the rest of the row.
+            int nameW = rEpg ? (lw - 300) * 2 / 5 : lw - 300;
+            clip_text(nm, (int)sizeof(nm), nameW, 3);
             char num[12]; snprintf(num, sizeof(num), "%d", abs + 1);
             gfx_text(g, lx + 24, y + (rowH - 6) / 2 - 8, num, 2, on ? INK : FAINT);
             gfx_text(g, lx + 118, y + (rowH - 6) / 2 - 12, nm, 3, on ? INK : TXT);
+            if (rEpg) {
+                char pl[200];
+                prog_line(&rOn, 0, pl, sizeof(pl));
+                int px = lx + 118 + nameW + 36;
+                clip_text(pl, (int)sizeof(pl), lx + lw - 170 - px, 2);
+                gfx_text(g, px, y + (rowH - 6) / 2 - 8, pl, 2, on ? INK : MUT);
+            }
             if (httpd_chan_is_fav(abs)) gfx_text(g, lx + lw - 142, y + 17, "FAV", 2, on ? INK : WARN);
             if (abs == cur) {
                 gfx_circle(g, lx + lw - 50, y + (rowH - 6) / 2, 6, on ? INK : LIVE);
@@ -782,6 +849,34 @@ static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
         }
     }
     if (n == 0) ctext(g, ly + 70, "No channels in this bouquet", 3, MUT, 0);
+
+    if (guideUp && n > 0) {
+        int iy = H - 112 - infoH + 14, ix = lx + 24, iw = lw - 48;
+        gfx_rect_a(g, lx, iy - 10, lw, 1, HAIR, 30);
+        char l[400];
+        if (!selEpg) {
+            gfx_text(g, ix, iy + 4, "No guide for this channel", 3, MUT);
+        } else if (selEpg & 1) {
+            prog_line(&selOn, 1, l, sizeof(l));
+            clip_text(l, (int)sizeof(l), iw - 220, 3);
+            gfx_text(g, ix, iy + 4, l, 3, TXT);
+            draw_prog_bar(g, ix + iw - 200, iy + 16, 200, prog_pct(&selOn), ACCENT);
+            if (selOn.desc[0] || selOn.sub[0]) {
+                snprintf(l, sizeof(l), "%s%s%s", selOn.sub, selOn.sub[0] && selOn.desc[0] ? " - " : "", selOn.desc);
+                clip_text(l, (int)sizeof(l), iw, 2);
+                gfx_text(g, ix, iy + 48, l, 2, MUT);
+            }
+        } else {
+            gfx_text(g, ix, iy + 4, "Nothing on air now", 3, MUT);
+        }
+        if (selEpg & 2) {
+            char nl[300];
+            prog_line(&selNx, 0, nl, sizeof(nl));
+            snprintf(l, sizeof(l), "Next  %s", nl);
+            clip_text(l, (int)sizeof(l), iw, 2);
+            gfx_text(g, ix, iy + 84, l, 2, FAINT);
+        }
+    }
 
     ctext(g, H - 56, inChannels
         ? "Up/Down channel   Cross watch   Square favourite   Circle bouquets   L2/R2 bouquet"
@@ -831,13 +926,20 @@ static void draw_channel_guide(Gfx *g, int sel, int railSel) {
 
         char name[96];
         httpd_chan_get(idx, name, sizeof(name), NULL, 0);
-        int maxch = (rw - 230) / 24; if (maxch < 4) maxch = 4;
-        if ((int)strlen(name) > maxch) name[maxch] = '\0';
+        clip_text(name, (int)sizeof(name), rw - 104 - 110, 3);
 
         char num[12]; snprintf(num, sizeof(num), "%d", idx + 1);
         GfxColor numc = seld ? INK : FAINT, nc = seld ? INK : TXT;
+        static EpgProgramme gOn;
+        int gEpg = chan_epg(idx, &gOn, NULL) & 1;
         gfx_text(g, rx + 26, rowY + rowH / 2 - 4, num, 2, numc);
-        gfx_text(g, rx + 104, rowY + rowH / 2 - 12, name, 3, nc);
+        gfx_text(g, rx + 104, rowY + rowH / 2 - (gEpg ? 22 : 12), name, 3, nc);
+        if (gEpg) {                                   // what is on, under the name
+            char pl[200];
+            prog_line(&gOn, 0, pl, sizeof(pl));
+            clip_text(pl, (int)sizeof(pl), rw - 104 - 110, 2);
+            gfx_text(g, rx + 104, rowY + rowH / 2 + 8, pl, 2, seld ? INK : MUT);
+        }
         if (idx == cur) {
             int dx = rx + rw - 72;
             gfx_circle(g, dx, rowY + rowH / 2, 6, seld ? INK : LIVE);
@@ -854,13 +956,32 @@ static void draw_channel_banner(Gfx *g) {
     char name[96], grp[48];
     if (!httpd_chan_get(cur, name, sizeof(name), NULL, 0)) return;
     httpd_chan_group(cur, grp, sizeof(grp));
-    int x = 64, y = 64, w = 680, h = 108;
+    static EpgProgramme on, nx;
+    int e = chan_epg(cur, &on, &nx);
+    int x = 64, y = 64, w = e ? 900 : 680, h = e ? 196 : 108;
     panel(g, x, y, w, h, 8, INK, 226);
     gfx_round(g, x + 24, y + 22, 6, h - 44, 3, ACCENT);
+    clip_text(name, (int)sizeof(name), w - 200, 4);
     gfx_text(g, x + 48, y + 22, name, 4, TXT);
     gfx_text(g, x + 48, y + 72, grp[0] ? grp : "Live TV", 2, MUT);
-    gfx_circle(g, x + w - 70, y + h / 2, 7, LIVE);
-    gfx_text(g, x + w - 52, y + h / 2 - 8, "LIVE", 1, LIVE);
+    gfx_circle(g, x + w - 70, y + 50, 7, LIVE);
+    gfx_text(g, x + w - 52, y + 42, "LIVE", 1, LIVE);
+    if (e) {                                         // now + progress, then next
+        char l[400];
+        if (e & 1) {
+            prog_line(&on, 1, l, sizeof(l));
+            clip_text(l, (int)sizeof(l), w - 96 - 180, 3);
+            gfx_text(g, x + 48, y + 108, l, 3, TXT);
+            draw_prog_bar(g, x + w - 204, y + 120, 160, prog_pct(&on), ACCENT);
+        }
+        if (e & 2) {
+            char nl[300];
+            prog_line(&nx, 0, nl, sizeof(nl));
+            snprintf(l, sizeof(l), "Next  %s", nl);
+            clip_text(l, (int)sizeof(l), w - 96, 2);
+            gfx_text(g, x + 48, y + (e & 1 ? 150 : 112), l, 2, MUT);
+        }
+    }
 }
 
 // Top-right stream telemetry, toggled by the touchpad. Plain shadowed text with
@@ -930,6 +1051,7 @@ int main(void) {
     // address changes (netmon.c). The first poll is synchronous, so a normal
     // boot starts both before the first frame as it always did.
     netmon_start(PORT);
+    epg_start();      // programme guide: waits for a network and a guide link itself
     char ip[32] = "";
     unsigned ipGen = ~0u;
     int net_ok = 0;

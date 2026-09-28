@@ -234,7 +234,8 @@ static void add_option_header(int req, const char *headers, const char *name) {
 
 int native_http_fetch(int slot, const char *url, const char *headers,
                       uint8_t **body, int *len, int *status, uint64_t timeout_us,
-                      int max_bytes, const volatile int *abort_flag) {
+                      int max_bytes, int cap_bytes, const volatile int *abort_flag) {
+    const size_t hardCap = cap_bytes > NHTTP_CAP ? (size_t)cap_bytes : NHTTP_CAP;
     uint64_t t0 = sceKernelGetProcessTime();
     if (!body || !len || !status || !url) return -1;
     *body = NULL; *len = 0; *status = 0;
@@ -309,7 +310,7 @@ int native_http_fetch(int slot, const char *url, const char *headers,
     // caller -- the main thread, which nothing here pets the watchdog for.
     size_t limit = (max_bytes > 0 && max_bytes < NHTTP_CAP) ? (size_t)max_bytes : 0;
     int cut = 0;
-    if (declared > NHTTP_CAP && !limit) {
+    if (declared > hardCap && !limit) {
         snprintf(g_debug, sizeof(g_debug), "native too large status=%d bytes=%lu",
                  *status, (unsigned long)declared);
         end_request(s, req);
@@ -330,7 +331,7 @@ int native_http_fetch(int slot, const char *url, const char *headers,
             rc = 0; cut = 1; break;
         }
         if (used == cap) {
-            size_t next = cap < NHTTP_CAP / 2 ? cap * 2 : NHTTP_CAP;
+            size_t next = cap < hardCap / 2 ? cap * 2 : hardCap;
             if (next <= cap) { rc = -9; break; }
             uint8_t *larger = realloc(buf, next);
             if (!larger) { rc = -8; break; }
@@ -343,7 +344,7 @@ int native_http_fetch(int slot, const char *url, const char *headers,
         if (got == 0) { rc = 0; break; }
         if (got < 0) { rc = got; break; }
         used += (size_t)got;
-        if (used > NHTTP_CAP) { rc = -9; break; }
+        if (used > hardCap) { rc = -9; break; }
     }
 
     end_request(s, req);

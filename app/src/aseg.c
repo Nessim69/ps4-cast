@@ -75,6 +75,9 @@ typedef struct {
     int          maxBytes;          // body cap: fail above it, or with `truncate` keep that much
     int          truncate;          // AsegOpts.maxBytes: keep the head, drop the connection
     int        (*stopAfterHeaders)(const char *ctype);
+    int        (*sink)(void *ctx, const uint8_t *p, int n);   // AsegOpts.sink
+    void        *sinkCtx;
+    uint64_t     streamed;          // bytes handed to sink
     char         ctype[96];         // Content-Type of the last response
     int64_t      rangeOff, rangeLen; // AsegOpts range; rangeLen 0 = whole resource
     int64_t      crStart;           // Content-Range start of the last response, -1 = none
@@ -98,6 +101,7 @@ typedef struct {
 } AsegCh;
 
 static AsegCh       g_ch[ASEG_CH_COUNT];
+_Static_assert(NHTTP_SLOTS >= ASEG_CH_COUNT, "one SceHttp slot per aseg channel");
 static int          g_chInit = 0;
 static volatile int g_playlistBudget = 0;   // aseg_set_playlist_budget(): tight PLAYLIST budget
 // What aseg_last_status() & co report: the stream channel whose fetch failed
@@ -420,7 +424,8 @@ static int native_fetch(AsegCh *c, const char *url, uint8_t **outBuf, int *outLe
         xh = hb;
     }
     return native_http_fetch((int)(c - g_ch), url, xh, outBuf, outLen, status,
-                             c->budgetUs, c->truncate ? c->maxBytes : 0, &c->abort);
+                             c->budgetUs, c->truncate ? c->maxBytes : 0,
+                             c->stream ? 0 : c->maxBytes, &c->abort);
 }
 
 // One request: connect, GET (Connection: close), parse headers. On 3xx returns
@@ -691,6 +696,78 @@ void aseg_set_playlist_budget(int on) {
     g_playlistBudget = on ? 1 : 0;
 }
 
+// AsegOpts.sink: hand the body over in pieces as it arrives instead of
+// collecting it -- a programme guide can unpack to hundreds of MB. Same
+// framing rules, budget, abort and watchdog as the collecting readers.
+static int stream_body(AsegCh *c, uint64_t budget0, unsigned gen0,
+                       const uint8_t *lead, int leadLen, long clen, int chunked) {
+    enum { PIECE = 64 * 1024 };
+    uint8_t *buf = malloc(PIECE);
+    if (!buf) { conn_close(c); c->kaAlive = 0; return -6; }
+    int rc = 0;
+    if (chunked) {
+        watchdog_note("aseg/stream-chunked");
+        ChunkReader rd = { c, lead, leadLen, 0 };
+        for (;;) {
+            char line[128];
+            if (chunk_read_line(&rd, line, sizeof(line)) < 0) { rc = -11; break; }
+            char *p = line, *end = NULL;
+            while (*p == ' ' || *p == '\t') p++;
+            unsigned long long chunk = strtoull(p, &end, 16);
+            if (end == p) { rc = -13; break; }
+            while (*end == ' ' || *end == '\t') end++;
+            if (*end && *end != ';') { rc = -13; break; }
+            if (chunk == 0) {
+                int ll;
+                do { ll = chunk_read_line(&rd, line, sizeof(line)); } while (ll > 0);
+                if (ll < 0) rc = -11;
+                break;
+            }
+            while (chunk && rc == 0) {
+                int piece = chunk > PIECE ? PIECE : (int)chunk;
+                if (chunk_read_exact(&rd, buf, (size_t)piece) != 0) { rc = c->abort ? -9 : -11; break; }
+                chunk -= (unsigned long long)piece;
+                c->streamed += (uint64_t)piece;
+                if (c->sink(c->sinkCtx, buf, piece)) rc = ASEG_STOPPED;
+            }
+            if (rc) break;
+            uint8_t crlf[2];
+            if (chunk_read_exact(&rd, crlf, 2) != 0 || crlf[0] != '\r' || crlf[1] != '\n') { rc = -13; break; }
+        }
+        if (rc == 0) keep_alive(c, gen0);
+        else { conn_close(c); c->kaAlive = 0; }
+        free(buf);
+        return rc;
+    }
+    watchdog_note("aseg/stream");
+    uint64_t left = clen >= 0 ? (uint64_t)clen : UINT64_MAX;
+    if (leadLen > 0) {
+        int n = (uint64_t)leadLen > left ? (int)left : leadLen;
+        left -= (uint64_t)n;
+        c->streamed += (uint64_t)n;
+        if (n > 0 && c->sink(c->sinkCtx, lead, n)) rc = ASEG_STOPPED;
+    }
+    while (rc == 0 && left > 0) {
+        if (c->abort) { rc = -9; break; }
+        if (sceKernelGetProcessTime() - budget0 > c->budgetUs) { rc = -12; break; }
+        watchdog_kick();
+        int want = left < PIECE ? (int)left : PIECE;
+        int r = conn_read(c, buf, want);
+        if (r <= 0) {
+            if (clen >= 0) rc = -11;   // short body
+            break;                     // no length: EOF ends it
+        }
+        left -= (uint64_t)r;
+        c->streamed += (uint64_t)r;
+        if (c->sink(c->sinkCtx, buf, r)) rc = ASEG_STOPPED;
+    }
+    if (rc == 0 && clen >= 0) keep_alive(c, gen0);
+    else { conn_close(c); c->kaAlive = 0; }
+    if (rc == 0 && c->streamed == 0) rc = -8;
+    free(buf);
+    return rc;
+}
+
 static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *outLen) {
     uint64_t budget0 = sceKernelGetProcessTime();
     c->t0 = budget0;
@@ -849,6 +926,7 @@ static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *o
         conn_close(c); c->kaAlive = 0;
         return ASEG_STOPPED;
     }
+    if (c->sink) return stream_body(c, budget0, gen0, lead, leadLen, clen, chunked);
 
     if (chunked) {
         watchdog_note("aseg/body-chunked");
@@ -967,11 +1045,11 @@ const char *aseg_native_debug(void) { return native_http_debug(); }
 
 void aseg_init(void) {
     static const char *names[ASEG_CH_COUNT] = {
-        "ps4cast_aseg_v", "ps4cast_aseg_a", "ps4cast_aseg_p", "ps4cast_aseg_u" };
+        "ps4cast_aseg_v", "ps4cast_aseg_a", "ps4cast_aseg_p", "ps4cast_aseg_u", "ps4cast_aseg_b" };
     if (g_chInit) return;
     for (int i = 0; i < ASEG_CH_COUNT; i++) {
         AsegCh *c = &g_ch[i];
-        c->stream = (i != ASEG_CH_UI);
+        c->stream = (i != ASEG_CH_UI && i != ASEG_CH_BG);
         c->sock = -1; c->port = 80;
         diag_clear(c);
         scePthreadMutexInit(&c->mtx, NULL, names[i]);
@@ -1015,16 +1093,22 @@ int aseg_fetch_opts(int ch, const char *url, uint8_t **outBuf, int *outLen, Aseg
     const char *pv = watchdog_note("aseg/lock");
     scePthreadMutexLock(&c->mtx);
     watchdog_note(pv);
-    c->budgetUs = ch == ASEG_CH_UI ? ASEG_BUDGET_UI_US
+    c->budgetUs = !c->stream ? ASEG_BUDGET_UI_US
                 : (ch == ASEG_CH_PLAYLIST && g_playlistBudget) ? ASEG_BUDGET_PLAYLIST_US
                 : ASEG_BUDGET_SEGMENT_US;
-    c->maxBytes = ch == ASEG_CH_UI ? ASEG_FETCH_CAP_UI : ASEG_FETCH_CAP;
+    c->maxBytes = !c->stream ? ASEG_FETCH_CAP_UI : ASEG_FETCH_CAP;
     c->truncate = 0; c->stopAfterHeaders = NULL; c->ctype[0] = '\0';
+    c->sink = NULL; c->sinkCtx = NULL; c->streamed = 0;
     c->rangeOff = c->rangeLen = 0; c->okStatus = 0; c->okNative = 0; c->crStart = -1;
     if (o) {
         if (o->budgetUs) c->budgetUs = o->budgetUs;
         if (o->maxBytes > 0 && o->maxBytes < ASEG_FETCH_CAP) { c->maxBytes = o->maxBytes; c->truncate = 1; }
         c->stopAfterHeaders = o->stopAfterHeaders;
+        if (o->sink) {
+            if (o->rangeLen > 0 || o->maxBytes > 0) { scePthreadMutexUnlock(&c->mtx); return -10; }
+            c->sink = o->sink; c->sinkCtx = o->sinkCtx;
+            if (c->maxBytes < ASEG_FETCH_CAP_UI) c->maxBytes = ASEG_FETCH_CAP_UI;   // SceHttp fallback's cap
+        }
         if (o->rangeLen > 0) {
             if (o->rangeOff < 0 || o->rangeLen > ASEG_FETCH_CAP) {
                 scePthreadMutexUnlock(&c->mtx);
@@ -1042,6 +1126,15 @@ int aseg_fetch_opts(int ch, const char *url, uint8_t **outBuf, int *outLen, Aseg
     if (rc == 0 && c->rangeLen > 0 && *outBuf && range_fixup(c, outBuf, outLen) != 0) {
         free(*outBuf); *outBuf = NULL; *outLen = 0;
         rc = -13;
+    }
+    if (c->sink) {
+        if (rc == 0 && *outBuf) {        // SceHttp fallback: the whole body at once
+            c->streamed = (uint64_t)*outLen;
+            if (c->sink(c->sinkCtx, *outBuf, *outLen)) rc = ASEG_STOPPED;
+        }
+        free(*outBuf); *outBuf = NULL;
+        *outLen = c->streamed > INT32_MAX ? INT32_MAX : (int)c->streamed;
+        c->sink = NULL; c->sinkCtx = NULL;
     }
     c->rangeOff = c->rangeLen = 0;
     if (o) snprintf(o->contentType, sizeof(o->contentType), "%s", c->ctype);

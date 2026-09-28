@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -Wno-unused-parameter -g -O1 -std=gnu11
 
 SRC = ../../app/src
 
-TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_netwatch test_lang test_m3u test_channels test_subs test_agent_crypto
+TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_netwatch test_lang test_m3u test_channels test_inflate test_xmltv test_guide test_subs test_agent_crypto
 
 # HLS AES-128 decryption (app/src/hls_crypt.c) against BearSSL's AES, built
 # from the pinned source tree that portlibs/fetch.sh unpacks. Skipped (with a
@@ -67,6 +67,19 @@ test_m3u: test_m3u.c $(SRC)/m3u.c $(SRC)/urlopt.c $(SRC)/netpolicy.c
 # shim/ stands in for the two OpenOrbis headers it includes.
 test_channels: test_channels.c $(SRC)/httpd_channels.c $(SRC)/m3u.c $(SRC)/urlopt.c $(SRC)/netpolicy.c shim/orbis/libkernel.h
 	$(CC) $(CFLAGS) -Ishim -I$(SRC) -o $@ test_channels.c $(SRC)/httpd_channels.c $(SRC)/m3u.c $(SRC)/urlopt.c $(SRC)/netpolicy.c -lpthread
+
+# Streaming gzip/zlib decoder (app/src/inflate.c). inflate_vectors.h comes
+# from gen_inflate_vectors.py (Python's zlib), so the check is against zlib.
+test_inflate: test_inflate.c inflate_vectors.h $(SRC)/inflate.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_inflate.c $(SRC)/inflate.c
+
+# XMLTV guide parser (app/src/xmltv.c).
+test_xmltv: test_xmltv.c $(SRC)/xmltv.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_xmltv.c $(SRC)/xmltv.c
+
+# Programme-guide store: matching, window, now/next (app/src/guide.c).
+test_guide: test_guide.c $(SRC)/guide.c $(SRC)/xmltv.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_guide.c $(SRC)/guide.c $(SRC)/xmltv.c
 
 # Subtitle parsing, clean-up, wrapping and cue list (app/src/subs.c).
 test_subs: test_subs.c $(SRC)/subs.c

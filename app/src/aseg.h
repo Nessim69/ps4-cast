@@ -1,7 +1,7 @@
 // aseg.h — minimal blocking HTTP(S) "fetch a whole resource into RAM" client
-// for HLS playlists and segments, page scraping (resolve.c) and the phone's
-// IPTV import. It runs on its own sockets, independent of the video read-ahead
-// reader (httpsrc).
+// for HLS playlists and segments, page scraping (resolve.c), the phone's IPTV
+// import and (streamed through a sink, AsegOpts) the programme guide. It runs
+// on its own sockets, independent of the video read-ahead reader (httpsrc).
 //
 // Fetches run on CHANNELS. Each channel has its own lock, socket/TLS,
 // keep-alive host, time budget and diagnostics, so the stream's fetches no
@@ -18,6 +18,8 @@ enum {
     ASEG_CH_PLAYLIST,    // stream-owned: hls_open master/variant/audio playlists,
                          // live refresh, resolve_page
     ASEG_CH_UI,          // web UI (IPTV/M3U import): never aborted, no stream headers
+    ASEG_CH_BG,          // background downloads (programme guide, channel logos):
+                         // like UI, but long transfers here never hold up an import
     ASEG_CH_COUNT
 };
 
@@ -29,8 +31,8 @@ void aseg_init(void);
 // http + https (BearSSL, SceHttp fallback), follows up to a few redirects.
 // Returns 0, else < 0.
 int aseg_fetch_ch(int ch, const char *url, uint8_t **buf, int *len);
-// ASEG_CH_UI: sends only a default User-Agent (never the stream's urlopt
-// headers), ignores aseg_abort/aseg_resume, 15s budget, 16 MB cap.
+// ASEG_CH_UI (and ASEG_CH_BG): sends only a default User-Agent (never the
+// stream's urlopt headers), ignores aseg_abort/aseg_resume, 60s budget, 64 MB cap.
 int aseg_fetch_ui(const char *url, uint8_t **buf, int *len);
 // Legacy entry point: ASEG_CH_PLAYLIST.
 int aseg_fetch(const char *url, uint8_t **buf, int *len);
@@ -50,6 +52,13 @@ typedef struct {
     // EXT-X-BYTERANGE). Sent as a Range request; a server that ignores it and
     // answers 200 gets the slice cut out of the full body (up to 16 MB in).
     int64_t   rangeOff, rangeLen;
+    // sink set: the body is handed over in pieces as it arrives instead of
+    // being collected (*buf stays NULL, *len is the byte count, clamped to
+    // INT_MAX), so its size is unbounded. Nonzero from sink stops the
+    // transfer and the fetch returns ASEG_STOPPED. The SceHttp fallback
+    // cannot stream: there the body (up to 64 MB) arrives in one piece.
+    int     (*sink)(void *ctx, const uint8_t *p, int n);
+    void     *sinkCtx;
 } AsegOpts;
 #define ASEG_STOPPED 1
 int aseg_fetch_opts(int ch, const char *url, uint8_t **buf, int *len, AsegOpts *o);

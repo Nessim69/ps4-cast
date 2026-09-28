@@ -28,6 +28,20 @@ static inline int scePthreadCondTimedwait(OrbisPthreadCond*c,OrbisPthreadMutex*m
 static inline int scePthreadCreate(OrbisPthread*t,void*a,void*(*f)(void*),void*arg,const char*n){(void)a;(void)n;return pthread_create(t,0,f,arg);}
 static inline int scePthreadJoin(OrbisPthread t,void**r){return pthread_join(t,r);}
 static inline OrbisPthread scePthreadSelf(void){return pthread_self();}
-static inline int sceKernelOpen(const char*p,int f,int m){(void)p;(void)f;(void)m;return -1;}
-static inline int sceKernelClose(int f){(void)f;return 0;}
-static inline long sceKernelWrite(int f,const void*b,unsigned long n){(void)f;(void)b;return (long)n;}
+// Files: only "/data/..." and only when $PS4CAST_DATA names a directory to
+// stand in for it (the programme-guide test); otherwise opens fail as before.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static inline const char *shim_data_path(const char*p,char*buf,size_t cap){const char*d=getenv("PS4CAST_DATA");if(!d||strncmp(p,"/data/",6)!=0)return NULL;snprintf(buf,cap,"%s/%s",d,p+6);return buf;}
+static inline int sceKernelOpen(const char*p,int f,int m){char b[1024];const char*q=shim_data_path(p,b,sizeof b);if(!q)return -1;int hf=(f&3)==1?O_WRONLY:(f&3)==2?O_RDWR:O_RDONLY;if(f&0x0200)hf|=O_CREAT;if(f&0x0400)hf|=O_TRUNC;int fd=open(q,hf,m);return fd<0?-1:fd;}
+static inline int sceKernelClose(int f){return f>=0?close(f):0;}
+static inline long sceKernelWrite(int f,const void*b,unsigned long n){return f>=0?(long)write(f,b,n):(long)n;}
+static inline long sceKernelRead(int f,void*b,unsigned long n){return (long)read(f,b,n);}
+static inline long sceKernelLseek(int f,long o,int w){return (long)lseek(f,o,w);}
+static inline int sceKernelUnlink(const char*p){char b[1024];const char*q=shim_data_path(p,b,sizeof b);return q?unlink(q):-1;}
+static inline int sceKernelRename(const char*a,const char*c){char b1[1024],b2[1024];const char*x=shim_data_path(a,b1,sizeof b1),*y=shim_data_path(c,b2,sizeof b2);return x&&y?rename(x,y):-1;}
+static inline int scePthreadDetach(OrbisPthread t){return pthread_detach(t);}
+static inline int scePthreadAttrInit(OrbisPthreadAttr*a){*a=0;return 0;}
+static inline int scePthreadAttrSetstacksize(OrbisPthreadAttr*a,size_t n){(void)a;(void)n;return 0;}
+static inline int scePthreadAttrDestroy(OrbisPthreadAttr*a){(void)a;return 0;}

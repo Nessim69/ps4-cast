@@ -113,12 +113,50 @@ files["/ml/master.m3u8"] = "\n".join(["#EXTM3U",
     '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Deutsch",LANGUAGE="de",URI="de.m3u8"',
     '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01e,mp4a.40.2",AUDIO="aud"', "/plain/index.m3u8"]).encode()
 
+# 11) streamed downloads (programme guide): Content-Length, chunked, and
+#     no length at all (read to close); 3 MB each
+big = rnd(3 * 1024 * 1024 + 17, 90)
+files["/stream/known.bin"] = big
+expect("stream.bin", big)
+streamed = {"/stream/chunked.bin": "chunked", "/stream/eof.bin": "eof"}
+
+# 12) programme guide: a gzip XMLTV file (times around 2026-09-28 12:00 UTC)
+#     and a page that is not one
+import gzip as _gz
+files["/epg/guide.xml.gz"] = _gz.compress(b"""<?xml version="1.0" encoding="UTF-8"?>
+<tv>
+ <channel id="bbc1.uk"><display-name>BBC One</display-name></channel>
+ <channel id="itv1.uk"><display-name>ITV 1</display-name></channel>
+ <channel id="c5.uk"><display-name>Channel 5</display-name></channel>
+ <programme start="20260928120000 +0000" stop="20260928123000 +0000" channel="bbc1.uk"><title>Noon News</title><desc>Headlines &amp; weather</desc></programme>
+ <programme start="20260928123000 +0000" stop="20260928130000 +0000" channel="bbc1.uk"><title>Half past</title></programme>
+ <programme start="20260928190000 +0000" stop="20260928200000 +0000" channel="bbc1.uk"><title>Evening</title></programme>
+ <programme start="20260928113000 +0000" stop="20260928140000 +0000" channel="itv1.uk"><title>Film</title></programme>
+ <programme start="20260928120000 +0000" stop="20260928130000 +0000" channel="c5.uk"><title>Unwanted</title></programme>
+</tv>
+""")
+files["/epg/page.html"] = b"<!doctype html><html><body>Not found</body></html>" + b" " * 70000
+
 log = open(os.path.join(OUT, "server.log"), "w")
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path in streamed:
+            log.write(f"GET {path}\n"); log.flush()
+            self.send_response(200)
+            if streamed[path] == "chunked":
+                self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
+                off, step = 0, 1
+                while off < len(big):
+                    part = big[off:off + step]; off += len(part); step = step * 3 + 1 if step < 200000 else 7
+                    self.wfile.write(b"%x;ext=1\r\n" % len(part) + part + b"\r\n")
+                self.wfile.write(b"0\r\nX-Trailer: 1\r\n\r\n")
+            else:
+                self.send_header("Connection", "close"); self.end_headers()
+                self.wfile.write(big); self.close_connection = True
+            return
         if path == "/rot/key":
             state["k_rot"] += 1; body = K4a if state["k_rot"] == 1 else K4b
         else:

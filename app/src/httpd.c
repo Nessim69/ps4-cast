@@ -13,6 +13,8 @@
 #include "trace.h"
 #include "notify.h"
 #include "pairing.h"
+#include "epg.h"
+#include "wallclock.h"
 
 #include <string.h>
 #include <ctype.h>
@@ -264,23 +266,38 @@ static int token_exempt(const char *path) {
 static void cfg_save(void) {
     int fd = sceKernelOpen(CFG_PATH, 0x0201 /*O_WRONLY|O_CREAT*/ | 0x0400 /*O_TRUNC*/, 0666);
     if (fd < 0) return;
-    char line[160];
+    char line[1400], epgUrl[1024];
+    epg_get_url(epgUrl, sizeof(epgUrl));
     // avsync is user-tuned for their TV/soundbar; losing it on every relaunch
     // (while channels/recent/resume persisted) was an inconsistency.
-    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\npair=%d\ntlsverify=%d\nalang=%s\nslang=%s\n",
+    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\npair=%d\ntlsverify=%d\nalang=%s\nslang=%s\ntz=%d\nepg=%s\n",
                      notify_get_debug(), player_get_avsync(), g_cfgPair, tls_verify_enabled(),
-                     player_audio_lang(), sub_lang());
+                     player_audio_lang(), sub_lang(), wallclock_phone_offset(), epgUrl);
+    if (n >= (int)sizeof(line)) n = (int)sizeof(line) - 1;
     sceKernelWrite(fd, line, n);
     sceKernelClose(fd);
 }
 static void cfg_load(void) {
     int fd = sceKernelOpen(CFG_PATH, 0 /*O_RDONLY*/, 0);
     if (fd < 0) return;
-    char buf[256];
+    char buf[1600];
     int n = (int)sceKernelRead(fd, buf, sizeof(buf) - 1);
     sceKernelClose(fd);
     if (n <= 0) return;
     buf[n] = '\0';
+    // epg= is written last and is a URL whose query could contain "pair=0"
+    // or the like: take it, then cut it off before the other keys are read.
+    char *eu = strstr(buf, "\nepg=");
+    if (eu) {
+        char u[1024];
+        int k = 0;
+        for (const char *v = eu + 5; v[k] && v[k] != '\n' && v[k] != '\r' && k < (int)sizeof(u) - 1; k++) u[k] = v[k];
+        u[k] = '\0';
+        epg_set_url(u);
+        eu[1] = '\0';
+    }
+    const char *tz = strstr(buf, "\ntz=");
+    if (tz) wallclock_set_phone_offset(atoi(tz + 4));
     const char *d = strstr(buf, "debug=");
     if (d) notify_set_debug(atoi(d + 6));
     const char *a = strstr(buf, "avsync=");
@@ -1800,7 +1817,7 @@ static void handle_client(OrbisNetId c) {
         player_debug(dbg, sizeof(dbg));
         // Static because long URLs can nearly double when JSON-escaped; keeping
         // this off the HTTP thread's stack also leaves headroom for diagnostics.
-        static char json[8192];
+        static char json[16384];
         int active = player_is_active();
         double cur = 0, dur = 0;
         player_progress(&cur, &dur);
@@ -1862,6 +1879,16 @@ static void handle_client(OrbisNetId c) {
                 JAPP("}");
             }
             JAPP("]");
+        }
+        {   // Programme guide: a new epg_ver means now/next lines are worth re-asking for.
+            char es[200], eu[1024], src[1024];
+            epg_status(es, sizeof(es));
+            epg_get_url(eu, sizeof(eu));
+            epg_source(src, sizeof(src));
+            JAPP(",\"epg_ver\":%d,\"epg_on\":%d,\"epg_status\":", epg_version(), epg_loaded());
+            json_str(json, cap, &o, es, 199);
+            JAPP(",\"epg_url\":"); json_str(json, cap, &o, eu, 1023);
+            JAPP(",\"epg_src\":"); json_str(json, cap, &o, src, 1023);
         }
         JAPP("}");
 #undef JAPP
@@ -1960,6 +1987,94 @@ static void handle_client(OrbisNetId c) {
         lang[k] = '\0';
         sub_set_lang(lang);
         cfg_save();
+        send_response(c, "200 OK", "text/plain", "ok", 2);
+        return;
+    }
+
+    // Programme guide. POST /epg body "3,5,8" (channel indices, as listed by
+    // /channels) -> [[now,next],...] in the same order, each {"s","e","t"}
+    // (Unix seconds, title) or null. POST /epg/chan body "5" -> that
+    // channel's schedule from the programme on air, with descriptions.
+    if (strcmp(method, "POST") == 0 && (strcmp(path, "/epg") == 0 || strcmp(path, "/epg/chan") == 0)) {
+        int one = path[4] == '/';
+        int64_t now = wallclock_utc();
+        enum { MAXQ = 400, SCHED = 48 };
+        size_t cap = one ? SCHED * 1700 + 64 : MAXQ * 800 + 16;   // worst case: every character escaped
+        char *j = malloc(cap);
+        EpgProgramme *ep = malloc(sizeof(EpgProgramme) * (one ? SCHED : 2));
+        if (!j || !ep) {
+            free(j); free(ep);
+            send_response(c, "503 Service Unavailable", "text/plain", "out of memory", 13);
+            return;
+        }
+        int o = 0, jc = (int)cap;
+        if (one) {
+            int n = now ? epg_schedule(atoi(body), now, ep, SCHED) : 0;
+            j[o++] = '[';
+            for (int i = 0; i < n; i++) {
+                o += snprintf(j + o, cap - (size_t)o, "%s{\"s\":%lld,\"e\":%lld,\"t\":", i ? "," : "",
+                              (long long)ep[i].start, (long long)ep[i].stop);
+                json_str(j, jc, &o, ep[i].title, 127);
+                o += snprintf(j + o, cap - (size_t)o, ",\"st\":"); json_str(j, jc, &o, ep[i].sub, 95);
+                o += snprintf(j + o, cap - (size_t)o, ",\"c\":"); json_str(j, jc, &o, ep[i].cat, 47);
+                o += snprintf(j + o, cap - (size_t)o, ",\"d\":"); json_str(j, jc, &o, ep[i].desc, 399);
+                j[o++] = '}';
+            }
+            j[o++] = ']';
+        } else {
+            j[o++] = '[';
+            const char *p = body;
+            for (int q = 0; q < MAXQ && *p; q++) {
+                while (*p == ',' || *p == ' ') p++;
+                if (*p < '0' || *p > '9') break;
+                int idx = atoi(p);
+                while (*p >= '0' && *p <= '9') p++;
+                int got = now ? epg_now_next(idx, now, &ep[0], &ep[1]) : 0;
+                if (q) j[o++] = ',';
+                j[o++] = '[';
+                for (int k = 0; k < 2; k++) {
+                    if (k) j[o++] = ',';
+                    if (!(got & (1 << k))) { memcpy(j + o, "null", 4); o += 4; continue; }
+                    o += snprintf(j + o, cap - (size_t)o, "{\"s\":%lld,\"e\":%lld,\"t\":",
+                                  (long long)ep[k].start, (long long)ep[k].stop);
+                    json_str(j, jc, &o, ep[k].title, 127);
+                    j[o++] = '}';
+                }
+                j[o++] = ']';
+            }
+            j[o++] = ']';
+        }
+        send_response(c, "200 OK", "application/json", j, o);
+        free(j); free(ep);
+        return;
+    }
+    // Settings: the guide link ("" = the one the playlist names).
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/epg/url") == 0) {
+        char u[1024];
+        int k = 0;
+        while (body[k] && body[k] != '\r' && body[k] != '\n' && k < (int)sizeof(u) - 1) { u[k] = body[k]; k++; }
+        u[k] = '\0';
+        while (k > 0 && (u[k - 1] == ' ' || u[k - 1] == '\t')) u[--k] = '\0';
+        if (u[0] && strncmp(u, "http://", 7) != 0 && strncmp(u, "https://", 8) != 0) {
+            send_response(c, "400 Bad Request", "text/plain", "not an http(s) URL", 18);
+            return;
+        }
+        epg_set_url(u);
+        cfg_save();
+        send_response(c, "200 OK", "text/plain", "ok", 2);
+        return;
+    }
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/epg/refresh") == 0) {
+        epg_refresh();
+        send_response(c, "200 OK", "text/plain", "ok", 2);
+        return;
+    }
+    // The phone's time zone (minutes east of UTC), used for guide times on the
+    // TV when the console's own zone can't be read.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/tz") == 0) {
+        int before = wallclock_phone_offset();
+        wallclock_set_phone_offset(atoi(body));
+        if (wallclock_phone_offset() != before) cfg_save();
         send_response(c, "200 OK", "text/plain", "ok", 2);
         return;
     }
@@ -2485,6 +2600,7 @@ void httpd_init(void) {
     if (inited) return;
     inited = 1;
     scePthreadMutexInit(&g_mtx, NULL, "ps4cast_mtx");
+    epg_init();     // before cfg_load, which restores the guide link
     sceKernelUnlink(UPLOAD_TMP_PATH); // discard a partial upload left by power loss/crash
     favs_load();    // restore saved favorites from /data
     cfg_load();     // restore persisted settings (debug toasts)

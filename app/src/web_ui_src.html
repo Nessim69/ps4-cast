@@ -81,6 +81,13 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
 .aud label{font-weight:700;text-transform:uppercase;letter-spacing:.35px;font-size:11px}
 .pick{flex:1;min-width:0;height:34px;border-radius:8px;border:1px solid var(--line2);background:#0c1226;color:var(--txt);font:inherit;font-size:13px;padding:0 8px}
 .set .pick{flex:none;width:132px}
+.set.setwrap{flex-wrap:wrap}
+.epgrow{display:flex;gap:6px;width:100%;align-items:center}
+.epgrow .search{flex:1;min-width:0;padding:7px 10px;font-size:13px}
+.row .tx .ep{font-size:11.5px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.row .tx .ep b{color:var(--txt);font-weight:700}
+.row .tx .ep .pb{display:inline-block;vertical-align:middle;width:34px;height:3px;border-radius:3px;background:rgba(123,140,200,.25);margin:0 6px 1px 0;overflow:hidden}
+.row .tx .ep .pb i{display:block;height:100%;background:var(--acc)}
 .tbtn{width:46px;height:46px;border-radius:50%;border:1px solid var(--line);background:var(--surf2);color:var(--txt);
  display:grid;place-items:center;cursor:pointer;transition:.14s}
 .tbtn:active{transform:scale(.9)}.tbtn svg{width:22px;height:22px}
@@ -380,6 +387,10 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
    <option value="">Off</option><option value="eng">English</option><option value="fra">French</option><option value="deu">German</option><option value="spa">Spanish</option><option value="ita">Italian</option><option value="por">Portuguese</option><option value="nld">Dutch</option><option value="ara">Arabic</option><option value="tur">Turkish</option><option value="rus">Russian</option><option value="pol">Polish</option><option value="swe">Swedish</option><option value="dan">Danish</option><option value="nor">Norwegian</option><option value="fin">Finnish</option>
   </select>
  </div>
+ <div class="set setwrap">
+  <div class="txt"><div class="a">Programme guide</div><div class="b" id="epgStat">Uses the XMLTV guide the playlist links to (x-tvg-url). Paste another link here to use that instead.</div></div>
+  <div class="epgrow"><input id="epgUrl" class="search" type="url" inputmode="url" placeholder="https://…/guide.xml.gz" autocomplete="off" autocapitalize="off" spellcheck="false"><button class="mini" onclick="saveEpg()">Save</button><button class="mini" onclick="reloadEpg()">Reload</button></div>
+ </div>
  <div class="set">
   <div class="txt"><div class="a">Pairing required</div><div class="b">Reject cast and settings commands without the token shown on the TV. DLNA stays available either way.</div></div>
   <div class="sw" id="swPair" onclick="togglePair()"></div>
@@ -642,7 +653,7 @@ async function loadPlaylist(){var u=$('purl').value.trim();if(!u){msg('Paste an 
  try{var r=await post('/playlist',u);
   if(r&&r.status===409){busy(false);msg('A playlist is already loading — try again in a moment');return}
   var a=await r.json();busy(false);
-  plData=a||[];listCache.chan=JSON.stringify(plData);chanCur=-1;curGroup='';curSearch='';plLimit=PL_PAGE;
+  plData=a||[];listCache.chan=JSON.stringify(plData);epgCache={};chanCur=-1;curGroup='';curSearch='';plLimit=PL_PAGE;
   if($('chSearch'))$('chSearch').value='';setMode('iptv');renderPane('pl');
   if(!plData.length){msg('No channels found in that link')}else{msg(plData.length+' channels — tap one to play')}}
  catch(e){busy(false);msg('Could not load that playlist')}}
@@ -668,7 +679,7 @@ function chanRow(i,name,on){
   '</div>'}
  return '<div class="row'+(on?' on':'')+'" data-kind="chan" data-act="tune" data-idx="'+i+'">'+
  '<div class="ic">'+(on?'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>':IC_TV)+'</div>'+
- '<div class="tx"><div class="n">'+esc(name)+'</div></div>'+
+ '<div class="tx"><div class="n">'+esc(name)+'</div><div class="ep" id="ep'+i+'"'+(epgLine(i)?'':' hidden')+'>'+epgLine(i)+'</div></div>'+
  (on?'<div class="live">LIVE</div>':IC_GO)+'</div>'}
 
 // ---- channel management (uses /channels, /channel/add|edit|del|fav) ----------
@@ -680,7 +691,7 @@ var listCache={fav:null,rec:null,cont:null,chan:null,upload:null};
 function listChanged(kind,val){var j=JSON.stringify(val);if(listCache[kind]===j)return false;listCache[kind]=j;return true}
 function scrollTopOf(el){var s=el&&el.querySelector('.scrolly');return s?s.scrollTop:0}
 function restoreScroll(el,top){var s=el&&el.querySelector('.scrolly');if(s)s.scrollTop=top}
-async function reloadChans(){var a=await getj('/channels');if(a&&listChanged('chan',a)){plData=a;renderPane('pl')}}
+async function reloadChans(){var a=await getj('/channels');if(a&&listChanged('chan',a)){plData=a;epgCache={};renderPane('pl')}}
 function toggleManage(){manage=!manage;
  $('mgBtn').classList.toggle('on',manage);
  $('mgAdd').hidden=!manage;$('mgClear').hidden=!manage;
@@ -712,6 +723,39 @@ function setGroupIdx(v){v=+v;setGroup(v<0?'':(plGroups[v]||''))}
 function onSearch(){curSearch=($('chSearch').value||'').trim().toLowerCase();plLimit=PL_PAGE;renderPane('pl')}
 function chanName(i){return plData[i].n||nameFromUrl(plData[i].u)}
 function chanKey(i){var c=plData[i];return c._q||(c._q=chanName(i).toLowerCase())}
+
+// ---- programme guide: now/next under each drawn channel row ----------------
+// POST /epg with the drawn rows' indices; answers are cached per index and
+// dropped when the receiver installs a new guide (epg_ver) or once a minute.
+var epgOn=0,epgVer=null,epgCache={},epgBusy=0,epgWant=false;
+function hhmm(s){try{return new Date(s*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}catch(e){return ''}}
+function epgLine(i){var e=epgCache[i];if(!e||(!e[0]&&!e[1]))return '';
+ var h='',now=Date.now()/1000;
+ if(e[0]){var p=Math.max(0,Math.min(100,(now-e[0].s)*100/Math.max(1,e[0].e-e[0].s)));
+  h+='<span class="pb"><i style="width:'+p.toFixed(0)+'%"></i></span><b>'+esc(e[0].t)+'</b>'}
+ if(e[1])h+=(e[0]?' · ':'')+hhmm(e[1].s)+' '+esc(e[1].t);
+ return h}
+function epgPaint(){for(var k in epgCache){var el=document.getElementById('ep'+k);if(el){var h=epgLine(+k);el.innerHTML=h;el.hidden=!h}}}
+async function fetchEpg(){
+ if(!epgOn||epgBusy||webMode!=='iptv'||document.hidden)return;
+ var rows=document.querySelectorAll('#panePl .row[data-act="tune"]'),need=[];
+ for(var r=0;r<rows.length;r++){var i=+rows[r].dataset.idx;if(!(i in epgCache))need.push(i)}
+ if(!need.length)return;
+ epgBusy=1;
+ try{for(var o=0;o<need.length;o+=400){var part=need.slice(o,o+400);
+   var res=await post('/epg',part.join(','));if(!res||!res.ok)break;var a=await res.json();
+   for(var q=0;q<part.length;q++)epgCache[part[q]]=a[q]||[null,null];
+   epgPaint()}}catch(e){}
+ epgBusy=0}
+async function saveEpg(){var u=$('epgUrl').value.trim();var r=await post('/epg/url',u);
+ if(r&&r.ok)msg(u?'Guide link saved — loading it':'Using the playlist\'s guide link');else msg('That is not an http(s) link')}
+async function reloadEpg(){await post('/epg/refresh','');msg('Downloading the guide again…')}
+function renderEpg(j){if(j.epg_status==null)return;
+ epgOn=j.epg_on?1:0;
+ $('epgStat').textContent=j.epg_status+(j.epg_src&&!j.epg_url?' (link from the playlist)':'');
+ var inp=$('epgUrl');if(document.activeElement!==inp){inp.value=j.epg_url||'';inp.placeholder=j.epg_src&&!j.epg_url?j.epg_src:'https://…/guide.xml.gz'}
+ if(j.epg_ver!==epgVer){epgVer=j.epg_ver;epgCache={};epgPaint();fetchEpg()}}
+setInterval(function(){if(!epgOn)return;epgCache={};fetchEpg()},60000);
 function renderPane(which){
  if(which=='pl'){$('chTools').hidden=!plData.length;$('modeChanCount').textContent=plData.length?' '+plData.length:'';
   var container=$('panePl'),top=scrollTopOf(container);
@@ -733,7 +777,7 @@ function renderPane(which){
   if(matched>shown)h+='<button class="chipf more" data-kind="more" data-act="more" data-idx="0">Show '+Math.min(PL_PAGE,matched-shown)+' more of '+(matched-shown)+' — or search</button>';
   h+='</div>';
   if(!shown)h+='<div class="empty">'+(curSearch?'No channels match “'+esc(curSearch)+'”.':'No channels in this group.')+'</div>';
-  container.innerHTML=h;restoreScroll(container,top)}
+  container.innerHTML=h;restoreScroll(container,top);fetchEpg()}
 }
 function listPane(id,cntId,kind,arr,icon,emptyMsg,removable){
  var el=$(id);$(cntId).textContent=arr&&arr.length?arr.length:'';
@@ -860,7 +904,7 @@ async function poll(){if(document.hidden||uploading)return;var j=await getj('/st
  if(j.debug!=null){dbg=j.debug;setSw('swDbg',dbg)}
  if(j.tls_verify!=null){tlsv=j.tls_verify;setSw('swTls',tlsv)}
  if(j.pair!=null){pair=j.pair;setSw('swPair',pair)}
- renderAudio(j,on);renderSubs(j,on);
+ renderAudio(j,on);renderSubs(j,on);renderEpg(j);
  if(!authLost&&document.getElementById('tokVal')&&document.getElementById('tokVal').textContent==='—')showToken()
  if(j.chan_cur!=null&&j.chan_cur!=chanCur){chanCur=j.chan_cur;if(plData.length)renderPane('pl')}
  if(j.error_code)showFailure(j);else if(on)$('failure').hidden=true;
@@ -880,6 +924,8 @@ try{setMode(localStorage.getItem('ps4cast-mode')||'cast')}catch(e){setMode('cast
 if(location.pathname==='/setup')openHelper();else initHandoff();
 if(location.pathname!=='/handoff'&&location.pathname!=='/setup'&&webMode==='cast')try{$('u').focus()}catch(e){}
 setInterval(poll,1000);poll();refreshLists();reloadChans();
+// The TV prints guide times in this zone when it can't read its own.
+post('/tz',''+(-new Date().getTimezoneOffset()));
 // Fallback cadence for a receiver too old to send lists_ver/chan_ver (poll()
 // then never learns it should skip these). Both timers no-op while the tab
 // is hidden, and a return to the tab polls right away instead of waiting.
