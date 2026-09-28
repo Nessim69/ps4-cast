@@ -11,7 +11,7 @@
 // an abort only ever hits the slot it names. One thread at a time per slot
 // (the aseg channel lock guarantees it). native_http_init() must run once,
 // before any thread fetches (aseg_init() calls it from main()).
-#define NHTTP_SLOTS 5   // == ASEG_CH_COUNT
+#define NHTTP_SLOTS 6   // == ASEG_CH_COUNT
 void native_http_init(void);
 // headers: CRLF block whose Referer/Origin/User-Agent/Cookie lines are sent
 // ("" = none). max_bytes > 0: a probe -- keep at most that many body bytes and

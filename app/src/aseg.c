@@ -1045,11 +1045,12 @@ const char *aseg_native_debug(void) { return native_http_debug(); }
 
 void aseg_init(void) {
     static const char *names[ASEG_CH_COUNT] = {
-        "ps4cast_aseg_v", "ps4cast_aseg_a", "ps4cast_aseg_p", "ps4cast_aseg_u", "ps4cast_aseg_b" };
+        "ps4cast_aseg_v", "ps4cast_aseg_a", "ps4cast_aseg_p", "ps4cast_aseg_u", "ps4cast_aseg_b",
+        "ps4cast_aseg_i" };
     if (g_chInit) return;
     for (int i = 0; i < ASEG_CH_COUNT; i++) {
         AsegCh *c = &g_ch[i];
-        c->stream = (i != ASEG_CH_UI && i != ASEG_CH_BG);
+        c->stream = (i != ASEG_CH_UI && i != ASEG_CH_BG && i != ASEG_CH_IMG);
         c->sock = -1; c->port = 80;
         diag_clear(c);
         scePthreadMutexInit(&c->mtx, NULL, names[i]);

@@ -43,6 +43,7 @@ static int   g_chanCur = -1;
 static char **g_groups;               // distinct groups, playlist order
 static int   g_groupN, g_groupCap;
 static unsigned g_letterMask;         // bit c-'A' for A..Z, bit 26 for '#'
+static int   g_hasLogos;              // any channel has a tvg-logo
 static char  g_epgUrl[URL_MAX];       // the playlist's XMLTV link (#EXTM3U x-tvg-url)
 // Bumped (under g_mtx) on every change to the list itself: playlist load,
 // init-time restore, add/edit/del, favourites. Not on tuning: /status carries
@@ -185,6 +186,7 @@ static void index_rebuild(void) {
     for (int i = 0; i < g_groupN; i++) free(g_groups[i]);
     g_groupN = 0;
     g_letterMask = 0;
+    g_hasLogos = 0;
     int hcap = 64;
     while (hcap < g_chanN * 2) hcap <<= 1;
     int *h = malloc(sizeof(int) * (size_t)hcap);
@@ -192,6 +194,7 @@ static void index_rebuild(void) {
     for (int i = 0; i < g_chanN; i++) {
         Chan *c = &g_ch[i];
         g_letterMask |= 1u << letter_bit(C_NAME(c));
+        if (C_LOGO(c)[0]) g_hasLogos = 1;
         c->grp = -1;
         const char *gname = C_GRP(c);
         if (!gname[0] || !h) continue;
@@ -389,6 +392,7 @@ void httpd_chan_rail_select(int row) {
 }
 
 int httpd_chan_count(void) { return g_chanN; }
+int httpd_chan_has_logos(void) { return g_hasLogos; }
 int httpd_chan_current(void) { return g_chanCur; }
 // Copy channel i's name/url into caller buffers under lock (safe vs. reloads).
 int httpd_chan_get(int i, char *name, int nameCap, char *url, int urlCap) {

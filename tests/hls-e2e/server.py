@@ -137,6 +137,16 @@ files["/epg/guide.xml.gz"] = _gz.compress(b"""<?xml version="1.0" encoding="UTF-
 """)
 files["/epg/page.html"] = b"<!doctype html><html><body>Not found</body></html>" + b" " * 70000
 
+# 13) channel logos: /logo/N.png, a 32x20 PNG in logo_driver.c's colour(N)
+import struct as _st, zlib as _zl
+def _png(w, h, rgb):
+    def chunk(t, d): return _st.pack(">I", len(d)) + t + d + _st.pack(">I", _zl.crc32(t + d) & 0xFFFFFFFF)
+    raw = b"".join(b"\0" + bytes(rgb) * w for _ in range(h))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", _st.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", _zl.compress(raw)) + chunk(b"IEND", b""))
+for _i in range(220):
+    files[f"/logo/{_i}.png"] = _png(32, 20, ((_i * 37) & 255, (_i * 91) & 255, (_i * 53) & 255))
+
 log = open(os.path.join(OUT, "server.log"), "w")
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"

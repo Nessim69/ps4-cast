@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -Wno-unused-parameter -g -O1 -std=gnu11
 
 SRC = ../../app/src
 
-TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_netwatch test_lang test_m3u test_channels test_inflate test_xmltv test_guide test_subs test_agent_crypto
+TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_netwatch test_lang test_m3u test_channels test_inflate test_xmltv test_guide test_logo_image test_subs test_agent_crypto
 
 # HLS AES-128 decryption (app/src/hls_crypt.c) against BearSSL's AES, built
 # from the pinned source tree that portlibs/fetch.sh unpacks. Skipped (with a
@@ -80,6 +80,11 @@ test_xmltv: test_xmltv.c $(SRC)/xmltv.c
 # Programme-guide store: matching, window, now/next (app/src/guide.c).
 test_guide: test_guide.c $(SRC)/guide.c $(SRC)/xmltv.c
 	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_guide.c $(SRC)/guide.c $(SRC)/xmltv.c
+
+# Channel-logo decoding and shrinking (app/src/logo_image.c, stb_image).
+# logo_vectors.h comes from gen_logo_vectors.py (Pillow).
+test_logo_image: test_logo_image.c logo_vectors.h $(SRC)/logo_image.c
+	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_logo_image.c $(SRC)/logo_image.c -lm
 
 # Subtitle parsing, clean-up, wrapping and cue list (app/src/subs.c).
 test_subs: test_subs.c $(SRC)/subs.c

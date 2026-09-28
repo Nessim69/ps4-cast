@@ -33,6 +33,7 @@ void httpd_channels_set_push_cb(void (*cb)(const char *url));
 char *httpd_channels_load_playlist(const char *text, const char *srcUrl, int *len);
 // Channel i's XMLTV id (tvg-id) and logo URL; 1 if i exists.
 int  httpd_chan_meta(int i, char *tvgId, int tvgCap, char *logo, int logoCap);
+int  httpd_chan_has_logos(void);          // any channel in the list has a logo
 // The loaded playlist's XMLTV guide link ("" if it named none).
 void httpd_channels_epg_url(char *out, int cap);
 // Mark channel i tuned; returns 1 and copies its URL when valid.

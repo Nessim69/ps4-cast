@@ -56,7 +56,8 @@ The build output is **`dist/PS4-Cast-v<version>.pkg`**. Two ways to install:
    are honoured. Lists of up to 100,000 channels load. When the playlist
    links a programme guide (`#EXTM3U x-tvg-url=`, XMLTV, plain or `.gz`), what
    is on now and next shows in the channel lists on the TV and the phone and
-   in the channel banner; Settings can point at a different guide.
+   in the channel banner; Settings can point at a different guide. Channel
+   logos (`tvg-logo`) show on both too.
 7. During IPTV playback, **Down** opens the channel guide, **L1/R1** changes
    channel and **L2/R2** changes bouquet. During cast playback, Left/Right and
    L1/R1 seek instead. Cross pauses, Circle stops and Triangle exits. When a

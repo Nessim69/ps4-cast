@@ -12,7 +12,8 @@
 #   streamed (sink) download the programme guide uses: Content-Length,
 #   chunked and read-to-close bodies, each fetched twice on one channel, and
 #   a sink that stops early; and the programme guide end to end (epg.c:
-#   download, /data cache, link override, refresh, a link that is no guide).
+#   download, /data cache, link override, refresh, a link that is no guide),
+#   and channel logos (logo.c: fetch, decode, draw, eviction, broken links).
 #
 # Needs python3 with `cryptography` and the BearSSL tree portlibs/fetch.sh
 # unpacks (BEARSSL_SRC to override). Skips (exit 0) when either is missing.
@@ -42,6 +43,11 @@ ${CC:-cc} -std=gnu11 -g -O1 -w -fsanitize=address,undefined ${E2E_CFLAGS:-} \
   "$HERE/epg_driver.c" "$HERE/stubs.c" "$A/epg.c" "$A/guide.c" "$A/xmltv.c" "$A/inflate.c" "$A/aseg.c" \
   "$A/hls_parse.c" "$A/httpd_channels.c" "$A/m3u.c" "$A/urlopt.c" "$A/netpolicy.c" \
   -lpthread || { echo "hls-e2e: guide build failed"; exit 1; }
+${CC:-cc} -std=gnu11 -g -O1 -w -fsanitize=address,undefined ${E2E_CFLAGS:-} -DGFX_HOST_PREVIEW \
+  -I"$HERE/shim" -I"$A" -o "$W/logo" \
+  "$HERE/logo_driver.c" "$HERE/stubs.c" "$A/logo.c" "$A/logo_image.c" "$A/gfx.c" "$A/font_atlas.c" "$A/aseg.c" \
+  "$A/hls_parse.c" "$A/httpd_channels.c" "$A/m3u.c" "$A/urlopt.c" "$A/netpolicy.c" \
+  -lpthread -lm || { echo "hls-e2e: logo build failed"; exit 1; }
 "$PY" "$HERE/server.py" "$W/out" 0 >"$W/server.err" 2>&1 & SRV=$!
 for _ in $(seq 50); do [ -s "$W/out/port" ] && break; sleep 0.1; done
 [ -s "$W/out/port" ] || { echo "hls-e2e: server did not start"; cat "$W/server.err"; exit 1; }
@@ -73,5 +79,8 @@ run "stream: sink stops"         "STREAM=1 STREAM_STOP=100000" "$U/stream/chunke
 mkdir -p "$W/data"
 if out=$(PS4CAST_DATA="$W/data" "$W/epg" "$U" "$O/server.log" 2>&1); then echo "ok   guide: download, cache, override, refresh"
 else echo "FAIL guide: download, cache, override, refresh"; echo "$out" | sed 's/^/     /' | head -12; fail=1; fi
+rm -rf "$W/data2"; mkdir -p "$W/data2"
+if out=$(PS4CAST_DATA="$W/data2" "$W/logo" "$U" 2>&1); then echo "ok   logos: fetch, decode, draw, evict"
+else echo "FAIL logos: fetch, decode, draw, evict"; echo "$out" | sed 's/^/     /' | head -12; fail=1; fi
 [ "$fail" = 0 ] && echo "hls-e2e: all ok" || echo "hls-e2e: FAILURES"
 exit $fail

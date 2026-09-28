@@ -631,6 +631,26 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
 - Host test: `test_channels` (100k parse/index/save/list, filters, reload,
   endpoints) with `tests/host/shim/orbis`.
 
+## Channel logos
+
+- Web UI: `<img>` over the row icon, lazy, `referrerpolicy=no-referrer` (the
+  page URL may carry the pairing token), http(s) only, removed on error.
+  `/channels` carries the logo as `l`.
+- TV: `logo.c` + `logo_image.c`. A worker thread downloads on its own aseg
+  channel (ASEG_CH_IMG; 1 MB, 8 s), decodes PNG/JPEG/GIF/BMP with stb_image
+  v2.30 (vendored unmodified as app/src/stb_image.h, public domain/MIT; only
+  those formats, memory input, asserts off, images over 2048 px refused before
+  decoding) and box-filters to at most 160x96 ARGB. 160 logos are kept (LRU).
+- gfx_image keeps the pixel pointer until gfx_present, so logo pixels are
+  only freed in logo_tick() at the top of the main loop, where nothing is
+  queued. logo_draw() never frees.
+- The list reserves a logo column when any channel has one
+  (httpd_chan_has_logos), the banner when the tuned channel does. SVG logos
+  show on the phone only.
+- Tests: host `test_logo_image` (images from Pillow); hls-e2e runs logo.c end
+  to end (220 channels through the 160-slot cache, broken links). The decoder
+  also survived 60k mutated images under ASan/UBSan during development.
+
 ## Programme guide (XMLTV)
 
 - Chain: `aseg` streams the download (AsegOpts.sink, channel ASEG_CH_BG) ->

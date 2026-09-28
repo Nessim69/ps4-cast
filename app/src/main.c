@@ -26,6 +26,8 @@
 #include "subtitle.h"
 #include "epg.h"
 #include "wallclock.h"
+#include "logo.h"
+#include "httpd_channels.h"
 #endif
 
 #ifndef BOOT_MINIMAL
@@ -810,6 +812,7 @@ static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
     int guideUp = inChannels && epg_loaded();
     int selEpg = guideUp && selAbs >= 0 ? chan_epg(selAbs, &selOn, &selNx) : 0;
     int infoH = guideUp ? 150 : 0;
+    int logos = inChannels && httpd_chan_has_logos();
     int rows = (H - ly - 112 - infoH) / rowH;
     int start = sel - rows / 2;
     if (start > n - rows) start = n - rows;
@@ -828,16 +831,19 @@ static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
             char nm[96]; httpd_chan_get(abs, nm, sizeof(nm), NULL, 0);
             static EpgProgramme rOn;
             int rEpg = chan_epg(abs, &rOn, NULL) & 1;
-            // Name, then (with a guide) what is on now in the rest of the row.
-            int nameW = rEpg ? (lw - 300) * 2 / 5 : lw - 300;
+            // [number] [logo] name, then (with a guide) what is on now.
+            int nameX = lx + 118;
+            if (logos) { logo_draw(g, abs, lx + 104, y + 6, 76, rowH - 18); nameX = lx + 200; }
+            int avail = lx + lw - 170 - nameX;
+            int nameW = rEpg ? avail * 2 / 5 : avail;
             clip_text(nm, (int)sizeof(nm), nameW, 3);
             char num[12]; snprintf(num, sizeof(num), "%d", abs + 1);
             gfx_text(g, lx + 24, y + (rowH - 6) / 2 - 8, num, 2, on ? INK : FAINT);
-            gfx_text(g, lx + 118, y + (rowH - 6) / 2 - 12, nm, 3, on ? INK : TXT);
+            gfx_text(g, nameX, y + (rowH - 6) / 2 - 12, nm, 3, on ? INK : TXT);
             if (rEpg) {
                 char pl[200];
                 prog_line(&rOn, 0, pl, sizeof(pl));
-                int px = lx + 118 + nameW + 36;
+                int px = nameX + nameW + 36;
                 clip_text(pl, (int)sizeof(pl), lx + lw - 170 - px, 2);
                 gfx_text(g, px, y + (rowH - 6) / 2 - 8, pl, 2, on ? INK : MUT);
             }
@@ -900,6 +906,7 @@ static void draw_channel_guide(Gfx *g, int sel, int railSel) {
     if (sel >= n) sel = n - 1;
 
     int K = 9, rowH = 70, headH = 76, footH = 56;
+    int logos = httpd_chan_has_logos();
     int shown = n < K ? n : K;
     int W = 800, H = headH + shown * rowH + footH;
     int x = 56, y = (g->height - H) / 2;
@@ -926,19 +933,21 @@ static void draw_channel_guide(Gfx *g, int sel, int railSel) {
 
         char name[96];
         httpd_chan_get(idx, name, sizeof(name), NULL, 0);
-        clip_text(name, (int)sizeof(name), rw - 104 - 110, 3);
+        int nameX = rx + 104;
+        if (logos) { logo_draw(g, idx, rx + 92, rowY + 15, 64, rowH - 30); nameX = rx + 170; }
+        clip_text(name, (int)sizeof(name), rx + rw - 110 - nameX, 3);
 
         char num[12]; snprintf(num, sizeof(num), "%d", idx + 1);
         GfxColor numc = seld ? INK : FAINT, nc = seld ? INK : TXT;
         static EpgProgramme gOn;
         int gEpg = chan_epg(idx, &gOn, NULL) & 1;
         gfx_text(g, rx + 26, rowY + rowH / 2 - 4, num, 2, numc);
-        gfx_text(g, rx + 104, rowY + rowH / 2 - (gEpg ? 22 : 12), name, 3, nc);
+        gfx_text(g, nameX, rowY + rowH / 2 - (gEpg ? 22 : 12), name, 3, nc);
         if (gEpg) {                                   // what is on, under the name
             char pl[200];
             prog_line(&gOn, 0, pl, sizeof(pl));
-            clip_text(pl, (int)sizeof(pl), rw - 104 - 110, 2);
-            gfx_text(g, rx + 104, rowY + rowH / 2 + 8, pl, 2, seld ? INK : MUT);
+            clip_text(pl, (int)sizeof(pl), rx + rw - 110 - nameX, 2);
+            gfx_text(g, nameX, rowY + rowH / 2 + 8, pl, 2, seld ? INK : MUT);
         }
         if (idx == cur) {
             int dx = rx + rw - 72;
@@ -958,12 +967,16 @@ static void draw_channel_banner(Gfx *g) {
     httpd_chan_group(cur, grp, sizeof(grp));
     static EpgProgramme on, nx;
     int e = chan_epg(cur, &on, &nx);
-    int x = 64, y = 64, w = e ? 900 : 680, h = e ? 196 : 108;
+    char logoUrl[8];
+    int hasLogo = httpd_chan_meta(cur, NULL, 0, logoUrl, sizeof(logoUrl)) && logoUrl[0];
+    int tx = hasLogo ? 48 + 136 : 48;                // the name starts after the logo box
+    int x = 64, y = 64, w = (e ? 900 : 680) + (hasLogo ? 136 : 0), h = e ? 196 : 108;
     panel(g, x, y, w, h, 8, INK, 226);
     gfx_round(g, x + 24, y + 22, 6, h - 44, 3, ACCENT);
-    clip_text(name, (int)sizeof(name), w - 200, 4);
-    gfx_text(g, x + 48, y + 22, name, 4, TXT);
-    gfx_text(g, x + 48, y + 72, grp[0] ? grp : "Live TV", 2, MUT);
+    if (hasLogo) logo_draw(g, cur, x + 48, y + 20, 120, 68);
+    clip_text(name, (int)sizeof(name), w - tx - 152, 4);
+    gfx_text(g, x + tx, y + 22, name, 4, TXT);
+    gfx_text(g, x + tx, y + 72, grp[0] ? grp : "Live TV", 2, MUT);
     gfx_circle(g, x + w - 70, y + 50, 7, LIVE);
     gfx_text(g, x + w - 52, y + 42, "LIVE", 1, LIVE);
     if (e) {                                         // now + progress, then next
@@ -1052,6 +1065,7 @@ int main(void) {
     // boot starts both before the first frame as it always did.
     netmon_start(PORT);
     epg_start();      // programme guide: waits for a network and a guide link itself
+    logo_init();      // channel logos: fetched and decoded on their own thread
     char ip[32] = "";
     unsigned ipGen = ~0u;
     int net_ok = 0;
@@ -1094,6 +1108,7 @@ int main(void) {
 
     while (running) {
         g_heartbeat = sceKernelGetProcessTime();   // pet the freeze watchdog each frame
+        logo_tick();      // adopt/evict logos now, while no drawing references them
         if (netmon_generation() != ipGen) {        // late Wi-Fi, a new DHCP lease, link lost
             ipGen = netmon_generation();
             netmon_ip(ip, sizeof(ip));

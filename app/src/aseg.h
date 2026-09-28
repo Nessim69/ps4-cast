@@ -18,8 +18,9 @@ enum {
     ASEG_CH_PLAYLIST,    // stream-owned: hls_open master/variant/audio playlists,
                          // live refresh, resolve_page
     ASEG_CH_UI,          // web UI (IPTV/M3U import): never aborted, no stream headers
-    ASEG_CH_BG,          // background downloads (programme guide, channel logos):
-                         // like UI, but long transfers here never hold up an import
+    ASEG_CH_BG,          // background downloads (programme guide): like UI, but
+                         // long transfers here never hold up an import
+    ASEG_CH_IMG,         // channel logos: like UI; small and many, never behind the guide
     ASEG_CH_COUNT
 };
 
