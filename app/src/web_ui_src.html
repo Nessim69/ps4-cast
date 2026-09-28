@@ -175,6 +175,12 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
  font-size:12px;font-weight:700;padding:6px 11px;border-radius:999px;cursor:pointer;white-space:nowrap}
 .chipf.on{background:var(--acc);color:#fff;border-color:transparent}
 #chTools{margin:7px 0 1px}
+.ftrow{display:flex;align-items:center;gap:8px;margin:0 0 8px}
+.ftk{flex:none;width:62px;font-size:12px;font-weight:700;color:var(--mut)}
+.chips.wrapc{flex-wrap:wrap;overflow:visible;padding:0;flex:1}
+.ftrow .pick{flex:1}
+.ftnote{font-size:11.5px;color:var(--faint);line-height:1.45;margin-top:8px}
+.ftstat{font-size:12.5px;font-weight:700;color:var(--txt);margin-top:9px}
 .pick.grp{width:100%;margin-bottom:7px}
 .chipf.more{align-self:center;margin:4px 0 2px}
 .search{width:100%;padding:9px 12px;border-radius:8px;border:1px solid var(--line2);background:var(--bg2);
@@ -343,6 +349,22 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
     <button class="psbtn" onclick="pasteTo('purl')" aria-label="Paste"><svg viewBox="0 0 24 24" fill="none"><rect x="8" y="3" width="8" height="4" rx="1.2" stroke="currentColor" stroke-width="1.8"/><path d="M9 5H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
    </div>
    <div class="actions"><button class="btn primary" style="width:100%" onclick="loadPlaylist()">Load playlist</button></div>
+  </section>
+  <section class="card">
+   <div class="lbl">Free channels</div>
+   <div class="ftrow"><span class="ftk">Audio</span><div class="chips wrapc" id="ftLang">
+    <button class="chipf on" data-v="ara" onclick="ftTog(this)">Arabic</button><button class="chipf on" data-v="eng" onclick="ftTog(this)">English</button><button class="chipf on" data-v="fra" onclick="ftTog(this)">French</button><button class="chipf" data-v="spa" onclick="ftTog(this)">Spanish</button><button class="chipf" data-v="deu" onclick="ftTog(this)">German</button><button class="chipf" data-v="ita" onclick="ftTog(this)">Italian</button><button class="chipf" data-v="por" onclick="ftTog(this)">Portuguese</button><button class="chipf" data-v="tur" onclick="ftTog(this)">Turkish</button>
+   </div></div>
+   <div class="ftrow"><span class="ftk">Kind</span><div class="chips wrapc" id="ftCat">
+    <button class="chipf on" data-v="documentary" onclick="ftTog(this)">Documentary</button><button class="chipf on" data-v="animation,kids" onclick="ftTog(this)">Cartoons &amp; kids</button><button class="chipf" data-v="news" onclick="ftTog(this)">News</button><button class="chipf" data-v="movies,series" onclick="ftTog(this)">Movies &amp; series</button><button class="chipf" data-v="music" onclick="ftTog(this)">Music</button><button class="chipf" data-v="sports" onclick="ftTog(this)">Sports</button><button class="chipf" data-v="religious" onclick="ftTog(this)">Religious</button><button class="chipf" data-v="all" onclick="ftTog(this)">Everything</button>
+   </div></div>
+   <div class="ftrow"><span class="ftk">On top</span><select class="pick" id="ftFirst">
+    <option value="TN" selected>Tunisia (all its channels)</option><option value="DZ">Algeria</option><option value="MA">Morocco</option><option value="LY">Libya</option><option value="EG">Egypt</option><option value="FR">France</option><option value="BE">Belgium</option><option value="CA">Canada</option><option value="UK">United Kingdom</option><option value="US">United States</option><option value="SA">Saudi Arabia</option><option value="AE">United Arab Emirates</option><option value="QA">Qatar</option><option value="LB">Lebanon</option><option value="">None</option>
+   </select></div>
+   <div class="ftrow"><span class="ftk">Bouquets</span><select class="pick" id="ftGroup"><option value="country" selected>One per country</option><option value="category">One per kind</option></select></div>
+   <div class="actions"><button class="btn" style="width:100%" onclick="loadFreeTv()">Add free channels</button></div>
+   <div class="ftstat" id="ftStat" hidden></div>
+   <div class="ftnote">Public streams listed by the iptv-org directory, added to your list (nothing is removed; adding again only brings new ones). Some are geo-blocked or offline at times.</div>
   </section>
   <div id="chTools" hidden>
    <input id="chSearch" class="search" type="search" placeholder="Search channels…" autocomplete="off" oninput="onSearch()">
@@ -660,6 +682,28 @@ async function loadPlaylist(){var u=$('purl').value.trim();if(!u){msg('Paste an 
   if(!plData.length){msg('No channels found in that link')}else{msg(plData.length+' channels — tap one to play')}}
  catch(e){busy(false);msg('Could not load that playlist')}}
 
+// ---- free channels (POST /freetv): iptv-org's public streams ----------------
+function ftTog(b){var box=b.parentNode;
+ if(b.dataset.v==='all'&&!b.classList.contains('on'))[].forEach.call(box.querySelectorAll('.chipf'),function(x){x.classList.remove('on')});
+ else if(b.dataset.v!=='all'){var a=box.querySelector('[data-v="all"]');if(a)a.classList.remove('on')}
+ b.classList.toggle('on')}
+function ftVals(id){return [].map.call(document.querySelectorAll('#'+id+' .chipf.on'),function(b){return b.dataset.v})}
+async function loadFreeTv(){
+ var langs=ftVals('ftLang'),cats=ftVals('ftCat'),first=$('ftFirst').value;
+ if(!langs.length&&!first){msg('Pick at least one audio language');return}
+ var o='lang='+langs.join(',')+';cat='+(!cats.length||cats.indexOf('all')>=0?'all':cats.join(','))+';first='+first+';group='+$('ftGroup').value;
+ busy(true);msg('Downloading the free channel list… this can take a minute');
+ try{var r=await post('/freetv',o);
+  if(!r){busy(false);msg('Could not reach the PS4');return}
+  if(r.status===409){busy(false);msg('A channel list is already loading — try again in a moment');return}
+  if(!r.ok){busy(false);msg('Could not add free channels');return}
+  var j=await r.json();busy(false);
+  if(j.list){plData=j.list;listCache.chan=JSON.stringify(plData);epgCache={};curGroup='';curSearch='';plLimit=PL_PAGE;
+   if($('chSearch'))$('chSearch').value='';renderPane('pl')}
+  msg(j.msg||'Done');ftShow(j.msg||'Done',0)}
+ catch(e){busy(false);msg('Could not add free channels')}}
+function ftShow(t,busyNow){var el=$('ftStat');el.hidden=!t&&!busyNow;el.textContent=busyNow?'Downloading the free channel list…':t}
+
 // Row/chip markup never interpolates data into inline handlers: actionable
 // elements carry data-kind/data-act/data-idx and a single delegated click
 // listener (below) looks the real value up in the JS-held array it names.
@@ -912,6 +956,7 @@ async function poll(){if(document.hidden||uploading)return;var j=await getj('/st
  if(j.tls_verify!=null){tlsv=j.tls_verify;setSw('swTls',tlsv)}
  if(j.pair!=null){pair=j.pair;setSw('swPair',pair)}
  renderAudio(j,on);renderSubs(j,on);renderEpg(j);
+ if(j.freetv_status!=null)ftShow(j.freetv_status,j.list_busy&&/Downloading/.test(j.freetv_status));
  if(!authLost&&document.getElementById('tokVal')&&document.getElementById('tokVal').textContent==='—')showToken()
  if(j.chan_cur!=null&&j.chan_cur!=chanCur){chanCur=j.chan_cur;if(plData.length)renderPane('pl')}
  if(j.error_code)showFailure(j);else if(on)$('failure').hidden=true;

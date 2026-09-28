@@ -631,6 +631,32 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
 - Host test: `test_channels` (100k parse/index/save/list, filters, reload,
   endpoints) with `tests/host/shim/orbis`.
 
+## Free channels (iptv-org)
+
+- Source: iptv-org's published playlists, fetched when the list is built
+  (links go stale fast, so nothing is baked into the app): `languages/<iso3>.m3u`
+  for each chosen audio language, filtered by category (group-title), and
+  `countries/<cc>.m3u` for the "first" countries, kept whole. GitHub Pages
+  first, raw.githubusercontent.com/iptv-org/iptv/gh-pages as the fallback.
+- `freetv.c` (pure): de-dup by stream URL across lists, drops "xxx", strips
+  "(1080p)" from names (keeps [Geo-blocked]/[Not 24/7]), numbers a channel's
+  extra streams "(2)", bouquet = country of the feed when the tvg-id's feed
+  is a country code ("X.de@FR" -> France; "@SD"/"@HD" are quality), else the
+  channel's ("X.tn@SD" -> Tunisia); "first" countries on top, then A-Z.
+  Country names: freetv_countries.h (from iptv-org's countries.json).
+- `freetv_net.c` downloads; httpd runs it on the list worker (POST /freetv,
+  one list job at a time with POST /playlist) and ADDS the result to the store
+  (`httpd_channels_add_playlist`, skipping URLs already there). /status
+  freetv_status + list_busy. TV: Square on the Live TV home (empty or on the
+  bouquet list) runs the defaults.
+- Defaults: lang ara,eng,fra; cat documentary,animation,kids; first TN;
+  bouquets per country. On the day this was written that came to 350 channels
+  (114 documentary, 231 cartoons/kids; 19 Arabic, 301 English, 30 French) in
+  46 bouquets; Tunisia has 4 public streams in the directory (El Watania 1
+  and 2, Jawhara TV, Mosaique FM). Languages are iptv-org's metadata.
+- Tests: host `test_freetv`; hls-e2e "free channels" (freetv_net.c against a
+  stand-in server, a missing list, add twice).
+
 ## Channel logos
 
 - Web UI: `<img>` over the row icon, lazy, `referrerpolicy=no-referrer` (the

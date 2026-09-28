@@ -7,6 +7,7 @@
 #include "m3u.h"
 #include "httpd.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -530,6 +531,61 @@ int httpd_channels_handle(OrbisNetId c, const char *method, const char *path,
         send_response(c, "200 OK", "text/plain", "ok", 2); return 1;
     }
     return 0;
+}
+
+// Adding to the list (free channels): streams already in it are skipped, so
+// adding again only brings in what is new.
+typedef struct { uint64_t *h; size_t cap, n; int added; } AddSet;
+
+static uint64_t hash64(const char *s) {
+    uint64_t h = 1469598103934665603ull;
+    for (; *s; s++) h = (h ^ (unsigned char)*s) * 1099511628211ull;
+    return h ? h : 1;
+}
+
+static int addset_put(AddSet *a, uint64_t h) {        // 1 if new
+    if ((a->n + 1) * 2 > a->cap) {
+        size_t cap = a->cap ? a->cap * 2 : 4096;
+        uint64_t *t = calloc(cap, sizeof(uint64_t));
+        if (!t) return 1;
+        for (size_t i = 0; i < a->cap; i++) {
+            if (!a->h[i]) continue;
+            size_t k = (size_t)a->h[i] & (cap - 1);
+            while (t[k]) k = (k + 1) & (cap - 1);
+            t[k] = a->h[i];
+        }
+        free(a->h);
+        a->h = t; a->cap = cap;
+    }
+    size_t k = (size_t)h & (a->cap - 1);
+    while (a->h[k]) { if (a->h[k] == h) return 0; k = (k + 1) & (a->cap - 1); }
+    a->h[k] = h;
+    a->n++;
+    return 1;
+}
+
+static int m3u_append(void *ctx, const M3uEntry *e) {
+    AddSet *a = ctx;
+    if (addset_put(a, hash64(e->spec)) && chan_add_full(e->name, e->group, e->spec, e->tvgId, e->logo, 0) == 0)
+        a->added++;
+    return g_chanN >= MAX_CHAN;
+}
+
+char *httpd_channels_add_playlist(const char *text, int *added, int *len) {
+    AddSet a;
+    memset(&a, 0, sizeof(a));
+    scePthreadMutexLock(&g_mtx);
+    for (int i = 0; i < g_chanN; i++) addset_put(&a, hash64(C_URL(&g_ch[i])));
+    m3u_parse(text, URL_MAX, m3u_append, &a);
+    if (a.added) { index_rebuild(); g_chanVer++; }
+    scePthreadMutexUnlock(&g_mtx);
+    free(a.h);
+    if (added) *added = a.added;
+    if (a.added) httpd_channels_save();
+    scePthreadMutexLock(&g_mtx);
+    char *j = chans_json(len);
+    scePthreadMutexUnlock(&g_mtx);
+    return j;
 }
 
 char *httpd_channels_load_playlist(const char *text, const char *srcUrl, int *len) {

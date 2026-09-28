@@ -38,6 +38,12 @@ int  httpd_chan_filter_abs(int n);
 int  httpd_chan_is_fav(int i);
 void httpd_chan_toggle_fav(int i);
 int  httpd_chan_letter_has(char letter);
+// Add free-to-air channels from the iptv-org directory in the background
+// (freetv.h options; "" = Tunisia + Arabic/English/French documentaries and
+// cartoons). 0 started, 1 another list job is running, -1 failed.
+int  httpd_freetv_start(const char *opts);
+// Where that stands ("" before the first run) and whether a list job runs.
+void httpd_freetv_status(char *out, int cap, int *busy);
 // Bouquet rail: row 0 = All, 1 = Favourites, 2+ = playlist groups.
 int  httpd_chan_rail_count(void);
 void httpd_chan_rail_name(int row, char *out, int cap);

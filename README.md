@@ -58,6 +58,14 @@ The build output is **`dist/PS4-Cast-v<version>.pkg`**. Two ways to install:
    is on now and next shows in the channel lists on the TV and the phone and
    in the channel banner; Settings can point at a different guide. Channel
    logos (`tvg-logo`) show on both too.
+   **Free channels:** without a playlist, press Square on the Live TV screen
+   (or use *Free channels* in the web UI's Live TV mode) to add free-to-air
+   channels from the [iptv-org](https://github.com/iptv-org/iptv) directory:
+   by default all of Tunisia's plus the Arabic, English and French
+   documentary and cartoon channels, in one bouquet per country with Tunisia
+   first. The web UI can pick other languages, kinds of channel, the country
+   on top, and bouquets per kind instead. They are added to your list (nothing
+   is removed); some streams are geo-blocked or only on at times.
 7. During IPTV playback, **Down** opens the channel guide, **L1/R1** changes
    channel and **L2/R2** changes bouquet. During cast playback, Left/Right and
    L1/R1 seek instead. Cross pauses, Circle stops and Triangle exits. When a

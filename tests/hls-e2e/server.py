@@ -147,6 +147,26 @@ def _png(w, h, rgb):
 for _i in range(220):
     files[f"/logo/{_i}.png"] = _png(32, 20, ((_i * 37) & 255, (_i * 91) & 255, (_i * 53) & 255))
 
+# 14) a stand-in for iptv-org's playlists (languages/, countries/); no fra
+files["/iptv/languages/ara.m3u"] = b"""#EXTM3U
+#EXTINF:-1 tvg-id="AsharqDocumentary.sa@SD" group-title="Documentary",Asharq Documentary (1080p)
+https://s.example/asharq.m3u8
+#EXTINF:-1 tvg-id="SpacetoonArabic.ae@SD" group-title="Animation;Kids",Spacetoon Arabic (720p)
+https://s.example/spacetoon.m3u8
+#EXTINF:-1 tvg-id="AlJazeera.qa@SD" group-title="News",Al Jazeera (1080p)
+https://s.example/aj.m3u8
+"""
+files["/iptv/languages/eng.m3u"] = b"""#EXTM3U
+#EXTINF:-1 tvg-id="NatureTime.us@SD" group-title="Documentary",Nature Time
+https://s.example/nature.m3u8
+"""
+files["/iptv/countries/tn.m3u"] = b"""#EXTM3U
+#EXTINF:-1 tvg-id="ElWatania1.tn@SD" group-title="General",El Watania 1 (1080i)
+https://s.example/watania1.m3u8
+#EXTINF:-1 tvg-id="JawharaTV.tn@SD" group-title="Music",Jawhara TV (720p) [Not 24/7]
+https://s.example/jawhara.m3u8
+"""
+
 log = open(os.path.join(OUT, "server.log"), "w")
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"

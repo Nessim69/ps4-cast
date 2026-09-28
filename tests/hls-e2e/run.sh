@@ -13,7 +13,8 @@
 #   chunked and read-to-close bodies, each fetched twice on one channel, and
 #   a sink that stops early; and the programme guide end to end (epg.c:
 #   download, /data cache, link override, refresh, a link that is no guide),
-#   and channel logos (logo.c: fetch, decode, draw, eviction, broken links).
+#   channel logos (logo.c: fetch, decode, draw, eviction, broken links), and
+#   free channels (freetv_net.c against a stand-in for iptv-org).
 #
 # Needs python3 with `cryptography` and the BearSSL tree portlibs/fetch.sh
 # unpacks (BEARSSL_SRC to override). Skips (exit 0) when either is missing.
@@ -48,6 +49,11 @@ ${CC:-cc} -std=gnu11 -g -O1 -w -fsanitize=address,undefined ${E2E_CFLAGS:-} -DGF
   "$HERE/logo_driver.c" "$HERE/stubs.c" "$A/logo.c" "$A/logo_image.c" "$A/gfx.c" "$A/font_atlas.c" "$A/aseg.c" \
   "$A/hls_parse.c" "$A/httpd_channels.c" "$A/m3u.c" "$A/urlopt.c" "$A/netpolicy.c" \
   -lpthread -lm || { echo "hls-e2e: logo build failed"; exit 1; }
+${CC:-cc} -std=gnu11 -g -O1 -w -fsanitize=address,undefined ${E2E_CFLAGS:-} \
+  -I"$HERE/shim" -I"$A" -o "$W/freetv" \
+  "$HERE/freetv_driver.c" "$HERE/stubs.c" "$A/freetv_net.c" "$A/freetv.c" "$A/aseg.c" \
+  "$A/hls_parse.c" "$A/httpd_channels.c" "$A/m3u.c" "$A/urlopt.c" "$A/netpolicy.c" \
+  -lpthread || { echo "hls-e2e: freetv build failed"; exit 1; }
 "$PY" "$HERE/server.py" "$W/out" 0 >"$W/server.err" 2>&1 & SRV=$!
 for _ in $(seq 50); do [ -s "$W/out/port" ] && break; sleep 0.1; done
 [ -s "$W/out/port" ] || { echo "hls-e2e: server did not start"; cat "$W/server.err"; exit 1; }
@@ -82,5 +88,8 @@ else echo "FAIL guide: download, cache, override, refresh"; echo "$out" | sed 's
 rm -rf "$W/data2"; mkdir -p "$W/data2"
 if out=$(PS4CAST_DATA="$W/data2" "$W/logo" "$U" 2>&1); then echo "ok   logos: fetch, decode, draw, evict"
 else echo "FAIL logos: fetch, decode, draw, evict"; echo "$out" | sed 's/^/     /' | head -12; fail=1; fi
+rm -rf "$W/data3"; mkdir -p "$W/data3"
+if out=$(PS4CAST_DATA="$W/data3" "$W/freetv" "$U" 2>&1); then echo "ok   free channels: download, add, add again"
+else echo "FAIL free channels: download, add, add again"; echo "$out" | sed 's/^/     /' | head -12; fail=1; fi
 [ "$fail" = 0 ] && echo "hls-e2e: all ok" || echo "hls-e2e: FAILURES"
 exit $fail

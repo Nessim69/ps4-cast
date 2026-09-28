@@ -793,15 +793,23 @@ static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
     gfx_text(g, lx + lw - gfx_text_w(sub, 2), 150, sub, 2, FAINT);
     gfx_rect_a(g, lx, 184, lw, 1, HAIR, 30);
 
+    char ftMsg[160];
+    int ftBusy = 0;
+    httpd_freetv_status(ftMsg, sizeof(ftMsg), &ftBusy);
     if (httpd_chan_count() <= 0) {
-        icon_cast(g, W / 2, 390, 90);
-        ctext(g, 474, "No IPTV playlist loaded", 5, TXT, 0);
-        ctext(g, 544, "Open the web controls and add an M3U playlist", 3, MUT, 0);
+        icon_cast(g, W / 2, 360, 90);
+        ctext(g, 444, "No IPTV playlist loaded", 5, TXT, 0);
+        ctext(g, 514, "Open the web controls and add an M3U playlist", 3, MUT, 0);
         if (net_ok) {
             char url[80]; control_url(url, sizeof(url), ip);
-            ctext(g, 602, url, 3, ACC_LT, 0);
+            ctext(g, 572, url, 3, ACC_LT, 0);
         }
-        ctext(g, H - 52, "L1 / R1  switch mode        Triangle  exit", 2, MUT, 0);
+        ctext(g, 660, ftBusy ? "Loading free channels..." :
+                      "or press Square for free channels: Tunisia, documentaries and cartoons",
+              3, ftBusy ? ACC_LT : TXT, 0);
+        ctext(g, 706, "Arabic, English and French, from the iptv-org directory", 2, MUT, 0);
+        if (!ftBusy && ftMsg[0]) ctext(g, 750, ftMsg, 2, WARN, 0);
+        ctext(g, H - 52, "Square  free channels     L1 / R1  switch mode     Triangle  exit", 2, MUT, 0);
         return;
     }
 
@@ -884,9 +892,11 @@ static void draw_channel_home(Gfx *g, int sel, int railSel, int inChannels,
         }
     }
 
+    if (!inChannels && (ftBusy || ftMsg[0]))
+        ctext(g, H - 88, ftBusy ? "Loading free channels..." : ftMsg, 2, ftBusy ? ACC_LT : MUT, 0);
     ctext(g, H - 56, inChannels
         ? "Up/Down channel   Cross watch   Square favourite   Circle bouquets   L2/R2 bouquet"
-        : "Up/Down bouquet   Cross open   L1/R1 switch mode", 2, MUT, 0);
+        : "Up/Down bouquet   Cross open   Square add free channels   L1/R1 switch mode", 2, MUT, 0);
 }
 
 // The playback guide reuses the same filtered selection as the Live TV home.
@@ -1230,6 +1240,14 @@ int main(void) {
                 notify("Pairing open for 2 minutes - pair the Chrome extension now");
             }
 
+            // Square on the Live TV home (empty, or on the bouquet list) adds
+            // the free channels: Tunisia plus Arabic/English/French
+            // documentaries and cartoons from the iptv-org directory.
+            if (homeMode == HOME_IPTV && (pressed & ORBIS_PAD_BUTTON_SQUARE) && (nch == 0 || !inChannels)) {
+                int rc = net_ok ? httpd_freetv_start("") : -1;
+                notify(rc == 0 ? "Loading free channels..." : rc == 1 ? "A channel list is already loading"
+                                                                       : "No network: can't load free channels");
+            }
             if (homeMode == HOME_IPTV && nch > 0) {
                 if (!inChannels) {
                     int rn = httpd_chan_rail_count();

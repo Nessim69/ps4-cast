@@ -31,6 +31,9 @@ void httpd_channels_set_push_cb(void (*cb)(const char *url));
 // list as the same JSON GET /channels serves (malloc'd; NULL when nothing
 // parsed). *len is its length.
 char *httpd_channels_load_playlist(const char *text, const char *srcUrl, int *len);
+// Add an M3U list's channels to the end of the store, skipping streams it
+// already has; returns the whole list as JSON like the above. *added = new ones.
+char *httpd_channels_add_playlist(const char *text, int *added, int *len);
 // Channel i's XMLTV id (tvg-id) and logo URL; 1 if i exists.
 int  httpd_chan_meta(int i, char *tvgId, int tvgCap, char *logo, int logoCap);
 int  httpd_chan_has_logos(void);          // any channel in the list has a logo

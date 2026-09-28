@@ -15,6 +15,7 @@
 #include "pairing.h"
 #include "epg.h"
 #include "wallclock.h"
+#include "freetv_net.h"
 
 #include <string.h>
 #include <ctype.h>
@@ -1564,31 +1565,122 @@ static void handle_local_upload(OrbisNetId c, const char *req, int reqLen,
 // fetch, parse and reply now run on their own thread, which owns the socket
 // the same way the upload worker does. One load at a time.
 static int g_plist_active = 0;   // guarded by g_mtx
+// The free-channel builder (POST /freetv, or Square on the TV) runs on the
+// same worker, one list job at a time. Its outcome, for /status and the TV.
+static char g_freetvMsg[160];     // guarded by g_mtx
 typedef struct {
-    OrbisNetId sock;
-    char       url[URL_MAX];
+    OrbisNetId  sock;             // -1: started from the TV, nobody to answer
+    int         freetv;
+    char        url[URL_MAX];
+    FreeTvOpts  opts;
 } PlaylistJob;
+
+static void freetv_set_msg(const char *m) {
+    scePthreadMutexLock(&g_mtx);
+    snprintf(g_freetvMsg, sizeof(g_freetvMsg), "%s", m);
+    scePthreadMutexUnlock(&g_mtx);
+}
+
+void httpd_freetv_status(char *out, int cap, int *busy) {
+    scePthreadMutexLock(&g_mtx);
+    snprintf(out, (size_t)cap, "%s", g_freetvMsg);
+    if (busy) *busy = g_plist_active;
+    scePthreadMutexUnlock(&g_mtx);
+}
+
+// Free channels: iptv-org's playlists -> freetv.c -> added to the store.
+// Answers {"added":N,"found":M,"msg":"..","list":[/channels]}.
+static void freetv_job(PlaylistJob *job) {
+    char msg[160], *m3u = NULL, *list = NULL;
+    int found = 0, added = 0, n = 0;
+    freetv_set_msg("Downloading the free channel list...");
+    if (freetv_load(&job->opts, &m3u, &found, msg, sizeof(msg)) == 0) {
+        list = httpd_channels_add_playlist(m3u, &added, &n);
+        char done[200];
+        snprintf(done, sizeof(done), "%s, %d new added", msg, added);
+        snprintf(msg, sizeof(msg), "%s", done);
+    }
+    free(m3u);
+    freetv_set_msg(msg);
+    if (job->sock >= 0) {
+        size_t cap = (size_t)n + 1024;
+        char *j = malloc(cap);
+        if (j) {
+            int o = snprintf(j, cap, "{\"added\":%d,\"found\":%d,\"msg\":", added, found);
+            json_str(j, (int)cap, &o, msg, 159);
+            o += snprintf(j + o, cap - (size_t)o, ",\"list\":");
+            if (list) { memcpy(j + o, list, (size_t)n); o += n; }
+            else { memcpy(j + o, "null", 4); o += 4; }
+            j[o++] = '}';
+            send_response(job->sock, "200 OK", "application/json", j, o);
+            free(j);
+        } else {
+            send_response(job->sock, "503 Service Unavailable", "text/plain", "out of memory", 13);
+        }
+    }
+    free(list);
+}
 
 static void *playlist_worker(void *arg) {
     PlaylistJob *job = (PlaylistJob *)arg;
-    char *out = NULL;
-    int n = 0;
-    uint8_t *buf = NULL; int len = 0;
-    if (aseg_fetch_ui(job->url, &buf, &len) == 0 && buf && len > 0) {
-        uint8_t *txt = realloc(buf, (size_t)len + 1);
-        if (txt) {
-            buf = txt; buf[len] = '\0';
-            out = httpd_channels_load_playlist((const char *)buf, job->url, &n);
+    if (job->freetv) {
+        freetv_job(job);
+    } else {
+        char *out = NULL;
+        int n = 0;
+        uint8_t *buf = NULL; int len = 0;
+        if (aseg_fetch_ui(job->url, &buf, &len) == 0 && buf && len > 0) {
+            uint8_t *txt = realloc(buf, (size_t)len + 1);
+            if (txt) {
+                buf = txt; buf[len] = '\0';
+                out = httpd_channels_load_playlist((const char *)buf, job->url, &n);
+            }
         }
+        free(buf);
+        if (out) send_response(job->sock, "200 OK", "application/json", out, n);
+        else send_response(job->sock, "200 OK", "application/json", "[]", 2);
+        free(out);
     }
-    free(buf);
-    if (out) send_response(job->sock, "200 OK", "application/json", out, n);
-    else send_response(job->sock, "200 OK", "application/json", "[]", 2);
-    free(out);
-    sceNetSocketClose(job->sock);
+    if (job->sock >= 0) sceNetSocketClose(job->sock);
     scePthreadMutexLock(&g_mtx); g_plist_active = 0; scePthreadMutexUnlock(&g_mtx);
     free(job);
     return NULL;
+}
+
+// Claim the list worker and start `job` on it (taking ownership of both it
+// and its socket). 0 started; 1 busy; -1 failed. On a nonzero return the
+// job is freed and a socket, if any, still belongs to the caller.
+static int start_list_job(PlaylistJob *job) {
+    scePthreadMutexLock(&g_mtx);
+    int busy = g_plist_active;
+    if (!busy) g_plist_active = 1;
+    scePthreadMutexUnlock(&g_mtx);
+    if (busy) { free(job); return 1; }
+    OrbisPthreadAttr attr;
+    OrbisPthreadAttr *pattr = NULL;
+    int attrInit = scePthreadAttrInit(&attr) == 0;
+    if (attrInit && scePthreadAttrSetstacksize(&attr, UPLOAD_WORKER_STACK) == 0) pattr = &attr;
+    OrbisPthread worker;
+    int trc = scePthreadCreate(&worker, pattr, playlist_worker, job, "ps4cast_plist");
+    if (attrInit) scePthreadAttrDestroy(&attr);
+    if (trc != 0) {
+        scePthreadMutexLock(&g_mtx); g_plist_active = 0; scePthreadMutexUnlock(&g_mtx);
+        free(job);
+        return -1;
+    }
+    scePthreadDetach(worker);
+    return 0;
+}
+
+// Answer the outcome of start_list_job for a job that came with socket c.
+static void list_job_answer(OrbisNetId c, int rc) {
+    if (rc == 0) { g_upload_handoff = 1; return; }   // the worker owns `c` now
+    if (rc == 1) {
+        const char *m = "a playlist is already loading";
+        send_response(c, "409 Conflict", "text/plain", m, (int)strlen(m));
+    } else {
+        send_response(c, "500 Internal Server Error", "text/plain", "cannot start the list job", 25);
+    }
 }
 
 static void handle_playlist(OrbisNetId c, const char *body) {
@@ -1599,38 +1691,35 @@ static void handle_playlist(OrbisNetId c, const char *body) {
         send_response(c, "200 OK", "application/json", "[]", 2);
         return;
     }
-    scePthreadMutexLock(&g_mtx);
-    int busy = g_plist_active;
-    if (!busy) g_plist_active = 1;
-    scePthreadMutexUnlock(&g_mtx);
-    if (busy) {
-        const char *m = "a playlist is already loading";
-        send_response(c, "409 Conflict", "text/plain", m, (int)strlen(m));
-        return;
-    }
-    PlaylistJob *job = malloc(sizeof(*job));
-    if (!job) {
-        send_response(c, "503 Service Unavailable", "text/plain", "out of memory", 13);
-        scePthreadMutexLock(&g_mtx); g_plist_active = 0; scePthreadMutexUnlock(&g_mtx);
+    PlaylistJob *job = calloc(1, sizeof(*job));
+    if (!job) { send_response(c, "503 Service Unavailable", "text/plain", "out of memory", 13); return; }
+    job->sock = c;
+    snprintf(job->url, sizeof(job->url), "%s", url);
+    list_job_answer(c, start_list_job(job));
+}
+
+// POST /freetv body: freetv options ("lang=ara,eng,fra;cat=documentary,
+// animation,kids;first=TN;group=country"; empty = those defaults).
+static void handle_freetv(OrbisNetId c, const char *body) {
+    PlaylistJob *job = calloc(1, sizeof(*job));
+    if (!job) { send_response(c, "503 Service Unavailable", "text/plain", "out of memory", 13); return; }
+    if (freetv_opts_parse(body, &job->opts) != 0) {
+        free(job);
+        send_response(c, "400 Bad Request", "text/plain", "pick at least one language or country", 37);
         return;
     }
     job->sock = c;
-    snprintf(job->url, sizeof(job->url), "%s", url);
-    OrbisPthreadAttr attr;
-    OrbisPthreadAttr *pattr = NULL;
-    int attrInit = scePthreadAttrInit(&attr) == 0;
-    if (attrInit && scePthreadAttrSetstacksize(&attr, UPLOAD_WORKER_STACK) == 0) pattr = &attr;
-    OrbisPthread worker;
-    int trc = scePthreadCreate(&worker, pattr, playlist_worker, job, "ps4cast_plist");
-    if (attrInit) scePthreadAttrDestroy(&attr);
-    if (trc != 0) {
-        send_response(c, "500 Internal Server Error", "text/plain", "cannot start playlist load", 26);
-        scePthreadMutexLock(&g_mtx); g_plist_active = 0; scePthreadMutexUnlock(&g_mtx);
-        free(job);
-        return;   // socket is still ours: server_main closes it as usual
-    }
-    scePthreadDetach(worker);
-    g_upload_handoff = 1;       // the worker now owns `c`; server_main must not close it
+    job->freetv = 1;
+    list_job_answer(c, start_list_job(job));
+}
+
+int httpd_freetv_start(const char *opts) {
+    PlaylistJob *job = calloc(1, sizeof(*job));
+    if (!job) return -1;
+    job->sock = -1;
+    job->freetv = 1;
+    if (freetv_opts_parse(opts, &job->opts) != 0) { free(job); return -1; }
+    return start_list_job(job);
 }
 
 static void handle_client(OrbisNetId c) {
@@ -1885,6 +1974,11 @@ static void handle_client(OrbisNetId c) {
             epg_status(es, sizeof(es));
             epg_get_url(eu, sizeof(eu));
             epg_source(src, sizeof(src));
+            char ft[160];
+            int ftBusy = 0;
+            httpd_freetv_status(ft, sizeof(ft), &ftBusy);
+            JAPP(",\"list_busy\":%d,\"freetv_status\":", ftBusy);
+            json_str(json, cap, &o, ft, 159);
             JAPP(",\"epg_ver\":%d,\"epg_on\":%d,\"epg_status\":", epg_version(), epg_loaded());
             json_str(json, cap, &o, es, 199);
             JAPP(",\"epg_url\":"); json_str(json, cap, &o, eu, 1023);
@@ -2545,6 +2639,11 @@ static void handle_client(OrbisNetId c) {
     // Expand an M3U / IPTV playlist link into a JSON channel list. Body = URL.
     if (strcmp(method, "POST") == 0 && strcmp(path, "/playlist") == 0) {
         handle_playlist(c, body);
+        return;
+    }
+    // Free-to-air channels from the iptv-org directory, added to the list.
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/freetv") == 0) {
+        handle_freetv(c, body);
         return;
     }
 
