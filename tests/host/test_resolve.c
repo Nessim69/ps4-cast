@@ -13,8 +13,9 @@ static const char *g_stubBody = "";
 static const char *g_stubCtype = "text/html; charset=utf-8";
 static int g_stubCh = -1, g_stubMax = 0, g_stubResumed = -1, g_stubCalls = 0;
 static uint64_t g_stubBudget = 0;
+static char g_stubUrl[1600];
 int aseg_fetch_opts(int ch, const char *url, uint8_t **buf, int *len, AsegOpts *o) {
-    (void)url;
+    snprintf(g_stubUrl, sizeof g_stubUrl, "%s", url);
     g_stubCalls++;
     g_stubCh = ch; g_stubMax = o ? o->maxBytes : 0; g_stubBudget = o ? o->budgetUs : 0;
     *buf = NULL; *len = 0;
@@ -134,6 +135,55 @@ int main(void) {
         sprintf(b, "/v.m3u8\"></video>");
         g_stubBody = body;
         CHECK(resolve_page("https://site.example/watch/6", out, sizeof out) == 0);
+    }
+
+    // YouTube: a channel's /live page while it is live. Fetched as a desktop
+    // browser with the consent cookie; the embedded hlsManifestUrl wins over
+    // anything else; the result expires, so reopens re-resolve.
+    {
+        char yt[64];
+        CHECK(youtube_page("https://m.youtube.com/channel/UCx/live", yt, sizeof yt) &&
+              !strcmp(yt, "https://www.youtube.com/channel/UCx/live"));
+        CHECK(youtube_page("https://youtu.be/abc123?t=5", yt, sizeof yt) &&
+              !strcmp(yt, "https://www.youtube.com/watch?v=abc123"));
+        CHECK(!youtube_page("https://notyoutube.com/x", yt, sizeof yt));
+        CHECK(!youtube_page("https://www.youtube.com.evil.example/x", yt, sizeof yt));
+
+        g_stubBody = "<html><script>var ytInitialPlayerResponse = {\"streamingData\":{\"expiresInSeconds\":\"21540\","
+                     "\"hlsManifestUrl\":\"https:\\/\\/manifest.googlevideo.com\\/api\\/manifest\\/hls_variant\\/expire\\/1790600000"
+                     "\\/id\\/xyz\\/source\\/yt_live_broadcast\\/file\\/index.m3u8\"}};"
+                     " var other = \"https://example.com/ad/playlist.m3u8\";</script>";
+        CHECK(resolve_page("https://m.youtube.com/channel/UCQS3ejF2jBAhwmbGD9Q3oeA/live", out, sizeof out) == 1);
+        CHECK(!strncmp(out, "https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1790600000/id/xyz/"
+                            "source/yt_live_broadcast/file/index.m3u8|User-Agent=Mozilla/5.0 (Windows", 125));
+        CHECK(!strstr(out, "Referer="));
+        CHECK(resolve_reresolve() == 1 && resolve_offline() == 0);
+        CHECK(!strcmp(g_stubUrl, "https://www.youtube.com/channel/UCQS3ejF2jBAhwmbGD9Q3oeA/live"));
+        const char *h = urlopt_headers();
+        CHECK(strstr(h, "Cookie: SOCS=CAI\r\n") && strstr(h, "User-Agent: Mozilla/5.0 (Windows NT 10.0") && !strstr(h, "SMART-TV"));
+
+        // Not live right now: a clear "offline", not a scrape of other links.
+        g_stubBody = "<html><script>var ytInitialPlayerResponse = {\"playabilityStatus\":{\"status\":\"LIVE_STREAM_OFFLINE\"}};"
+                     " var x=\"https://example.com/other/master.m3u8\";</script>";
+        CHECK(resolve_page("https://www.youtube.com/channel/UCx/live", out, sizeof out) == 0);
+        CHECK(resolve_offline() == 1 && resolve_reresolve() == 0);
+
+        // A broadcaster's page that only embeds its YouTube live player is
+        // followed to that channel's /live page (one hop).
+        g_stubBody = "<html><iframe src=\"https://www.youtube.com/embed/live_stream?channel=UCQS3ejF2jBAhwmbGD9Q3oeA&autoplay=1\"></iframe>";
+        CHECK(resolve_page("https://live.broadcaster.example/", out, sizeof out) == 0);   // stub serves the same page again
+        CHECK(!strcmp(g_stubUrl, "https://www.youtube.com/channel/UCQS3ejF2jBAhwmbGD9Q3oeA/live"));
+        CHECK(resolve_offline() == 1);
+        g_stubBody = "<html><iframe src=\"//www.youtube-nocookie.com/embed/dQw4w9WgXcQ?rel=0\"></iframe>";
+        resolve_page("https://live.broadcaster.example/", out, sizeof out);
+        CHECK(!strcmp(g_stubUrl, "https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        char e[128];
+        CHECK(!youtube_embed("youtube.com/embed/short", e, sizeof e));
+
+        // Other sites keep the old behaviour and flags stay down.
+        g_stubBody = "<html>https://cdn.example/v.m3u8";
+        CHECK(resolve_page("https://site.example/watch/9", out, sizeof out) == 1);
+        CHECK(resolve_offline() == 0 && resolve_reresolve() == 0);
     }
 
     test_media_types();

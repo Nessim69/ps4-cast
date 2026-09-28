@@ -654,8 +654,25 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
   (114 documentary, 231 cartoons/kids; 19 Arabic, 301 English, 30 French) in
   46 bouquets; Tunisia has 4 public streams in the directory (El Watania 1
   and 2, Jawhara TV, Mosaique FM). Languages are iptv-org's metadata.
-- Tests: host `test_freetv`; hls-e2e "free channels" (freetv_net.c against a
-  stand-in server, a missing list, add twice).
+- Official sources (`freetv_add_official`): channels the directory has no
+  stream for but whose broadcaster streams them free. Tunisia: Hannibal TV
+  (official YouTube channel UCMowjs_MJ-oIWEeHUu3DrOQ), Nessma (live.nessma.tv,
+  then YouTube UC-48PCT3flS86JkLzxlTA9g as "Nessma (2)"), Attessia TV (YouTube
+  UCQS3ejF2jBAhwmbGD9Q3oeA). Stored as page URLs and resolved when tuned, so
+  they follow whatever is live; added even if iptv-org can't be reached.
+  None of these could be opened from the development sandbox (its network
+  policy blocks youtube.com and nessma.tv): unverified on a console.
+- resolve.c YouTube: youtube.com / m.youtube.com / youtu.be pages are fetched
+  as a desktop browser with `Cookie: SOCS=CAI` (consent answered) and the
+  embedded `"hlsManifestUrl"` is used (as streamlink does). No manifest =
+  `resolve_offline()` -> error "offline" ("not live right now") instead of
+  opening the page as media. The manifest expires (hours), so
+  `resolve_reresolve()` makes the player keep the page as the reopen spec. A
+  page with no .m3u8 that embeds a YouTube player (embed/live_stream?channel=
+  or embed/<id>) is followed one hop.
+- Tests: host `test_freetv`, `test_resolve` (YouTube page, offline, embeds);
+  hls-e2e "free channels" (freetv_net.c against a stand-in server, a missing
+  list, add twice, directory unreachable).
 
 ## Channel logos
 

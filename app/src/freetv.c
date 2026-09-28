@@ -249,6 +249,27 @@ void freetv_add(FreeTv *b, const char *text, int whole) {
     if (text) m3u_parse(text, SPEC_MAX, on_entry, &a);
 }
 
+// Official free sources, per country. YouTube entries are the broadcaster's
+// own channel's /live page (the channel id never changes; the stream does).
+static const struct { const char *cc, *m3u; } OFFICIAL[] = {
+    { "TN",
+      "#EXTM3U\n"
+      "#EXTINF:-1 tvg-id=\"HannibalTV.tn@SD\" tvg-logo=\"https://i.imgur.com/sIMmkBo.png\" group-title=\"General\",Hannibal TV\n"
+      "https://www.youtube.com/channel/UCMowjs_MJ-oIWEeHUu3DrOQ/live\n"
+      "#EXTINF:-1 tvg-id=\"NessmaElJadida.tn@SD\" tvg-logo=\"https://i.imgur.com/66CJtdz.png\" group-title=\"General\",Nessma\n"
+      "https://live.nessma.tv/\n"
+      "#EXTINF:-1 tvg-id=\"NessmaElJadida.tn@SD\" tvg-logo=\"https://i.imgur.com/66CJtdz.png\" group-title=\"General\",Nessma\n"
+      "https://www.youtube.com/channel/UC-48PCT3flS86JkLzxlTA9g/live\n"
+      "#EXTINF:-1 tvg-id=\"AttessiaTV.tn@SD\" tvg-logo=\"https://i.imgur.com/kmfRNVy.png\" group-title=\"General\",Attessia TV\n"
+      "https://www.youtube.com/channel/UCQS3ejF2jBAhwmbGD9Q3oeA/live\n" },
+};
+
+void freetv_add_official(FreeTv *b) {
+    for (int k = 0; k < b->o.nFirst; k++)
+        for (size_t i = 0; i < sizeof(OFFICIAL) / sizeof(OFFICIAL[0]); i++)
+            if (!strcmp(b->o.first[k], OFFICIAL[i].cc)) freetv_add(b, OFFICIAL[i].m3u, 1);
+}
+
 static int ci_cmp(const char *a, const char *b) {
     for (;; a++, b++) {
         int x = (unsigned char)*a, y = (unsigned char)*b;

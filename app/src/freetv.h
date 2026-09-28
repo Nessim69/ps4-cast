@@ -36,6 +36,12 @@ FreeTv *freetv_new(const FreeTvOpts *o);
 // One downloaded playlist: a language's (filtered by category) or, with
 // whole = 1, a "first" country's (kept whole).
 void    freetv_add(FreeTv *b, const char *m3uText, int whole);
+// Channels the directory has no stream for but whose broadcaster streams
+// them free on its own site or official YouTube channel, for the "first"
+// countries (Tunisia: Hannibal TV, Nessma, Attessia TV). Their URLs are
+// pages the player resolves when tuned (resolve.c), so they follow whatever
+// the broadcaster is streaming now.
+void    freetv_add_official(FreeTv *b);
 // The result as M3U text (malloc'd); *count = channels in it.
 char   *freetv_m3u(FreeTv *b, int *count);
 int     freetv_count(const FreeTv *b);

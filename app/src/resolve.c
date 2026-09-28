@@ -7,11 +7,71 @@
 #include <stdlib.h>
 
 static char g_dbg[128] = "";
+static int  g_offline;      // the last page was a live page with nothing live on it
+static int  g_reresolve;    // the last result expires: reopen from the page, not it
 
 // A real page is small; anything bigger is scanned from its head only.
 #define RESOLVE_PAGE_CAP       (2 * 1024 * 1024)
 #define RESOLVE_PAGE_BUDGET_US (8ULL * 1000 * 1000)
 const char *resolve_debug(void) { return g_dbg; }
+int resolve_offline(void) { return g_offline; }
+int resolve_reresolve(void) { return g_reresolve; }
+
+static void unescape(char *s);
+
+// ---- YouTube live ---------------------------------------------------------
+// A live stream's watch page, and a channel's /live page while it is live,
+// carry the stream's HLS manifest in the embedded player response as
+// "hlsManifestUrl" (the same thing streamlink reads). Asked as a desktop
+// browser -- a TV User-Agent gets the TV app shell -- with the consent
+// question answered, or visitors in some regions get a consent page instead.
+// The manifest URL expires after some hours, so a reconnect re-resolves.
+#define DESKTOP_UA "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+
+static int host_is(const char *url, const char *host) {
+    const char *p = strstr(url, "://");
+    if (!p) return 0;
+    p += 3;
+    size_t n = strlen(host);
+    return strncasecmp(p, host, n) == 0 && (p[n] == '/' || p[n] == ':' || p[n] == '?' || p[n] == '\0');
+}
+
+// youtube.com / m.youtube.com / youtu.be/ID -> the www page (0 if not YouTube).
+static int youtube_page(const char *url, char *out, int cap) {
+    const char *p = strstr(url, "://");
+    if (!p) return 0;
+    if (host_is(url, "youtu.be")) {
+        const char *id = p + 3 + 8;                              // "youtu.be"
+        if (*id == '/') id++;
+        int n = (int)strcspn(id, "?#&/");
+        if (n <= 0) return 0;
+        snprintf(out, (size_t)cap, "https://www.youtube.com/watch?v=%.*s", n, id);
+        return 1;
+    }
+    const char *hosts[] = { "www.youtube.com", "youtube.com", "m.youtube.com" };
+    for (int i = 0; i < 3; i++) {
+        if (!host_is(url, hosts[i])) continue;
+        snprintf(out, (size_t)cap, "https://www.youtube.com%s", p + 3 + strlen(hosts[i]));
+        return 1;
+    }
+    return 0;
+}
+
+// "hlsManifestUrl":"https:\/\/manifest.googlevideo.com\/...\/index.m3u8"
+static int youtube_manifest(const char *body, char *out, int cap) {
+    const char *k = strstr(body, "\"hlsManifestUrl\":\"");
+    if (!k) return 0;
+    k += 18;
+    const char *e = strchr(k, '"');
+    if (!e || e - k <= 8 || e - k >= 1400) return 0;
+    char url[1400];
+    memcpy(url, k, (size_t)(e - k));
+    url[e - k] = '\0';
+    unescape(url);
+    if (strncmp(url, "https://", 8) != 0) return 0;
+    snprintf(out, (size_t)cap, "%s|User-Agent=%s", url, DESKTOP_UA);
+    return 1;
+}
 
 // Extensions we can hand straight to the player -- no point fetching the page.
 static const char *MEDIA_EXT[] = {
@@ -160,15 +220,47 @@ static int extract_best(const char *body, const char *pageUrl, char *out, int ca
     return 1;
 }
 
+// A broadcaster's own live page that embeds its YouTube player:
+// youtube(-nocookie).com/embed/live_stream?channel=UC.. or /embed/<id>.
+// The watch/live page to resolve instead, or 0.
+static int youtube_embed(const char *body, char *out, int cap) {
+    static const char *hosts[] = { "youtube.com/embed/", "youtube-nocookie.com/embed/", NULL };
+    for (int h = 0; hosts[h]; h++) {
+        for (const char *p = strstr(body, hosts[h]); p; p = strstr(p + 1, hosts[h])) {
+            const char *v = p + strlen(hosts[h]);
+            if (!strncmp(v, "live_stream?channel=", 20)) {
+                v += 20;
+                int n = (int)strspn(v, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-");
+                if (n >= 20 && n <= 30) {
+                    snprintf(out, (size_t)cap, "https://www.youtube.com/channel/%.*s/live", n, v);
+                    return 1;
+                }
+                continue;
+            }
+            int n = (int)strspn(v, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-");
+            if (n == 11) {
+                snprintf(out, (size_t)cap, "https://www.youtube.com/watch?v=%.*s", n, v);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 int resolve_page(const char *pageUrl, char *out, int cap) {
     g_dbg[0] = '\0';
+    g_offline = g_reresolve = 0;
     if (!pageUrl || !out || cap <= 0) return 0;
 
     // Ask as a browser would; many sites serve a stub (or 403) to unknown agents.
-    char withHdrs[1600];
-    snprintf(withHdrs, sizeof(withHdrs),
-             "%s|User-Agent=%s&Referer=%s",
-             pageUrl, "Mozilla/5.0 (SMART-TV; Linux) AppleWebKit/537.36", pageUrl);
+    char withHdrs[1600], ytPage[1400];
+    int yt = youtube_page(pageUrl, ytPage, sizeof(ytPage));
+    if (yt)
+        snprintf(withHdrs, sizeof(withHdrs), "%s|User-Agent=%s&Cookie=SOCS=CAI", ytPage, DESKTOP_UA);
+    else
+        snprintf(withHdrs, sizeof(withHdrs),
+                 "%s|User-Agent=%s&Referer=%s",
+                 pageUrl, "Mozilla/5.0 (SMART-TV; Linux) AppleWebKit/537.36", pageUrl);
     char clean[1400];
     urlopt_apply(withHdrs, clean, sizeof(clean));
 
@@ -204,7 +296,25 @@ int resolve_page(const char *pageUrl, char *out, int cap) {
     memcpy(text, body, (size_t)len); text[len] = '\0';
     free(body);
 
+    if (yt) {
+        int ok = youtube_manifest(text, out, cap);
+        free(text);
+        if (!ok) {
+            g_offline = 1;
+            snprintf(g_dbg, sizeof(g_dbg), "resolve: YouTube page has no live stream (%dKB)", len / 1024);
+            return 0;
+        }
+        g_reresolve = 1;
+        snprintf(g_dbg, sizeof(g_dbg), "resolve: YouTube live from %dKB page", len / 1024);
+        return 1;
+    }
     int got = extract_best(text, pageUrl, out, cap);
+    char embed[256];
+    if (!got && youtube_embed(text, embed, sizeof(embed))) {
+        // One hop only: the embed's own page is YouTube, which never embeds on.
+        free(text);
+        return resolve_page(embed, out, cap);
+    }
     free(text);
     if (!got) {
         // Almost always means the URL is built in JS at runtime.

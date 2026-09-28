@@ -739,7 +739,15 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
         if (open_cancelled()) return OPEN_RC_CANCELLED;   // an aborted fetch is no verdict on the page
         if (found) {
             urlopt_apply(resolved, startUrl, sizeof(startUrl));
-            spec = resolved;   // reopen the manifest, not the page (no second scrape)
+            // Reopen the manifest, not the page (no second scrape) -- unless
+            // the manifest expires (YouTube): then a reconnect resolves again.
+            spec = resolve_reresolve() ? requested : resolved;
+        } else if (resolve_offline()) {
+            // A live page with nothing on: say so, rather than open the page
+            // as media and report a broken source.
+            snprintf(g_status, sizeof(g_status), "not live right now");
+            player_set_error("offline", "This channel isn't broadcasting live right now. Try again later.");
+            return -1;
         } else {
             urlopt_apply(requested, startUrl, sizeof(startUrl));
         }

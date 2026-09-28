@@ -34,26 +34,32 @@ int main(int argc, char **argv) {
     int found = 0;
     CHECK(freetv_load(&o, &m3u, &found, msg, sizeof msg) == 0);
     printf("  %s\n", msg);
-    CHECK(found == 5 && strstr(msg, "could not download: fra"));
+    CHECK(found == 9 && strstr(msg, "could not download: fra"));   // 5 listed + 4 official Tunisian
 
     int added = 0;
     free(httpd_channels_add_playlist(m3u, &added, &jl));
-    CHECK(added == 5 && httpd_chan_count() == 6);
+    CHECK(added == 9 && httpd_chan_count() == 10);
     char name[96], url[1024], grp[64];
     CHECK(httpd_chan_get(0, name, sizeof name, url, sizeof url) && !strcmp(name, "My Channel"));   // kept
     httpd_chan_get(1, name, sizeof name, NULL, 0);
     httpd_chan_group(1, grp, sizeof grp);
-    CHECK(!strcmp(name, "El Watania 1") && !strcmp(grp, "Tunisia"));
+    CHECK(!strcmp(name, "Attessia TV") && !strcmp(grp, "Tunisia"));   // official ones sort in with the rest
+    CHECK(httpd_chan_get(3, name, sizeof name, url, sizeof url) && !strcmp(name, "Hannibal TV") &&
+          strstr(url, "youtube.com/channel/UCMowjs_MJ-oIWEeHUu3DrOQ/live"));
     httpd_chan_rail_name(3, grp, sizeof grp);                 // All, Favourites, Mine, Tunisia, ...
     CHECK(!strcmp(grp, "Tunisia"));
 
     free(httpd_channels_add_playlist(m3u, &added, &jl));       // again: nothing new
-    CHECK(added == 0 && httpd_chan_count() == 6);
+    CHECK(added == 0 && httpd_chan_count() == 10);
     free(m3u);
 
-    // Nothing reachable: a clear error.
+    // Directory unreachable: the official channels still come, and it says so;
+    // with no "first" country there is nothing, and a clear error.
     snprintf(base, sizeof base, "%s/nowhere/", argv[1]);
     freetv_set_base(base);
+    CHECK(freetv_load(&o, &m3u, &found, msg, sizeof msg) == 0 && found == 4 && strstr(msg, "Could not reach"));
+    free(m3u);
+    freetv_opts_parse("lang=eng;first=", &o);
     CHECK(freetv_load(&o, &m3u, &found, msg, sizeof msg) == -1 && strstr(msg, "Could not reach"));
     printf("freetv ok\n");
     return 0;

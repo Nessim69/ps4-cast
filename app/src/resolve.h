@@ -23,5 +23,11 @@ int resolve_page(const char *pageUrl, char *out, int cap);
 
 // Short human-readable note about the last attempt, for /status.
 const char *resolve_debug(void);
+// After a failed resolve_page: 1 if the page was a live page (a YouTube
+// channel's /live) with nothing live on it right now.
+int resolve_offline(void);
+// After a successful one: 1 if the manifest expires (YouTube), so a later
+// reopen must resolve the page again rather than reuse the manifest.
+int resolve_reresolve(void);
 
 #endif

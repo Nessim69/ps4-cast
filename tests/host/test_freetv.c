@@ -125,6 +125,28 @@ int main(void) {
     free(m);
     freetv_free(b);
 
+    // Official sources for Tunisia join its bouquet (Nessma twice: site, then
+    // YouTube as "(2)"), and only when Tunisia is one of the "first".
+    freetv_opts_default(&o);
+    b = freetv_new(&o);
+    freetv_add(b, TN, 1);
+    freetv_add_official(b);
+    m = freetv_m3u(b, &n);
+    memset(&g, 0, sizeof g);
+    m3u_parse(m, 1024, collect, &g);
+    CHECK(g.n == 6);
+    CHECK(!strcmp(g.line[0], "Tunisia|Attessia TV|AttessiaTV.tn@SD|https://www.youtube.com/channel/UCQS3ejF2jBAhwmbGD9Q3oeA/live"));
+    CHECK(!strcmp(g.line[2], "Tunisia|Hannibal TV|HannibalTV.tn@SD|https://www.youtube.com/channel/UCMowjs_MJ-oIWEeHUu3DrOQ/live"));
+    CHECK(!strcmp(g.line[5], "Tunisia|Nessma (2)|NessmaElJadida.tn@SD|https://www.youtube.com/channel/UC-48PCT3flS86JkLzxlTA9g/live"));
+    CHECK(!strcmp(g.line[4], "Tunisia|Nessma|NessmaElJadida.tn@SD|https://live.nessma.tv/"));
+    free(m);
+    freetv_free(b);
+    freetv_opts_parse("first=MA", &o);
+    b = freetv_new(&o);
+    freetv_add_official(b);
+    CHECK(freetv_count(b) == 0);
+    freetv_free(b);
+
     // Everything, English only: news and the rest come in, adult still out.
     freetv_opts_parse("lang=eng;cat=all;first=", &o);
     b = freetv_new(&o);

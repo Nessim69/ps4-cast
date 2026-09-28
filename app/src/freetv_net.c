@@ -67,7 +67,9 @@ int freetv_load(const FreeTvOpts *o, char **m3u, int *count, char *msg, int msgC
             snprintf(missed + k, sizeof(missed) - k, "%s%s", k ? ", " : "", whole ? o->first[i - o->nLangs] : o->langs[i]);
         }
     }
-    if (!got) {
+    // The broadcasters' own sources don't depend on the directory.
+    freetv_add_official(b);
+    if (freetv_count(b) == 0) {
         freetv_free(b);
         snprintf(msg, (size_t)msgCap, "Could not reach the iptv-org channel directory");
         return -1;
@@ -75,7 +77,8 @@ int freetv_load(const FreeTvOpts *o, char **m3u, int *count, char *msg, int msgC
     *m3u = freetv_m3u(b, count);
     freetv_free(b);
     if (!*m3u) { snprintf(msg, (size_t)msgCap, "Out of memory"); return -1; }
-    if (failed) snprintf(msg, (size_t)msgCap, "%d channels found (could not download: %s)", *count, missed);
+    if (!got) snprintf(msg, (size_t)msgCap, "Could not reach the iptv-org channel directory; %d official channels found", *count);
+    else if (failed) snprintf(msg, (size_t)msgCap, "%d channels found (could not download: %s)", *count, missed);
     else snprintf(msg, (size_t)msgCap, "%d channels found", *count);
     return 0;
 }
