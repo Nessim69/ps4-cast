@@ -134,11 +134,20 @@ int main(void) {
     m = freetv_m3u(b, &n);
     memset(&g, 0, sizeof g);
     m3u_parse(m, 1024, collect, &g);
-    CHECK(g.n == 6);
-    CHECK(!strcmp(g.line[0], "Tunisia|Attessia TV|AttessiaTV.tn@SD|https://www.youtube.com/channel/UCQS3ejF2jBAhwmbGD9Q3oeA/live"));
-    CHECK(!strcmp(g.line[2], "Tunisia|Hannibal TV|HannibalTV.tn@SD|https://www.youtube.com/channel/UCMowjs_MJ-oIWEeHUu3DrOQ/live"));
-    CHECK(!strcmp(g.line[5], "Tunisia|Nessma (2)|NessmaElJadida.tn@SD|https://www.youtube.com/channel/UC-48PCT3flS86JkLzxlTA9g/live"));
-    CHECK(!strcmp(g.line[4], "Tunisia|Nessma|NessmaElJadida.tn@SD|https://live.nessma.tv/"));
+    CHECK(g.n == 9);
+    const char *tn[] = {
+        "Tunisia|Attessia TV|AttessiaTV.tn@SD|https://www.youtube.com/channel/UCQS3ejF2jBAhwmbGD9Q3oeA/live",
+        "Tunisia|Carthage+|CarthagePlus.tn@SD|http://www.carthageplus.live/",
+        "Tunisia|Carthage+ (2)|CarthagePlus.tn@SD|http://carthageplus.tv/",
+        "Tunisia|El Watania 1|ElWatania1.tn@SD|https://s/watania1.m3u8",
+        "Tunisia|Elhiwar Ettounsi|ElhiwarEttounsiTV.tn@SD|https://www.youtube.com/channel/UCXzmMkXaHxMVlutDBD8goHA/live",
+        "Tunisia|Hannibal TV|HannibalTV.tn@SD|https://www.youtube.com/channel/UCMowjs_MJ-oIWEeHUu3DrOQ/live",
+        "Tunisia|Jawhara TV [Not 24/7]|JawharaTV.tn@SD|https://s/jawhara.m3u8",
+        "Tunisia|Nessma|NessmaElJadida.tn@SD|https://live.nessma.tv/",
+        "Tunisia|Nessma (2)|NessmaElJadida.tn@SD|https://www.youtube.com/channel/UC-48PCT3flS86JkLzxlTA9g/live",
+    };
+    for (int i = 0; i < 9 && i < g.n; i++)
+        if (strcmp(g.line[i], tn[i]) != 0) { failures++; printf("FAIL tn row %d\n  got  %s\n  want %s\n", i, g.line[i], tn[i]); }
     free(m);
     freetv_free(b);
     freetv_opts_parse("first=MA", &o);

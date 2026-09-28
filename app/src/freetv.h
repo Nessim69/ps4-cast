@@ -38,7 +38,8 @@ FreeTv *freetv_new(const FreeTvOpts *o);
 void    freetv_add(FreeTv *b, const char *m3uText, int whole);
 // Channels the directory has no stream for but whose broadcaster streams
 // them free on its own site or official YouTube channel, for the "first"
-// countries (Tunisia: Hannibal TV, Nessma, Attessia TV). Their URLs are
+// countries (Tunisia: Hannibal TV, Nessma, Attessia TV, Elhiwar Ettounsi,
+// Carthage+). Their URLs are
 // pages the player resolves when tuned (resolve.c), so they follow whatever
 // the broadcaster is streaming now.
 void    freetv_add_official(FreeTv *b);

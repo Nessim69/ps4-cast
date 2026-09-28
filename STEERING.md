@@ -658,10 +658,14 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
   stream for but whose broadcaster streams them free. Tunisia: Hannibal TV
   (official YouTube channel UCMowjs_MJ-oIWEeHUu3DrOQ), Nessma (live.nessma.tv,
   then YouTube UC-48PCT3flS86JkLzxlTA9g as "Nessma (2)"), Attessia TV (YouTube
-  UCQS3ejF2jBAhwmbGD9Q3oeA). Stored as page URLs and resolved when tuned, so
+  UCQS3ejF2jBAhwmbGD9Q3oeA), Elhiwar Ettounsi (official YouTube
+  UCXzmMkXaHxMVlutDBD8goHA; its own live platform H+/hplus.tv needs an account),
+  Carthage+ (its sites www.carthageplus.live, then carthageplus.tv as "(2)":
+  several YouTube channels carry the name, so none is hard-coded; a site that
+  embeds one is followed). Stored as page URLs and resolved when tuned, so
   they follow whatever is live; added even if iptv-org can't be reached.
   None of these could be opened from the development sandbox (its network
-  policy blocks youtube.com and nessma.tv): unverified on a console.
+  policy blocks youtube.com, nessma.tv and the others): unverified on a console.
 - resolve.c YouTube: youtube.com / m.youtube.com / youtu.be pages are fetched
   as a desktop browser with `Cookie: SOCS=CAI` (consent answered) and the
   embedded `"hlsManifestUrl"` is used (as streamlink does). No manifest =

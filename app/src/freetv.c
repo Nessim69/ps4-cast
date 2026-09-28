@@ -261,7 +261,17 @@ static const struct { const char *cc, *m3u; } OFFICIAL[] = {
       "#EXTINF:-1 tvg-id=\"NessmaElJadida.tn@SD\" tvg-logo=\"https://i.imgur.com/66CJtdz.png\" group-title=\"General\",Nessma\n"
       "https://www.youtube.com/channel/UC-48PCT3flS86JkLzxlTA9g/live\n"
       "#EXTINF:-1 tvg-id=\"AttessiaTV.tn@SD\" tvg-logo=\"https://i.imgur.com/kmfRNVy.png\" group-title=\"General\",Attessia TV\n"
-      "https://www.youtube.com/channel/UCQS3ejF2jBAhwmbGD9Q3oeA/live\n" },
+      "https://www.youtube.com/channel/UCQS3ejF2jBAhwmbGD9Q3oeA/live\n"
+      // Elhiwar Ettounsi: its official YouTube channel (its own live platform,
+      // H+ at hplus.tv, needs an account and a browser, so it is not used).
+      "#EXTINF:-1 tvg-id=\"ElhiwarEttounsiTV.tn@SD\" tvg-logo=\"https://i.imgur.com/qYG1qLO.png\" group-title=\"General\",Elhiwar Ettounsi\n"
+      "https://www.youtube.com/channel/UCXzmMkXaHxMVlutDBD8goHA/live\n"
+      // Carthage+: its two official sites (several YouTube channels carry
+      // the name; a site that embeds the right one is followed to it).
+      "#EXTINF:-1 tvg-id=\"CarthagePlus.tn@SD\" tvg-logo=\"https://i.imgur.com/5BsDW4B.png\" group-title=\"General\",Carthage+\n"
+      "http://www.carthageplus.live/\n"
+      "#EXTINF:-1 tvg-id=\"CarthagePlus.tn@SD\" tvg-logo=\"https://i.imgur.com/5BsDW4B.png\" group-title=\"General\",Carthage+\n"
+      "http://carthageplus.tv/\n" },
 };
 
 void freetv_add_official(FreeTv *b) {

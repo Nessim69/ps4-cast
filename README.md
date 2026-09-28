@@ -63,9 +63,10 @@ The build output is **`dist/PS4-Cast-v<version>.pkg`**. Two ways to install:
    channels from the [iptv-org](https://github.com/iptv-org/iptv) directory:
    by default all of Tunisia's plus the Arabic, English and French
    documentary and cartoon channels, in one bouquet per country with Tunisia
-   first. Tunisia also gets Hannibal TV, Nessma and Attessia TV from the
-   broadcasters' own free streams (their site or official YouTube channel,
-   played while they are live). The web UI can pick other languages, kinds of channel, the country
+   first. Tunisia also gets Hannibal TV, Nessma, Attessia TV, Elhiwar Ettounsi
+   and Carthage+ from the broadcasters' own free streams (their site or
+   official YouTube channel, played while they are live). The web UI can pick
+   other languages, kinds of channel, the country
    on top, and bouquets per kind instead. They are added to your list (nothing
    is removed); some streams are geo-blocked or only on at times.
 7. During IPTV playback, **Down** opens the channel guide, **L1/R1** changes
