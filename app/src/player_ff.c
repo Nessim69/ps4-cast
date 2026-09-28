@@ -19,6 +19,7 @@
 #include "watchdog.h"
 #include "lang.h"
 #include "audiotrack.h"
+#include "subtitle.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -448,6 +449,7 @@ int player_init(void) {
         if (pma) scePthreadMutexattrDestroy(&ma);
     }
     aseg_set_cancel_check(open_cancelled);
+    sub_init();
     return 0;
 }
 
@@ -518,6 +520,7 @@ static void player_teardown(void) {
     if (g_bsf)   { av_bsf_free(&g_bsf); g_bsf = NULL; }
     if (g_hwPkt) { av_packet_free(&g_hwPkt); }
     g_useHw = 0; g_hwReorder = 0;
+    sub_stream_closed();   // decode threads are joined: drop tracks, routing and the bitmap decoder
     if (g_fmt)   { avformat_close_input(&g_fmt); }
     if (g_avio)  { av_freep(&g_avio->buffer); avio_context_free(&g_avio); }
     present_pool_stop();                 // join present workers before freeing buffers
@@ -812,9 +815,11 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
     g_pos = 0;
     // Re-apply a target carried across an fMP4 scrub's reopen. Must run BEFORE
     // the demuxer opens so it reads init + the target segment, not the file start.
+    double hlsResumedAt = 0;          // where a reopen actually landed (subtitle timeline)
     if (g_isHls && resumeSec >= 0) {
         double actual = 0;
         int src = hls_seek_clamped(resumeSec, &actual);
+        if (src == 0) hlsResumedAt = actual;
         trace_mark("seek hls resume target=%.3f rc=%d actual=%.3f", resumeSec, src, actual);
     }
 
@@ -959,6 +964,11 @@ static int play_open(const char *url, int requestedHeadstart, double resumeSec) 
     }
 
     build_audio_tracks();
+    {   // Subtitle tracks. External files are timed from the media start: the
+        // demuxer's start, minus the part of an HLS timeline a reopen skipped.
+        int64_t st0 = g_fmt->start_time != AV_NOPTS_VALUE ? g_fmt->start_time : 0;
+        sub_stream_opened(g_fmt, g_isHls, g_playSpec, st0 - (int64_t)(hlsResumedAt * 1000000.0));
+    }
 
     // Hardware H.264 fast path: decode on the GPU silicon (CPU stays free for
     // networking/scaling). Set up a mp4->annexb bitstream filter and bring up the
@@ -1599,6 +1609,7 @@ static void apply_seek(void) {
         }
         trace_mark("seek applied target=%.3f actual=%.3f hls=%d audio=reanchor-next-pts",
                    sec, actual, g_isHls);
+        sub_seek();
         g_sepAudioEof = 0;
         g_gotFrame = 0;          // re-anchor the pacing clock on the next frame
         if (g_threaded) {
@@ -1815,6 +1826,7 @@ static int paint_scaled(Gfx *g) {
     int ox = (dw - g_scaledW) / 2, oy = (dh - g_scaledH) / 2;
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
     clear_bars_gated(g, ox, oy, g_scaledW, g_scaledH);
+    sub_set_video_rect(ox, oy, g_scaledW, g_scaledH);
     // sws already produced BGRA (memory B,G,R,A == framebuffer byte order with A
     // in the top byte). The framebuffer wants the top byte = 0x80, so just force
     // it: one mask+or per pixel instead of byte-by-byte shuffling.
@@ -2447,8 +2459,10 @@ static int paint_nv12(Gfx *g) {
     if (sw <= 0 || sh <= 0) return -1;
     int scaledW = dw, scaledH = (int)((int64_t)dw * sh / sw);
     if (scaledH > dh) { scaledH = dh; scaledW = (int)((int64_t)dh * sw / sh); }
-    if (scaledW < 1) scaledW = 1; if (scaledH < 1) scaledH = 1;
+    if (scaledW < 1) scaledW = 1;
+    if (scaledH < 1) scaledH = 1;
     int ox = (dw - scaledW) / 2, oy = (dh - scaledH) / 2;
+    sub_set_video_rect(ox, oy, scaledW, scaledH);
 
     uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
     // Clear ONLY the letterbox/pillarbox border (area outside the video rect),
@@ -2546,6 +2560,7 @@ static void *decode_thread_main(void *arg) {
             continue;
         }
         if (g_paused)      { sceKernelUsleep(8000); continue; }
+        sub_apply_pending(g_fmt);        // a subtitle track change from the UI
 
         if (g_isHls && hls_take_variant_switch()) {
             // fMP4 quality change: reopen at the current position with the new
@@ -2588,6 +2603,11 @@ static void *decode_thread_main(void *arg) {
 
         g_pkts++;
         int sidx = g_pkt->stream_index;
+        if (sidx == sub_stream_index(g_fmt, 0)) {
+            sub_packet(g_fmt, g_pkt);
+            av_packet_unref(g_pkt);
+            continue;
+        }
         if (g_haveAudio && sidx == g_astream) {
             g_audioPkts++;
             decode_audio_pkt();
@@ -2870,12 +2890,19 @@ static void *decode_segment_thread_main(void *arg) {
         AVRational vtb = (sv >= 0) ? sfmt->streams[sv]->time_base : (AVRational){1, 90000};
         AVRational atb = (sa >= 0) ? sfmt->streams[sa]->time_base : (AVRational){1, 90000};
         int segPkts = 0, segVideo = 0, segAudio = 0;
+        sub_apply_pending(NULL);                        // this demuxer is per segment: route by PID
+        int ss = sub_stream_index(sfmt, 1);
 
         while (!g_decStop && !g_seekPending) {
             rc = av_read_frame(sfmt, g_pkt);
             if (rc < 0) break;
             g_pkts++;
             segPkts++;
+            if (ss >= 0 && g_pkt->stream_index == ss) {
+                sub_packet(sfmt, g_pkt);
+                av_packet_unref(g_pkt);
+                continue;
+            }
             if (sa >= 0 && g_haveAudio && g_pkt->stream_index == sa) {
                 g_audioPkts++; segAudio++;
                 decode_audio_frame(g_pkt, atb);
@@ -3021,6 +3048,7 @@ static int render_threaded(Gfx *g) {
             snprintf(g_status, sizeof(g_status), "playing %dx%d", show->width, show->height);
         }
         g_curSec = showPts / 1000000.0;
+        sub_set_clock(showPts);
         g_lastLagUs = clock - showPts;   // >0 = presented frame is behind the clock
         g_shownGen++;
         if (g_useHw) {
@@ -3091,6 +3119,8 @@ int player_render(Gfx *g) {
         }
         g_pkts++;
         int sidx = g_pkt->stream_index;
+        sub_apply_pending(g_fmt);
+        if (sidx == sub_stream_index(g_fmt, 0)) { sub_packet(g_fmt, g_pkt); av_packet_unref(g_pkt); continue; }
         if (g_haveAudio && sidx == g_astream) { g_audioPkts++; decode_audio_pkt(); av_packet_unref(g_pkt); continue; }
         if (sidx != g_vstream) { av_packet_unref(g_pkt); continue; }
         g_videoPkts++;
@@ -3110,6 +3140,7 @@ int player_render(Gfx *g) {
         int64_t ptsUs = (pts == AV_NOPTS_VALUE) ? 0
                         : (int64_t)(pts * av_q2d(tb) * 1000000.0);
         g_curSec = ptsUs / 1000000.0;
+        sub_set_clock(ptsUs);
 
         int useAudio = (g_haveAudio && audio_ok() && audio_has_clock() && !(g_sepAudioMode && g_sepAudioEof));
         if (!g_gotFrame) {

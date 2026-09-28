@@ -59,7 +59,10 @@ The build output is **`dist/PS4-Cast-v<version>.pkg`**. Two ways to install:
    L1/R1 seek instead. Cross pauses, Circle stops and Triangle exits. When a
    video has several audio tracks (languages, commentary), R3 switches between
    them; the web UI's Now Playing card has a picker, and Settings sets a
-   preferred audio language.
+   preferred audio language. Subtitles work the same way (L3 on the TV):
+   embedded tracks, HLS subtitles, or an SRT/VTT file you load from the Now
+   Playing card. Bitmap subtitles (Blu-ray PGS, DVB, DVD) need FFmpeg rebuilt
+   with `portlibs/build-ffmpeg-616.sh`.
 
 ### Cast directly from Chrome
 

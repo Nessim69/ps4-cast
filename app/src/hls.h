@@ -63,6 +63,13 @@ void hls_set_audio_pref(const char *name, const char *lang);
 int  hls_audio_read(uint8_t *buf, uint32_t len);   // >0 bytes, 0 = end
 void hls_audio_abort(void);                          // unblock a stuck fetch (Stop/cast)
 
+// WebVTT subtitle renditions (EXT-X-MEDIA TYPE=SUBTITLES with a URI) offered
+// for the playing variant's SUBTITLES group; uri is the resolved media
+// playlist. Filled by hls_open from the master playlist.
+#define HLS_MAX_SUB_RENDITIONS 16
+typedef struct { char name[64]; char lang[16]; char uri[2048]; int isDefault, forced; } HlsSubRendition;
+int  hls_subtitle_renditions(HlsSubRendition *out, int max);
+
 // Request a one-step bitrate downshift (ABR), applied at the next segment
 // boundary. No-op for media (non-master) playlists or when already lowest.
 void hls_request_downshift(void);

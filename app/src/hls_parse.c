@@ -445,6 +445,10 @@ int hlspl_collect_variants(HlsPlaylist *pl, const char *body, const char *base) 
         const char *ap = strstr(p, "AUDIO=\"");
         if (ap && ap < eol) { const char *as = ap + 7; const char *ae = strchr(as, '"');
             int al = ae ? (int)(ae - as) : 0; if (al > 0 && al < (int)sizeof(agroup)) { memcpy(agroup, as, (size_t)al); agroup[al] = '\0'; } }
+        char sgroup[64] = "";
+        const char *sp = strstr(p, "SUBTITLES=\"");
+        if (sp && sp < eol) { const char *ss = sp + 11; const char *se = strchr(ss, '"');
+            int sl = se ? (int)(se - ss) : 0; if (sl > 0 && sl < (int)sizeof(sgroup)) { memcpy(sgroup, ss, (size_t)sl); sgroup[sl] = '\0'; } }
         const char *nl = eol;
         while (nl) {
             const char *ls = nl + 1; const char *le = strchr(ls, '\n');
@@ -460,6 +464,7 @@ int hlspl_collect_variants(HlsPlaylist *pl, const char *body, const char *base) 
                 pl->variants[pl->variantCount].codec = codec;
                 strncpy(pl->variants[pl->variantCount].agroup, agroup, sizeof(pl->variants[0].agroup) - 1);
                 pl->variants[pl->variantCount].agroup[sizeof(pl->variants[0].agroup) - 1] = '\0';
+                snprintf(pl->variants[pl->variantCount].sgroup, sizeof(pl->variants[0].sgroup), "%s", sgroup);
                 pl->variantCount++;
                 break;
             }

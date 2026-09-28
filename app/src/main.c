@@ -23,6 +23,7 @@
 #include "notify.h"
 #include "audio.h"
 #include "watchdog.h"
+#include "subtitle.h"
 #endif
 
 #ifndef BOOT_MINIMAL
@@ -659,7 +660,19 @@ static void draw_hud(Gfx *g, PlaybackOrigin origin) {
     gfx_circle(g, barX + 6, barY - 32, 6, paused ? WARN : LIVE);
     stext(g, barX + 24, barY - 44, state, 3, paused ? WARN : TXT);
 
-    // Audio track (only when there is a choice): R3 steps through them.
+    // Audio track (only when there is a choice): R3 steps through them;
+    // subtitles (when there are any): L3. Right-aligned, stacked.
+    int hintY = barY - 44;
+    SubTrack stt[SUB_MAX_TRACKS];
+    int scur = -1, sn = sub_tracks(stt, SUB_MAX_TRACKS, &scur);
+    if (sn > 0) {
+        const char *lab = "Off";
+        for (int i = 0; i < sn; i++) if (stt[i].id == scur) lab = stt[i].label;
+        char sl[110];
+        snprintf(sl, sizeof(sl), "L3  Subtitles: %.64s", lab);
+        stext(g, barX + barW - gfx_text_w(sl, 3), hintY, sl, 3, MUT);
+        hintY -= 40;
+    }
     PlayerAudioTrack at[PLAYER_MAX_AUDIO];
     int acur = -1, an = player_audio_tracks(at, PLAYER_MAX_AUDIO, &acur);
     if (an >= 2) {
@@ -668,7 +681,7 @@ static void draw_hud(Gfx *g, PlaybackOrigin origin) {
         char aud[120];
         if (k >= 0) snprintf(aud, sizeof(aud), "R3  Audio: %.60s  %d/%d", at[k].label, k + 1, an);
         else snprintf(aud, sizeof(aud), "R3  Audio: %d tracks", an);
-        stext(g, barX + barW - gfx_text_w(aud, 3), barY - 44, aud, 3, MUT);
+        stext(g, barX + barW - gfx_text_w(aud, 3), hintY, aud, 3, MUT);
     }
 
     if (dur > 0) {
@@ -1289,6 +1302,20 @@ int main(void) {
                 guideOpen = 0;
                 everDrew = 0; reconnecting = 0; reconnects = 0;
             }
+            if (pressed & ORBIS_PAD_BUTTON_L3) {
+                // Subtitles: off -> each track -> off.
+                SubTrack st[SUB_MAX_TRACKS];
+                int scur = -1, sn = sub_tracks(st, SUB_MAX_TRACKS, &scur);
+                if (sn > 0) {
+                    int k = -1;
+                    for (int i = 0; i < sn; i++) if (st[i].id == scur) k = i;
+                    k++;                                   // -1 (off) -> 0 -> ... -> sn (off)
+                    if (k >= sn) { sub_select(-1); notify("Subtitles off"); }
+                    else if (sub_select(st[k].id) == 0) notify("Subtitles: %s", st[k].label);
+                } else {
+                    notify("No subtitles for this video (add a file from the web controls)");
+                }
+            }
             if (pressed & ORBIS_PAD_BUTTON_R3) {
                 // Next audio track (the switch reopens at this position).
                 PlayerAudioTrack at[PLAYER_MAX_AUDIO];
@@ -1451,6 +1478,10 @@ int main(void) {
             int drew = player_render(&g);   // always pump frames while started
             drewVideo = drew;
             if (drew) {
+                // Subtitles go on the picture itself (a frame that draws
+                // nothing keeps the old one), under every overlay below.
+                // Lifted above the HUD while it is up (title + scrubber).
+                sub_draw(&g, (player_is_paused() || now < hudUntil || g_scrubActive) ? 190 : 0);
                 everDrew = 1;
                 unsigned shown = player_present_generation();
                 if (shown != fpsSeenGen) { fpsCount++; fpsSeenGen = shown; }

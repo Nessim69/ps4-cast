@@ -65,8 +65,8 @@ make distclean >/dev/null 2>&1 || true
   --enable-avcodec \
   --enable-swscale \
   --enable-swresample \
-  --enable-decoder=h264,hevc,mpeg4,mpeg2video,mpeg1video,msmpeg4v1,msmpeg4v2,msmpeg4v3,wmv1,wmv2,vc1,h263,vp8,vp9,aac,aac_latm,mp3,ac3,eac3,opus,vorbis,flac,pcm_s16le,pcm_s16be,mjpeg \
-  --enable-parser=h264,hevc,mpeg4video,mpegvideo,aac,aac_latm,mpegaudio,vp8,vp9,opus,vc1,h263 \
+  --enable-decoder=h264,hevc,mpeg4,mpeg2video,mpeg1video,msmpeg4v1,msmpeg4v2,msmpeg4v3,wmv1,wmv2,vc1,h263,vp8,vp9,aac,aac_latm,mp3,ac3,eac3,opus,vorbis,flac,pcm_s16le,pcm_s16be,mjpeg,pgssub,dvbsub,dvdsub \
+  --enable-parser=h264,hevc,mpeg4video,mpegvideo,aac,aac_latm,mpegaudio,vp8,vp9,opus,vc1,h263,dvbsub,dvdsub \
   --enable-demuxer=mov,matroska,mpegts,mpegps,mpegvideo,mp3,flac,wav,flv,hls,aac,ogg,avi,asf,m4v \
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,aac_adtstoasc
 

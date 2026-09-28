@@ -66,6 +66,12 @@ void gfx_arc(Gfx *g, int cx, int cy, int r, int thick, int quad, GfxColor c);  /
 int  gfx_text_tr(Gfx *g, int x, int y, const char *s, int scale, GfxColor c, int track);
 int  gfx_text_tr_w(const char *s, int scale, int track);
 
+// ARGB image (alpha in the top byte) scaled into the w x h rectangle at x,y
+// and blended. `id` must change whenever the pixels behind `argb` do (it is
+// part of the frame's reuse tag), and `argb` must stay valid until the next
+// gfx_present -- drawing is queued until then.
+void gfx_image(Gfx *g, int x, int y, int w, int h, const uint32_t *argb, int sw, int sh, uint32_t id);
+
 // Text using the embedded 8x8 font. `scale` enlarges each glyph pixel into a
 // scale*scale block. Returns the x advance in pixels.
 int  gfx_text(Gfx *g, int x, int y, const char *s, int scale, GfxColor c);

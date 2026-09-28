@@ -960,6 +960,49 @@ static int attr_quoted(const char *line, const char *key, char *out, int cap) {
     return 1;
 }
 
+// Subtitle renditions of the playing variant (hls_subtitle_renditions).
+static HlsSubRendition g_srends[HLS_MAX_SUB_RENDITIONS];
+static int             g_srendN;
+
+int hls_subtitle_renditions(HlsSubRendition *out, int max) {
+    int n = g_srendN < max ? g_srendN : max;
+    if (out && n > 0) memcpy(out, g_srends, sizeof(HlsSubRendition) * (size_t)n);
+    return n;
+}
+
+// Record the master's TYPE=SUBTITLES renditions in `group` (all of them if
+// the variant names none, or none match).
+static void collect_subtitles(const char *body, const char *base, const char *group) {
+    g_srendN = 0;
+    int groupSeen = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        g_srendN = 0;
+        const char *p = body;
+        while ((p = strstr(p, "#EXT-X-MEDIA")) != NULL && g_srendN < HLS_MAX_SUB_RENDITIONS) {
+            const char *eol = strchr(p, '\n'); if (!eol) eol = p + strlen(p);
+            char line[1024];
+            int cl = (int)(eol - p) < (int)sizeof(line) ? (int)(eol - p) : (int)sizeof(line) - 1;
+            memcpy(line, p, (size_t)cl); line[cl] = '\0';
+            p = eol;
+            if (!strstr(line, "TYPE=SUBTITLES")) continue;
+            char uri[2048];
+            if (!attr_quoted(line, "URI=", uri, sizeof(uri))) continue;
+            char gid[64] = ""; attr_quoted(line, "GROUP-ID=", gid, sizeof(gid));
+            int inGroup = group && group[0] && strcmp(gid, group) == 0;
+            if (pass == 0) { groupSeen |= inGroup; continue; }
+            if (groupSeen && !inGroup) continue;
+            HlsSubRendition *r = &g_srends[g_srendN];
+            r->name[0] = r->lang[0] = '\0';
+            attr_quoted(line, "NAME=", r->name, sizeof(r->name));
+            attr_quoted(line, "LANGUAGE=", r->lang, sizeof(r->lang));
+            r->isDefault = strstr(line, "DEFAULT=YES") != NULL;
+            r->forced = strstr(line, "FORCED=YES") != NULL;
+            hlspl_resolve_url(base, uri, r->uri, sizeof(r->uri));
+            g_srendN++;
+        }
+    }
+}
+
 // Audio renditions of the playing variant's group, and the preference the
 // next open applies (hls_set_audio_pref).
 static HlsAudioRendition g_arends[HLS_MAX_AUDIO_RENDITIONS];
@@ -1128,6 +1171,7 @@ int hls_open(const char *url) {
     watchdog_note("open/master");
     trace_mark("hls open gen=%u self=%p %s", g_openGen, (void *)scePthreadSelf(), url);
     g_variantCount = 0; g_curVariant = -1; g_downshiftReq = 0; g_upshiftReq = 0;
+    g_srendN = 0;
     g_fastFetchStreak = 0; g_estBandwidth = 0; g_autoMaxHeight = g_requestedMaxHeight; g_sepAudio = 0;
     g_vLastRc = g_vLastBytes = g_vLastMs = g_vFailCount = 0; g_vLastUrl[0] = '\0';
     g_segFail[0] = '\0'; g_forceAsegSeg = 0;
@@ -1186,6 +1230,7 @@ int hls_open(const char *url) {
         // while we still hold the master body (needs the chosen variant's group).
         watchdog_note("open/audio-rend");
         if (g_sepAudio) setup_audio_rendition(body, url);
+        collect_subtitles(body, url, g_curVariant >= 0 ? g_variants[g_curVariant].sgroup : "");
         free(body);
     } else {
         int prc = hlspl_parse_media(&g_pl, body, url);

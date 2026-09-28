@@ -48,8 +48,8 @@ static inline uint32_t encode(GfxColor c) {
 // stays unknown and is never reused.
 enum { Q_DIRECT, Q_RECORD, Q_REPLAY };
 enum { OP_PIXEL, OP_RECT, OP_BLEND, OP_RECT_A, OP_CIRCLE_A, OP_ROUND_A,
-       OP_VGRAD, OP_TRI, OP_ARC, OP_TEXT };
-typedef struct { int op, text, a[7]; } QCmd;
+       OP_VGRAD, OP_TRI, OP_ARC, OP_TEXT, OP_IMAGE };
+typedef struct { int op, text, a[9]; } QCmd;
 #define Q_CMDS 4096                 // the lobby, QR modules included, is ~600
 #define Q_TEXT (32 * 1024)
 #define Q_TAG_FULL 0x46554c4c53435245ull   // base of a frame that opens with a full-screen fill
@@ -714,6 +714,34 @@ int gfx_text(Gfx *g, int x, int y, const char *s, int scale, GfxColor c) {
     return gfx_text_tr(g, x, y, s, scale, c, default_track(scale));
 }
 
+void gfx_image(Gfx *g, int x, int y, int w, int h, const uint32_t *argb, int sw, int sh, uint32_t id) {
+    uint64_t ptr = (uint64_t)(uintptr_t)argb;
+    int q[] = { x, y, w, h, sw, sh, (int)id, (int)(uint32_t)(ptr >> 32), (int)(uint32_t)ptr };
+    if (q_hook(g, OP_IMAGE, q, 9, NULL)) return;
+    if (!argb || w <= 0 || h <= 0 || sw <= 0 || sh <= 0) return;
+    int W = g->width, H = g->height;
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w > W ? W : x + w, y1 = y + h > H ? H : y + h;
+    if (x0 >= x1 || y0 >= y1) return;
+    uint32_t *fb = (uint32_t *)g->frameBuffers[g->activeIdx];
+    for (int dy = y0; dy < y1; dy++) {
+        const uint32_t *srow = argb + (size_t)((int64_t)(dy - y) * sh / h) * sw;
+        uint32_t *drow = fb + (size_t)dy * W;
+        for (int dx = x0; dx < x1; dx++) {
+            uint32_t sp = srow[(int64_t)(dx - x) * sw / w];
+            int a = (int)(sp >> 24);
+            if (!a) continue;
+            if (a == 255) { drow[dx] = 0x80000000u | (sp & 0xffffffu); continue; }
+            uint32_t e = drow[dx];
+            int ia = 255 - a;
+            uint32_t r = (((sp >> 16) & 0xff) * a + ((e >> 16) & 0xff) * ia) / 255;
+            uint32_t gg = (((sp >> 8) & 0xff) * a + ((e >> 8) & 0xff) * ia) / 255;
+            uint32_t b = ((sp & 0xff) * a + (e & 0xff) * ia) / 255;
+            drow[dx] = 0x80000000u | (r << 16) | (gg << 8) | b;
+        }
+    }
+}
+
 // Draw the queued frame into the target: the video picture first, then every
 // queued call in order through the same primitives, so the pixels match what
 // immediate drawing would have produced.
@@ -737,6 +765,9 @@ static void q_run(Gfx *g) {
         case OP_VGRAD:    gfx_vgrad(g, a[0], a[1], a[2], a[3], q_col(a[4]), q_col(a[5])); break;
         case OP_TRI:      gfx_tri(g, a[0], a[1], a[2], a[3], a[4], a[5], q_col(a[6])); break;
         case OP_ARC:      gfx_arc(g, a[0], a[1], a[2], a[3], a[4], q_col(a[5])); break;
+        case OP_IMAGE:    gfx_image(g, a[0], a[1], a[2], a[3],
+                                    (const uint32_t *)(uintptr_t)((uint64_t)(uint32_t)a[7] << 32 | (uint32_t)a[8]),
+                                    a[4], a[5], (uint32_t)a[6]); break;
         case OP_TEXT:     gfx_text_tr(g, a[0], a[1], s_q[i].text >= 0 ? s_qText + s_q[i].text : NULL,
                                       a[2], q_col(a[3]), a[4]); break;
         }

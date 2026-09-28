@@ -11,7 +11,7 @@
 #define HLS_MAX_VARIANTS 24
 
 enum { VC_H264 = 0, VC_HEVC, VC_VP9, VC_AV1, VC_OTHER };
-typedef struct { int bw, height, fps, codec; char url[2048]; char agroup[64]; } HlsVariant;
+typedef struct { int bw, height, fps, codec; char url[2048]; char agroup[64]; char sgroup[64]; } HlsVariant;
 
 // EXT-X-KEY METHOD=AES-128 (RFC 8216 4.3.2.4): whole-segment AES-128-CBC with
 // PKCS#7 padding, 16-byte key fetched from `uri`.

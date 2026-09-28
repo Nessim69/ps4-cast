@@ -4,6 +4,8 @@
 #include "tls.h"
 #include "web_ui.h"
 #include "player.h"
+#include "subtitle.h"
+#include "subs.h"
 #include "goldhen.h"
 #include "ssdp.h"
 #include "pad_diag.h"
@@ -13,6 +15,7 @@
 #include "pairing.h"
 
 #include <string.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -264,9 +267,9 @@ static void cfg_save(void) {
     char line[160];
     // avsync is user-tuned for their TV/soundbar; losing it on every relaunch
     // (while channels/recent/resume persisted) was an inconsistency.
-    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\npair=%d\ntlsverify=%d\nalang=%s\n",
+    int n = snprintf(line, sizeof(line), "debug=%d\navsync=%d\npair=%d\ntlsverify=%d\nalang=%s\nslang=%s\n",
                      notify_get_debug(), player_get_avsync(), g_cfgPair, tls_verify_enabled(),
-                     player_audio_lang());
+                     player_audio_lang(), sub_lang());
     sceKernelWrite(fd, line, n);
     sceKernelClose(fd);
 }
@@ -293,6 +296,14 @@ static void cfg_load(void) {
         for (al += 6; al[k] && al[k] != '\n' && k < (int)sizeof(lang) - 1; k++) lang[k] = al[k];
         lang[k] = '\0';
         player_set_audio_lang(lang);
+    }
+    const char *sl = strstr(buf, "slang=");
+    if (sl) {
+        char lang[16];
+        int k = 0;
+        for (sl += 6; sl[k] && sl[k] != '\n' && k < (int)sizeof(lang) - 1; k++) lang[k] = sl[k];
+        lang[k] = '\0';
+        sub_set_lang(lang);
     }
 }
 
@@ -1326,6 +1337,49 @@ static void upload_name_load(char *out, int cap) {
     if (!out[0]) snprintf(out, cap, "Uploaded video");
 }
 
+// POST /subtitle/text[?name=file.srt]: an SRT/WebVTT file from the web UI.
+// Its body can exceed the 8 KB request buffer, so it is read here in full
+// (subtitle files are small; 4 MB cap) before being parsed.
+static void handle_subtitle_upload(OrbisNetId c, const char *target, const char *req, int n,
+                                   const char *hdrend, int64_t contentLen) {
+    if (contentLen <= 0 || contentLen > 4 * 1024 * 1024) {
+        send_response(c, "413 Payload Too Large", "text/plain", "subtitle file too large", 23);
+        return;
+    }
+    if (!player_started()) { send_response(c, "409 Conflict", "text/plain", "nothing is playing", 18); return; }
+    char *buf = malloc((size_t)contentLen + 1);
+    if (!buf) { send_response(c, "503 Service Unavailable", "text/plain", "out of memory", 13); return; }
+    int have = n - (int)((hdrend + 4) - req);
+    if (have > contentLen) have = (int)contentLen;
+    if (have > 0) memcpy(buf, hdrend + 4, (size_t)have);
+    while (have < contentLen) {
+        int r = sceNetRecv(c, buf + have, (size_t)(contentLen - have), 0);
+        if (r <= 0) break;
+        have += r;
+    }
+    buf[have] = '\0';
+    char name[64] = "";
+    const char *q = strstr(target, "name=");
+    if (q) {
+        q += 5;
+        int k = 0;
+        for (int i = 0; q[i] && q[i] != '&' && k < (int)sizeof(name) - 1; i++) {
+            unsigned char ch = (unsigned char)q[i];
+            if (ch == '%' && isxdigit((unsigned char)q[i + 1]) && isxdigit((unsigned char)q[i + 2])) {
+                char hx[3] = { q[i + 1], q[i + 2], 0 };
+                ch = (unsigned char)strtol(hx, NULL, 16);
+                i += 2;
+            } else if (ch == '+') ch = ' ';
+            if (ch >= 0x20 && ch != 0x7f && ch != '"' && ch != '\\') name[k++] = (char)ch;
+        }
+        name[k] = '\0';
+    }
+    int rc = (have == contentLen) ? sub_load_text(buf, name) : -1;
+    free(buf);
+    if (rc == 0) send_response(c, "200 OK", "text/plain", "loaded", 6);
+    else send_response(c, "415 Unsupported Media Type", "text/plain", "not an SRT or WebVTT file", 25);
+}
+
 // A multi-GB /upload used to run inline on server_main's single worker
 // thread, blocking /stop, /status and every DLNA action for the whole
 // transfer. handle_local_upload now only validates the request and (on
@@ -1558,6 +1612,10 @@ static void handle_client(OrbisNetId c) {
         handle_local_upload(c, req, n, hdrend, contentLen);
         return;
     }
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/subtitle/text") == 0) {
+        handle_subtitle_upload(c, target, req, n, hdrend, contentLen);
+        return;
+    }
 
     {
         int clen = contentLen > INT32_MAX ? INT32_MAX : (int)contentLen;
@@ -1716,6 +1774,20 @@ static void handle_client(OrbisNetId c) {
             }
             JAPP("]");
         }
+        {   // Subtitle tracks (listed whenever there is at least one).
+            SubTrack st[SUB_MAX_TRACKS];
+            int scur = -1, sn = sub_tracks(st, SUB_MAX_TRACKS, &scur);
+            JAPP(",\"sub_cur\":%d,\"slang\":", scur);
+            json_str(json, cap, &o, sub_lang(), 15);
+            JAPP(",\"sub_status\":"); json_str(json, cap, &o, sub_status(), 127);
+            JAPP(",\"sub_tracks\":[");
+            for (int i = 0; i < sn; i++) {
+                JAPP("%s{\"id\":%d,\"label\":", i ? "," : "", st[i].id);
+                json_str(json, cap, &o, st[i].label, 71);
+                JAPP("}");
+            }
+            JAPP("]");
+        }
         JAPP("}");
 #undef JAPP
         json[o] = '\0';
@@ -1779,6 +1851,41 @@ static void handle_client(OrbisNetId c) {
     if (strcmp(method, "POST") == 0 && strcmp(path, "/audio") == 0) {
         if (player_select_audio(atoi(body)) == 0) send_response(c, "200 OK", "text/plain", "switching", 9);
         else send_response(c, "409 Conflict", "text/plain", "no such track or already playing", 32);
+        return;
+    }
+
+    // Subtitles of the playing source: POST /subtitle body "<id>" (from
+    // /status sub_tracks) or "-1" for off; POST /subtitle/url body "<url>"
+    // loads an SRT/WebVTT file (POST /subtitle/text uploads one, see above).
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/subtitle") == 0) {
+        if (sub_select(atoi(body)) == 0) send_response(c, "200 OK", "text/plain", "ok", 2);
+        else send_response(c, "409 Conflict", "text/plain", "no such subtitle track", 22);
+        return;
+    }
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/subtitle/url") == 0) {
+        char url[1024];
+        int k = 0;
+        while (body[k] && body[k] != '\r' && body[k] != '\n' && k < (int)sizeof(url) - 1) { url[k] = body[k]; k++; }
+        url[k] = '\0';
+        if (!player_started()) send_response(c, "409 Conflict", "text/plain", "nothing is playing", 18);
+        else if (sub_load_url(url) == 0) send_response(c, "200 OK", "text/plain", "downloading", 11);
+        else send_response(c, "400 Bad Request", "text/plain", "not an http(s) URL", 18);
+        return;
+    }
+    // Settings: preferred subtitle language (auto-selects a matching track on
+    // new sources; "" = subtitles start off).
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/slang") == 0) {
+        char lang[16];
+        int k = 0;
+        for (; body[k] && k < (int)sizeof(lang) - 1; k++) {
+            char ch = body[k];
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '-' || ch == '_')) break;
+            lang[k] = ch;
+        }
+        lang[k] = '\0';
+        sub_set_lang(lang);
+        cfg_save();
+        send_response(c, "200 OK", "text/plain", "ok", 2);
         return;
     }
 
@@ -1957,6 +2064,14 @@ static void handle_client(OrbisNetId c) {
             if (!extract_tag(body, "CurrentURI", uri, sizeof(uri)) || !uri[0]) {
                 send_soap_fault(c, 402, "Invalid Args");
                 return;
+            }
+            {   // A subtitle the sender attached (Samsung CaptionInfo, SRT/VTT <res>):
+                // loaded once this URI has opened.
+                static char meta[6144];
+                char su[1024];
+                if (extract_tag(body, "CurrentURIMetaData", meta, sizeof(meta)) &&
+                    subs_didl_url(meta, su, sizeof(su)))
+                    sub_load_url_for(uri, su);
             }
             scePthreadMutexLock(&g_mtx);
             int changed = strcmp(g_dlna_uri, uri) != 0;

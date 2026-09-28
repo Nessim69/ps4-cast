@@ -610,3 +610,28 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
 - Options that don't fit the 1 KB channel URL are dropped whole, least useful
   last (User-Agent, Referer, Origin, Cookie). Cookie is still scoped to the
   channel's own host by urlopt.
+
+## Subtitles
+
+- Sources: embedded tracks (text: SubRip, ASS/SSA, WebVTT, mov_text, read
+  straight from the packets by `subs.c`; bitmap: PGS, DVB, DVD through
+  FFmpeg's decoders), an external SRT/WebVTT file (web UI upload
+  `POST /subtitle/text`, link `POST /subtitle/url`, or a DLNA sender's
+  `sec:CaptionInfo`/SRT-VTT `<res>` in its DIDL metadata), and HLS WebVTT
+  renditions (`EXT-X-MEDIA TYPE=SUBTITLES` of the variant's group, timed by
+  `X-TIMESTAMP-MAP`) fetched by the `ps4cast_subs` thread around the playback
+  position (VOD) or following the playlist (live).
+- Switching never reopens the stream: the decode thread re-routes on its
+  next loop (discard flags; TS segment demux follows the track's PID). The
+  choice and an external file stick to the source across reopens (seek,
+  quality or audio switch). Settings -> Subtitle language (`slang=`) turns a
+  matching track on for new sources; default off. TV: L3 cycles
+  off/tracks; the HUD shows the current one and lifts subtitles above it.
+- Drawing (`sub_draw`, main thread, on the picture): wrapped centred lines on
+  a translucent box, bitmaps mapped from their canvas onto the video rect via
+  the new queued `gfx_image`. The TV font is the ASCII atlas: accented Latin
+  is folded, other scripts (Arabic, CJK, ...) show as '?' -- bitmap subtitles
+  are unaffected. Windows-1252 SRT files are converted to UTF-8.
+- **Rebuild FFmpeg** (`portlibs/build-ffmpeg-616.sh`, now with
+  `pgssub,dvbsub,dvdsub`) for bitmap subtitles; with the old build those
+  tracks are simply not offered. Text subtitles need no rebuild.
