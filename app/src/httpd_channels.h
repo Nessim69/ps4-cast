@@ -11,9 +11,10 @@
 void httpd_channels_init(void);
 void httpd_channels_save(void);   // persist current list (also used by DLNA paths)
 
-// Bumped on every change to the channel store (playlist load, init-time
-// restore, add/edit/del, favourites, current/tuned channel), so /status can
-// hand the phone a "chan_ver" and it only re-fetches /channels when it moves.
+// Bumped on every change to the channel list (playlist load, init-time
+// restore, add/edit/del, favourites), so /status can hand the phone a
+// "chan_ver" and it only re-fetches /channels when it moves. The tuned
+// channel is /status "chan_cur" and does not bump it.
 int httpd_channels_version(void);
 
 // Endpoint router for GET /channels and POST /channel/{add,edit,del,fav}.
@@ -27,9 +28,13 @@ int httpd_channels_handle(OrbisNetId c, const char *method, const char *path,
 void httpd_channels_set_push_cb(void (*cb)(const char *url));
 
 // Parse an M3U/text playlist into the store, persist, and return the channel
-// JSON list (length, or -1 when nothing parsed).
-int  httpd_channels_load_playlist(const char *text, const char *srcUrl,
-                                  char *out, int cap);
+// list as the same JSON GET /channels serves (malloc'd; NULL when nothing
+// parsed). *len is its length.
+char *httpd_channels_load_playlist(const char *text, const char *srcUrl, int *len);
+// Channel i's XMLTV id (tvg-id) and logo URL; 1 if i exists.
+int  httpd_chan_meta(int i, char *tvgId, int tvgCap, char *logo, int logoCap);
+// The loaded playlist's XMLTV guide link ("" if it named none).
+void httpd_channels_epg_url(char *out, int cap);
 // Mark channel i tuned; returns 1 and copies its URL when valid.
 int  httpd_channels_tune(int i, char *urlOut, int urlCap);
 

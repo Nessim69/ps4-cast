@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -Wno-unused-parameter -g -O1 -std=gnu11
 
 SRC = ../../app/src
 
-TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_netwatch test_lang test_m3u test_subs test_agent_crypto
+TESTS = test_hls_parse test_urlopt test_resolve test_qr test_openq test_token test_netpolicy test_netwatch test_lang test_m3u test_channels test_subs test_agent_crypto
 
 # HLS AES-128 decryption (app/src/hls_crypt.c) against BearSSL's AES, built
 # from the pinned source tree that portlibs/fetch.sh unpacks. Skipped (with a
@@ -62,6 +62,11 @@ test_netwatch: test_netwatch.c $(SRC)/netwatch.c
 # M3U/IPTV parsing and per-channel options, through urlopt into headers.
 test_m3u: test_m3u.c $(SRC)/m3u.c $(SRC)/urlopt.c $(SRC)/netpolicy.c
 	$(CC) $(CFLAGS) -I$(SRC) -o $@ test_m3u.c $(SRC)/m3u.c $(SRC)/urlopt.c $(SRC)/netpolicy.c
+
+# Channel store: big lists, rail/filters, save + reload, /channel/* (app/src/httpd_channels.c).
+# shim/ stands in for the two OpenOrbis headers it includes.
+test_channels: test_channels.c $(SRC)/httpd_channels.c $(SRC)/m3u.c $(SRC)/urlopt.c $(SRC)/netpolicy.c shim/orbis/libkernel.h
+	$(CC) $(CFLAGS) -Ishim -I$(SRC) -o $@ test_channels.c $(SRC)/httpd_channels.c $(SRC)/m3u.c $(SRC)/urlopt.c $(SRC)/netpolicy.c -lpthread
 
 # Subtitle parsing, clean-up, wrapping and cue list (app/src/subs.c).
 test_subs: test_subs.c $(SRC)/subs.c

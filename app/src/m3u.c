@@ -221,10 +221,38 @@ static void name_from_url(const char *url, char *out, int cap) {
     memcpy(out, slash, (size_t)n); out[n] = '\0';
 }
 
+// Quoted attribute `key="..."` of an #EXTINF/#EXTM3U line, matched as a
+// whole word (tvg-id must not match inside x-tvg-id). 1 if present.
+static int quoted_attr(const char *s, const char *key, char *out, int cap) {
+    size_t kl = strlen(key);
+    for (const char *p = s; (p = strstr(p, key)) != NULL; p += kl) {
+        if (p > s && p[-1] != ' ' && p[-1] != '\t' && p[-1] != ':') continue;
+        if (p[kl] != '=' || p[kl + 1] != '"') continue;
+        const char *v = p + kl + 2, *e = strchr(v, '"');
+        if (!e) return 0;
+        set_val(out, cap, v, (int)(e - v));
+        return 1;
+    }
+    return 0;
+}
+
+int m3u_epg_url(const char *text, char *out, int cap) {
+    if (!text) return 0;
+    while (*text == '\xEF' || *text == '\xBB' || *text == '\xBF' || *text == ' ') text++;   // BOM
+    if (strncmp(text, "#EXTM3U", 7) != 0) return 0;
+    int n = (int)strcspn(text, "\r\n");
+    char line[2048];
+    snprintf(line, sizeof(line), "%.*s", n < (int)sizeof(line) - 1 ? n : (int)sizeof(line) - 1, text);
+    if (!quoted_attr(line, "x-tvg-url", out, cap) && !quoted_attr(line, "url-tvg", out, cap) &&
+        !quoted_attr(line, "tvg-url", out, cap)) return 0;
+    out[strcspn(out, ", ")] = '\0';                  // the first of several
+    return strncmp(out, "http://", 7) == 0 || strncmp(out, "https://", 8) == 0;
+}
+
 int m3u_parse(const char *text, int specCap, int (*add)(void *ctx, const M3uEntry *e), void *ctx) {
     M3uOpts defs, pend;
     m3u_opts_clear(&defs); m3u_opts_clear(&pend);
-    char title[256] = "", grp[64] = "", sticky[64] = "";
+    char title[256] = "", grp[64] = "", sticky[64] = "", tvg[128] = "", logo[512] = "";
     char *spec = malloc((size_t)specCap), *line = malloc(4096);
     int count = 0;
     if (!spec || !line) { free(spec); free(line); return 0; }
@@ -253,6 +281,9 @@ int m3u_parse(const char *text, int specCap, int (*add)(void *ctx, const M3uEntr
             grp[0] = '\0';
             const char *g = strstr(s, "group-title=\"");
             if (g) { g += 13; int k = 0; while (g[k] && g[k] != '"' && k < (int)sizeof(grp) - 1) { grp[k] = g[k]; k++; } grp[k] = '\0'; }
+            tvg[0] = logo[0] = '\0';
+            quoted_attr(s, "tvg-id", tvg, sizeof(tvg));
+            if (!quoted_attr(s, "tvg-logo", logo, sizeof(logo))) quoted_attr(s, "logo", logo, sizeof(logo));
             m3u_opts_line(&pend, s);
         } else if (strncmp(s, "#EXTGRP:", 8) == 0) {
             const char *g = s + 8;
@@ -265,10 +296,10 @@ int m3u_parse(const char *text, int specCap, int (*add)(void *ctx, const M3uEntr
             if (title[0]) snprintf(nm, sizeof(nm), "%s", title);
             else name_from_url(s, nm, sizeof(nm));
             m3u_spec(&pend, &defs, s, spec, specCap);
-            M3uEntry e = { nm, grp[0] ? grp : sticky, spec };
+            M3uEntry e = { nm, grp[0] ? grp : sticky, spec, tvg, logo };
             count++;
             int stop = add(ctx, &e);
-            title[0] = '\0'; grp[0] = '\0';
+            title[0] = '\0'; grp[0] = '\0'; tvg[0] = '\0'; logo[0] = '\0';
             m3u_opts_clear(&pend);
             if (stop) break;
         }

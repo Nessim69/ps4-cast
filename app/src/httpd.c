@@ -1541,6 +1541,81 @@ static void handle_local_upload(OrbisNetId c, const char *req, int reqLen,
     g_upload_handoff = 1;       // the worker now owns `c`; server_main must not close it
 }
 
+// POST /playlist. A provider's full list can be tens of MB and take half a
+// minute to download, which used to hold server_main's single worker (and
+// with it /status, /stop and every DLNA action) for the whole fetch. The
+// fetch, parse and reply now run on their own thread, which owns the socket
+// the same way the upload worker does. One load at a time.
+static int g_plist_active = 0;   // guarded by g_mtx
+typedef struct {
+    OrbisNetId sock;
+    char       url[URL_MAX];
+} PlaylistJob;
+
+static void *playlist_worker(void *arg) {
+    PlaylistJob *job = (PlaylistJob *)arg;
+    char *out = NULL;
+    int n = 0;
+    uint8_t *buf = NULL; int len = 0;
+    if (aseg_fetch_ui(job->url, &buf, &len) == 0 && buf && len > 0) {
+        uint8_t *txt = realloc(buf, (size_t)len + 1);
+        if (txt) {
+            buf = txt; buf[len] = '\0';
+            out = httpd_channels_load_playlist((const char *)buf, job->url, &n);
+        }
+    }
+    free(buf);
+    if (out) send_response(job->sock, "200 OK", "application/json", out, n);
+    else send_response(job->sock, "200 OK", "application/json", "[]", 2);
+    free(out);
+    sceNetSocketClose(job->sock);
+    scePthreadMutexLock(&g_mtx); g_plist_active = 0; scePthreadMutexUnlock(&g_mtx);
+    free(job);
+    return NULL;
+}
+
+static void handle_playlist(OrbisNetId c, const char *body) {
+    char url[URL_MAX];
+    strncpy(url, body, sizeof(url) - 1); url[sizeof(url) - 1] = '\0';
+    for (int i = (int)strlen(url) - 1; i >= 0 && (url[i]=='\r'||url[i]=='\n'||url[i]==' '||url[i]=='\t'); i--) url[i] = '\0';
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+        send_response(c, "200 OK", "application/json", "[]", 2);
+        return;
+    }
+    scePthreadMutexLock(&g_mtx);
+    int busy = g_plist_active;
+    if (!busy) g_plist_active = 1;
+    scePthreadMutexUnlock(&g_mtx);
+    if (busy) {
+        const char *m = "a playlist is already loading";
+        send_response(c, "409 Conflict", "text/plain", m, (int)strlen(m));
+        return;
+    }
+    PlaylistJob *job = malloc(sizeof(*job));
+    if (!job) {
+        send_response(c, "503 Service Unavailable", "text/plain", "out of memory", 13);
+        scePthreadMutexLock(&g_mtx); g_plist_active = 0; scePthreadMutexUnlock(&g_mtx);
+        return;
+    }
+    job->sock = c;
+    snprintf(job->url, sizeof(job->url), "%s", url);
+    OrbisPthreadAttr attr;
+    OrbisPthreadAttr *pattr = NULL;
+    int attrInit = scePthreadAttrInit(&attr) == 0;
+    if (attrInit && scePthreadAttrSetstacksize(&attr, UPLOAD_WORKER_STACK) == 0) pattr = &attr;
+    OrbisPthread worker;
+    int trc = scePthreadCreate(&worker, pattr, playlist_worker, job, "ps4cast_plist");
+    if (attrInit) scePthreadAttrDestroy(&attr);
+    if (trc != 0) {
+        send_response(c, "500 Internal Server Error", "text/plain", "cannot start playlist load", 26);
+        scePthreadMutexLock(&g_mtx); g_plist_active = 0; scePthreadMutexUnlock(&g_mtx);
+        free(job);
+        return;   // socket is still ours: server_main closes it as usual
+    }
+    scePthreadDetach(worker);
+    g_upload_handoff = 1;       // the worker now owns `c`; server_main must not close it
+}
+
 static void handle_client(OrbisNetId c) {
     // One request is handled at a time by server_main, so static storage is safe
     // and avoids spending 8 KB of the HTTP thread stack before dispatch begins.
@@ -2354,27 +2429,7 @@ static void handle_client(OrbisNetId c) {
 
     // Expand an M3U / IPTV playlist link into a JSON channel list. Body = URL.
     if (strcmp(method, "POST") == 0 && strcmp(path, "/playlist") == 0) {
-        char url[URL_MAX];
-        strncpy(url, body, sizeof(url) - 1); url[sizeof(url) - 1] = '\0';
-        for (int i = (int)strlen(url) - 1; i >= 0 && (url[i]=='\r'||url[i]=='\n'||url[i]==' '||url[i]=='\t'); i--) url[i] = '\0';
-        const int CAP = 3 * 1024 * 1024;   // the channel store holds up to 2000 entries
-        char *out = malloc(CAP);
-        if (!out) { send_response(c, "200 OK", "application/json", "[]", 2); return; }
-        int n = 0;
-        if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {
-            uint8_t *buf = NULL; int len = 0;
-            if (aseg_fetch_ui(url, &buf, &len) == 0 && buf && len > 0) {
-                uint8_t *txt = realloc(buf, (size_t)len + 1);
-                if (txt) {
-                    buf = txt; buf[len] = '\0';
-                    n = httpd_channels_load_playlist((const char *)buf, url, out, CAP);
-                }
-                free(buf);
-            }
-        }
-        if (n <= 0) { out[0] = '['; out[1] = ']'; n = 2; }
-        send_response(c, "200 OK", "application/json", out, n);
-        free(out);
+        handle_playlist(c, body);
         return;
     }
 

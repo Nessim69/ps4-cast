@@ -41,11 +41,15 @@ typedef struct {
 #define ORBIS_NET_SO_SNDTIMEO  0x1005
 #define ORBIS_NET_SO_RCVTIMEO  0x1006
 #define ASEG_FETCH_CAP         (16 * 1024 * 1024)
+// ASEG_CH_UI: a provider's full IPTV list with tens of thousands of channels
+// is well past 16 MB.
+#define ASEG_FETCH_CAP_UI      (64 * 1024 * 1024)
 
 #define ASEG_BUDGET_SEGMENT_US (25ULL * 1000 * 1000)
 #define ASEG_BUDGET_PLAYLIST_US (6ULL * 1000 * 1000)
 // ASEG_CH_UI: a big M3U/IPTV list legitimately takes longer than a playlist.
-#define ASEG_BUDGET_UI_US      (15ULL * 1000 * 1000)
+// It runs on its own thread (httpd.c playlist_worker), so nothing waits on it.
+#define ASEG_BUDGET_UI_US      (60ULL * 1000 * 1000)
 
 typedef struct {
     int  lastStatus;        // last parsed HTTP status (0 = unparseable)
@@ -890,7 +894,8 @@ static int aseg_fetch_inner(AsegCh *c, const char *url, uint8_t **outBuf, int *o
             watchdog_kick();
             if (used + 64 * 1024 > cap) {
                 size_t ncap = cap * 2; if (ncap < need) ncap = need;
-                if (ncap > ASEG_FETCH_CAP) ncap = ASEG_FETCH_CAP;
+                size_t lim = (size_t)c->maxBytes > ASEG_FETCH_CAP ? (size_t)c->maxBytes : ASEG_FETCH_CAP;
+                if (ncap > lim) ncap = lim;
                 uint8_t *nb = realloc(buf, ncap);
                 if (!nb) { free(buf); conn_close(c); c->kaAlive = 0; return -7; }
                 buf = nb; cap = ncap;
@@ -1013,7 +1018,8 @@ int aseg_fetch_opts(int ch, const char *url, uint8_t **outBuf, int *outLen, Aseg
     c->budgetUs = ch == ASEG_CH_UI ? ASEG_BUDGET_UI_US
                 : (ch == ASEG_CH_PLAYLIST && g_playlistBudget) ? ASEG_BUDGET_PLAYLIST_US
                 : ASEG_BUDGET_SEGMENT_US;
-    c->maxBytes = ASEG_FETCH_CAP; c->truncate = 0; c->stopAfterHeaders = NULL; c->ctype[0] = '\0';
+    c->maxBytes = ch == ASEG_CH_UI ? ASEG_FETCH_CAP_UI : ASEG_FETCH_CAP;
+    c->truncate = 0; c->stopAfterHeaders = NULL; c->ctype[0] = '\0';
     c->rangeOff = c->rangeLen = 0; c->okStatus = 0; c->okNative = 0; c->crStart = -1;
     if (o) {
         if (o->budgetUs) c->budgetUs = o->budgetUs;

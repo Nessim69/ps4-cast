@@ -168,6 +168,8 @@ input[type=range].seek::-moz-range-thumb{width:17px;height:17px;border:0;border-
  font-size:12px;font-weight:700;padding:6px 11px;border-radius:999px;cursor:pointer;white-space:nowrap}
 .chipf.on{background:var(--acc);color:#fff;border-color:transparent}
 #chTools{margin:7px 0 1px}
+.pick.grp{width:100%;margin-bottom:7px}
+.chipf.more{align-self:center;margin:4px 0 2px}
 .search{width:100%;padding:9px 12px;border-radius:8px;border:1px solid var(--line2);background:var(--bg2);
  color:#fff;font-size:14px;font-family:inherit;outline:none}
 .search:focus{border-color:var(--acc);box-shadow:0 0 0 4px rgba(91,140,255,.14)}
@@ -637,8 +639,11 @@ async function pasteTo(id){var el=$(id);el.focus();el.select();
 
 async function loadPlaylist(){var u=$('purl').value.trim();if(!u){msg('Paste an M3U / playlist link first');$('purl').focus();return}
  busy(true);msg('Loading playlist…');
- try{var r=await post('/playlist',u);var a=await r.json();busy(false);
-  plData=a||[];chanCur=-1;curGroup='';curSearch='';if($('chSearch'))$('chSearch').value='';setMode('iptv');renderPane('pl');
+ try{var r=await post('/playlist',u);
+  if(r&&r.status===409){busy(false);msg('A playlist is already loading — try again in a moment');return}
+  var a=await r.json();busy(false);
+  plData=a||[];listCache.chan=JSON.stringify(plData);chanCur=-1;curGroup='';curSearch='';plLimit=PL_PAGE;
+  if($('chSearch'))$('chSearch').value='';setMode('iptv');renderPane('pl');
   if(!plData.length){msg('No channels found in that link')}else{msg(plData.length+' channels — tap one to play')}}
  catch(e){busy(false);msg('Could not load that playlist')}}
 
@@ -699,22 +704,33 @@ async function delChan(i){
 async function favChan(i){await post('/channel/fav',''+i);await reloadChans()}
 async function clearChans(){if(!confirm('Delete ALL channels?'))return;await post('/channel/del','');await reloadChans();msg('List cleared')}
 function chanPick(i){if(i<0||i>=plData.length)return;chanCur=i;renderPane('pl');post('/chan',''+i);msg('Tuning '+(plData[i].n||'channel '+(i+1)))}
-function setGroup(g){curGroup=g;renderPane('pl')}
-function onSearch(){curSearch=($('chSearch').value||'').trim().toLowerCase();renderPane('pl')}
+// Big provider lists run to tens of thousands of channels: only the first
+// PL_PAGE matches are put in the DOM, with "Show more" and search for the rest.
+var PL_PAGE=300,plLimit=PL_PAGE;
+function setGroup(g){curGroup=g;plLimit=PL_PAGE;renderPane('pl')}
+function setGroupIdx(v){v=+v;setGroup(v<0?'':(plGroups[v]||''))}
+function onSearch(){curSearch=($('chSearch').value||'').trim().toLowerCase();plLimit=PL_PAGE;renderPane('pl')}
 function chanName(i){return plData[i].n||nameFromUrl(plData[i].u)}
+function chanKey(i){var c=plData[i];return c._q||(c._q=chanName(i).toLowerCase())}
 function renderPane(which){
  if(which=='pl'){$('chTools').hidden=!plData.length;$('modeChanCount').textContent=plData.length?' '+plData.length:'';
   var container=$('panePl'),top=scrollTopOf(container);
   if(!plData.length){container.innerHTML='<div class="empty">Add an M3U playlist to browse channels here.</div>';return}
   var groups=[],seen={};for(var k=0;k<plData.length;k++){var g=plData[k].g||'';if(g&&!seen[g]){seen[g]=1;groups.push(g)}}
   var h='';
-  if(groups.length>1){plGroups=groups;
+  plGroups=groups;if(curGroup&&!seen[curGroup])curGroup='';
+  if(groups.length>24){
+   h+='<select class="pick grp" onchange="setGroupIdx(this.value)"><option value="-1">All groups ('+groups.length+')</option>';
+   for(var gs=0;gs<groups.length;gs++){h+='<option value="'+gs+'"'+(curGroup===groups[gs]?' selected':'')+'>'+esc(groups[gs])+'</option>'}h+='</select>'}
+  else if(groups.length>1){
    h+='<div class="chips"><button class="chipf'+(curGroup===''?' on':'')+'" data-kind="group" data-act="set" data-idx="-1">All</button>';
    for(var gi=0;gi<groups.length;gi++){h+='<button class="chipf'+(curGroup===groups[gi]?' on':'')+'" data-kind="group" data-act="set" data-idx="'+gi+'">'+esc(groups[gi])+'</button>'}h+='</div>'}
-  h+='<div class="scrolly">';var shown=0;
+  h+='<div class="scrolly">';var shown=0,matched=0;
   for(var i=0;i<plData.length;i++){if(curGroup&&(plData[i].g||'')!==curGroup)continue;
-   if(curSearch&&chanName(i).toLowerCase().indexOf(curSearch)<0)continue;
+   if(curSearch&&chanKey(i).indexOf(curSearch)<0)continue;
+   matched++;if(shown>=plLimit)continue;
    h+=chanRow(i,chanName(i),i==chanCur);shown++}
+  if(matched>shown)h+='<button class="chipf more" data-kind="more" data-act="more" data-idx="0">Show '+Math.min(PL_PAGE,matched-shown)+' more of '+(matched-shown)+' — or search</button>';
   h+='</div>';
   if(!shown)h+='<div class="empty">'+(curSearch?'No channels match “'+esc(curSearch)+'”.':'No channels in this group.')+'</div>';
   container.innerHTML=h;restoreScroll(container,top)}
@@ -775,6 +791,8 @@ document.addEventListener('click',function(e){
   if(act==='tune')chanPick(idx);else if(act==='fav')favChan(idx);else if(act==='edit')editChan(idx);else if(act==='del')delChan(idx);
  }else if(kind==='group'){
   setGroup(idx<0?'':plGroups[idx]);
+ }else if(kind==='more'){
+  plLimit+=PL_PAGE;renderPane('pl');
  }
 });
 

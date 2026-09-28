@@ -9,13 +9,15 @@
 static int failures = 0;
 #define CHECK(c) do { if (!(c)) { failures++; printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } } while (0)
 
-typedef struct { int n; char name[16][96]; char group[16][64]; char spec[16][1024]; } Got;
+typedef struct { int n; char name[16][96]; char group[16][64]; char spec[16][1024]; char tvg[16][64]; char logo[16][256]; } Got;
 static int collect(void *ctx, const M3uEntry *e) {
     Got *g = ctx;
     if (g->n < 16) {
         snprintf(g->name[g->n], sizeof g->name[0], "%s", e->name);
         snprintf(g->group[g->n], sizeof g->group[0], "%s", e->group);
         snprintf(g->spec[g->n], sizeof g->spec[0], "%s", e->spec);
+        snprintf(g->tvg[g->n], sizeof g->tvg[0], "%s", e->tvgId);
+        snprintf(g->logo[g->n], sizeof g->logo[0], "%s", e->logo);
     }
     g->n++;
     return 0;
@@ -55,6 +57,8 @@ int main(void) {
     CHECK(m3u_parse(list, 1024, collect, &g) == 7);
 
     CHECK(strcmp(g.name[0], "Channel A") == 0 && strcmp(g.group[0], "News, World") == 0);
+    CHECK(strcmp(g.tvg[0], "a") == 0 && g.logo[0][0] == 0);
+    CHECK(g.tvg[1][0] == 0);                                      // not carried over
     CHECK(strstr(headers_of(g.spec[0]), "User-Agent: Mozilla/5.0 (X11; Linux) Safari & Co 100%\r\n") != NULL);
     CHECK(strstr(headers_of(g.spec[0]), "Referer: https://site.example/live\r\n") != NULL);
     CHECK(strncmp(g.spec[0], "http://cdn.example/a.m3u8|", 26) == 0);
@@ -78,6 +82,18 @@ int main(void) {
     CHECK(strstr(headers_of(g.spec[5]), "VlcUA") == NULL);
 
     CHECK(strcmp(g.name[6], "bare.ts") == 0 && strcmp(g.spec[6], "http://cdn.example/path/bare.ts?token=1") == 0);
+
+    // guide link and per-channel ids/logos
+    char epg[256];
+    CHECK(m3u_epg_url(list, epg, sizeof epg) == 1 && strcmp(epg, "http://epg/x.xml") == 0);
+    CHECK(m3u_epg_url("#EXTM3U url-tvg=\"https://a/g.xml.gz,https://b/g.xml\"\n", epg, sizeof epg) == 1 &&
+          strcmp(epg, "https://a/g.xml.gz") == 0);
+    CHECK(m3u_epg_url("#EXTM3U\n#EXTINF:-1 x-tvg-url=\"http://no\",x\n", epg, sizeof epg) == 0);
+    memset(&g, 0, sizeof g);
+    CHECK(m3u_parse("#EXTM3U\n#EXTINF:-1 tvg-id=\"bbc1.uk\" tvg-name=\"BBC One\" tvg-logo=\"http://l/bbc1.png\",BBC One\nhttp://h/1\n"
+                    "#EXTINF:-1 logo=\"http://l/x.png\" x-tvg-id=\"no\",X\nhttp://h/2\n", 1024, collect, &g) == 2);
+    CHECK(strcmp(g.tvg[0], "bbc1.uk") == 0 && strcmp(g.logo[0], "http://l/bbc1.png") == 0);
+    CHECK(g.tvg[1][0] == 0 && strcmp(g.logo[1], "http://l/x.png") == 0);
 
     // list-wide defaults on #EXTM3U, overridden per entry
     memset(&g, 0, sizeof g);

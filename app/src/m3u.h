@@ -25,7 +25,13 @@ typedef struct {
     const char *name;     // #EXTINF title, or derived from the URL
     const char *group;    // group-title, else the sticky #EXTGRP, else ""
     const char *spec;     // URL plus its options, "url|K=V&.."
+    const char *tvgId;    // tvg-id (the XMLTV channel id), or ""
+    const char *logo;     // tvg-logo (or logo), or ""
 } M3uEntry;
+
+// The list's XMLTV guide link from its #EXTM3U line (x-tvg-url, url-tvg or
+// tvg-url; the first of a comma-separated list). 1 if found.
+int m3u_epg_url(const char *text, char *out, int cap);
 
 // Calls add() for every channel, in order, until it returns nonzero.
 // specCap bounds the spec (options that don't fit are dropped, most useful

@@ -611,6 +611,26 @@ Goal: tolerate crashes during autonomous test loops without getting stuck.
   last (User-Agent, Referer, Origin, Cookie). Cookie is still scoped to the
   channel's own host by urlopt.
 
+## Big channel lists
+
+- The channel store (`httpd_channels.c`) holds up to 100,000 channels (was
+  2,000). Each channel's strings are one heap block; groups, the A-Z mask
+  and the filter are rebuilt once per change, so the TV's rail/letter strip no
+  longer rescans the list every frame (the rail was O(n^2)). `/channels` is
+  built exact-size (it was sized for the worst case: ~2.4 KB a channel).
+- The save file gained two columns, tvg-id and logo, plus an optional
+  `#EPG\t<url>` first line; 3- and 4-column files still load. Tabs in fields
+  are turned into spaces.
+- `POST /playlist` fetches, parses and replies on its own thread
+  (`ps4cast_plist`, one at a time, 409 while busy); the UI fetch channel may
+  read 64 MB within 60 s. It used to hold the single HTTP worker for up to 15 s.
+- `chan_ver` no longer moves on tuning (`chan_cur` in `/status` covers the
+  LIVE marker); it made the phone re-download the list on every zap.
+- The web UI draws 300 rows at a time ("Show more", or search) and turns the
+  group chips into a drop-down past 24 groups.
+- Host test: `test_channels` (100k parse/index/save/list, filters, reload,
+  endpoints) with `tests/host/shim/orbis`.
+
 ## Subtitles
 
 - Sources: embedded tracks (text: SubRip, ASS/SSA, WebVTT, mov_text, read
