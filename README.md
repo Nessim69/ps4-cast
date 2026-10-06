@@ -136,7 +136,7 @@ transport-control matrix without rebuilding it.
 The injected GoldHEN launch payload and Second Screen are deliberately not used:
 the former lacks an authenticated user session on FW 11 and can crash ShellUI,
 while Second Screen requires a PSN-backed mobile identity unavailable in this
-offline homebrew setup.
+offline homebrew setup..
 
 ## Status
 | Part | State |
