@@ -1,0 +1,22 @@
+name: Fabriquer le PKG PS4-Cast
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer les pre-requis Mac
+        run: brew install llvm lld
+
+      - name: Compiler le code en PKG
+        run: |
+          bash scripts/fetch-toolchain.sh
+          ./build.sh
+
+      - name: Sauvegarder le fichier PKG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mon-Fichier-PS4-Cast
+          path: dist/*.pkg
